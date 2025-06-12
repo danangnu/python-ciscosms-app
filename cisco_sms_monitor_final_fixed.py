@@ -2,6 +2,7 @@ import os
 import sys
 import socket
 import paramiko
+import time
 import threading
 import re
 from datetime import datetime
@@ -9,6 +10,7 @@ from PyQt5 import QtWidgets, uic
 from sms_log_dialog import SMSLogDialog
 from PyQt5.QtCore import QTimer
 from PyQt5.QtCore import Qt
+import mysql.connector
 import sip
 
 # No crash – safely register using sip
@@ -52,7 +54,7 @@ EMAIL_PASSWORD = "Nyepi2017"  # Consider using an App Password
 EMAIL_RECIPIENT = "alliedco.bali@gmail.com"
 
 # Router login details
-ROUTER_IP = "192.168.100.1"
+ROUTER_IPS = "192.168.100.1"
 USERNAME = "admin"
 PASSWORD = "Bryan2011"
 
@@ -60,13 +62,102 @@ PASSWORD = "Bryan2011"
 UDP_IP = "0.0.0.0"  # Listen on all interfaces
 UDP_PORT = 514
 
+def load_devices_from_db():
+    conn = mysql.connector.connect(
+        host="localhost",         # or your server IP
+        user="root",
+        password="admin1234!",
+        database="cisco_sms"
+    )
+    cursor = conn.cursor()
+    cursor.execute("SELECT name, ip, sim, apn, email FROM devices")
+    rows = cursor.fetchall()
+    conn.close()
+
+    devices = []
+    for row in rows:
+        devices.append({
+            "name": row[0],
+            "ip": row[1],
+            "sim": row[2],
+            "apn": row[3],
+            "email": row[4],
+            "lastSMS": "",  # You can fetch from another table or update manually
+            "signal": 0     # Update this based on monitoring
+        })
+    return devices
+
+def get_ip_address():
+    hostname = socket.gethostname()
+    ip_address = socket.gethostbyname(hostname)
+    return ip_address
+
+def configure_sms_applet_on_cisco(router_ip, username, password):
+    eem_script = f"""
+        configure terminal
+        !
+        ! Remove and re-create EEM applet
+        no event manager applet SMS_Extract
+        event manager applet SMS_Extract
+        event syslog pattern "Cellular0/0/0: New SMS received on index ([0-9]+)"
+        action 1.0 cli command "enable"
+        action 2.0 regexp "index ([0-9]+)" "$_syslog_msg" match sms_index
+        action 3.0 cli command "cellular 0/0/0 lte sms view $sms_index"
+        action 4.0 regexp "SMS ID: ([0-9]+)" "$_cli_result" match sms_id
+        action 5.0 syslog msg "SMS Extracted -> ID: $sms_id"
+        exit
+        !
+        ! Configure remote syslog destination
+        logging host {get_ip_address()}
+        logging trap informational
+        exit
+        write memory
+    """
+
+
+    try:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(router_ip, username=username, password=password, look_for_keys=False, allow_agent=False)
+
+        shell = ssh.invoke_shell()
+        time.sleep(1)
+        shell.recv(1000)  # Clear initial output
+
+        for line in eem_script.strip().split("\n"):
+            shell.send(line.strip() + "\n")
+            time.sleep(0.5)
+
+        output = shell.recv(5000).decode()
+        print(output)
+        ssh.close()
+        print(f"EEM applet configured on {router_ip}")
+    except Exception as e:
+        print(f"Failed to configure EEM on {router_ip}: {e}")
+
+
+def insert_device_to_db(device):
+    conn = mysql.connector.connect(
+        host="localhost",         # or your server IP
+        user="root",
+        password="admin1234!",
+        database="cisco_sms"
+    )
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO devices (name, ip, sim, apn, email)
+        VALUES (%s, %s, %s, %s, %s)
+    """, (device["name"], device["ip"], device["sim"], device["apn"], device["email"]))
+    conn.commit()
+    conn.close()
+
 # Simulated fetch_sms_details function for this UI
 # Function to fetch SMS details from router
-def fetch_sms_details(sms_index):
+def fetch_sms_details(router_ip, sms_index):
     print(f"🔍 Fetching SMS details for index: {sms_index}")
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ssh.connect(ROUTER_IP, username=USERNAME, password=PASSWORD)
+    ssh.connect(router_ip, username=USERNAME, password=PASSWORD)
 
     command = f"cellular 0/0/0 lte sms view {sms_index}"
     stdin, stdout, stderr = ssh.exec_command(command)
@@ -104,10 +195,7 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         super().__init__()
         ui_file = resource_path("combined_sms_monitor.ui")
         uic.loadUi(ui_file, self)
-        self.devices = [
-            {"name": "Router A", "ip": "192.168.1.1", "sim": "628123456789", "apn": "internet.telkomsel", "email": "alerts@domain.com", "lastSMS": "Test OK", "signal": 4},
-            {"name": "Router B", "ip": "192.168.1.2", "sim": "628223456789", "apn": "3data", "email": "support@x.com", "lastSMS": "Low signal", "signal": 2}
-        ]
+        self.devices = load_devices_from_db()
         self.sms_logs = []
         self.is_paused = False
 
@@ -163,9 +251,21 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         dialog = DeviceSettingsDialog(parent=self)
         if dialog.exec_() == QtWidgets.QDialog.Accepted:
             new_device = dialog.get_data()
-            new_device["lastSMS"] = ""
-            new_device["signal"] = 3
-            self.devices.append(new_device)
+            insert_device_to_db(new_device)
+
+            # Push config to Cisco
+            try:
+                configure_sms_applet_on_cisco(
+                    router_ip=new_device["ip"],
+                    username="admin",
+                    password="Bryan2011"
+                )
+            except Exception as e:
+                QtWidgets.QMessageBox.warning(self, "Cisco Error", f"Failed to configure SMS EEM applet:\n{e}")
+
+        
+            # Reload from database to ensure sync
+            self.devices = load_devices_from_db()
             self.load_devices(self.devices)
 
     def show_sms_log_dialog(self, index):
