@@ -9,12 +9,12 @@ class SMSLogDialog(QtWidgets.QDialog):
         self.closeButton.clicked.connect(self.close)
 
         self.smsTable.setColumnCount(5)
-        self.smsTable.setHorizontalHeaderLabels(["ID", "Time", "From", "Size", "Message"])
+        self.smsTable.setHorizontalHeaderLabels(["ID", "Time", "From", "Size", "Content"])
         self.smsTable.setRowCount(len(sms_logs or []))
 
         for i, sms in enumerate(sms_logs or []):
-            self.smsTable.setItem(i, 0, QtWidgets.QTableWidgetItem(str(sms["id"])))
-            self.smsTable.setItem(i, 1, QtWidgets.QTableWidgetItem(sms["time"]))
-            self.smsTable.setItem(i, 2, QtWidgets.QTableWidgetItem(sms["from"]))
-            self.smsTable.setItem(i, 3, QtWidgets.QTableWidgetItem(str(sms["size"])))
-            self.smsTable.setItem(i, 4, QtWidgets.QTableWidgetItem(sms["message"]))
+            self.smsTable.setItem(i, 0, QtWidgets.QTableWidgetItem(str(sms["ID"])))
+            self.smsTable.setItem(i, 1, QtWidgets.QTableWidgetItem(sms["Time"]))
+            self.smsTable.setItem(i, 2, QtWidgets.QTableWidgetItem(sms["From"]))
+            self.smsTable.setItem(i, 3, QtWidgets.QTableWidgetItem(str(sms["Size"])))
+            self.smsTable.setItem(i, 4, QtWidgets.QTableWidgetItem(sms["Content"]))

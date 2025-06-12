@@ -8,8 +8,9 @@ import re
 from datetime import datetime
 from PyQt5 import QtWidgets, uic
 from sms_log_dialog import SMSLogDialog
-from PyQt5.QtCore import QTimer
-from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QMovie
+from PyQt5.QtCore import Qt, QSize, QTimer
+
 import mysql.connector
 import sip
 
@@ -27,6 +28,7 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
     def __init__(self, device=None, parent=None):
         super(DeviceSettingsDialog, self).__init__(parent)
         uic.loadUi(resource_path("device_settings_dialog.ui"), self)
+
         self.device = device
         if device:
             self.nameLineEdit.setText(device["name"])
@@ -184,6 +186,63 @@ def fetch_sms_details(router_ip, sms_index):
 
     return sms_details
 
+def fetch_all_sms(router_ip):
+    import paramiko, time, re
+
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    ssh.connect(router_ip, username=USERNAME, password=PASSWORD, look_for_keys=False, allow_agent=False)
+
+    shell = ssh.invoke_shell()
+    time.sleep(1)
+    shell.recv(1000)
+
+    shell.send("terminal length 0\n")
+    time.sleep(0.5)
+    shell.recv(1000)
+
+    shell.send("cellular 0/0/0 lte sms view all\n")
+    time.sleep(1)
+
+    output = ""
+    while True:
+        if shell.recv_ready():
+            output += shell.recv(4096).decode(errors="ignore")
+            time.sleep(0.2)
+        else:
+            break
+
+    ssh.close()
+
+    sms_blocks = re.split(r"\n(?=SMS ID:)", output.strip())
+
+    all_sms = []
+    for block in sms_blocks:
+        sms_id = re.search(r"SMS ID: (\d+)", block)
+        sms_time = re.search(r"TIME: ([\d-]+ [\d:]+)", block)
+        sms_from = re.search(r"FROM: (\d+)", block)
+        sms_size = re.search(r"SIZE: (\d+)", block)
+        sms_content_match = re.search(r"SIZE: \d+\s*\n(.+)", block)
+
+        # Skip if any essential field is missing
+        if not all([sms_id, sms_time, sms_from, sms_content_match]):
+            continue
+
+        # Build only if all required values exist
+        sms_details = {
+            "ID": sms_id.group(1),
+            "Time": sms_time.group(1),
+            "From": sms_from.group(1),
+            "Size": sms_size.group(1) if sms_size else "0",
+            "Content": sms_content_match.group(1).strip(),
+        }
+
+        all_sms.append(sms_details)
+
+    return all_sms
+
+
+
 class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
     def get_router_name(self, ip):
         for device in self.devices:
@@ -195,6 +254,18 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         super().__init__()
         ui_file = resource_path("combined_sms_monitor.ui")
         uic.loadUi(ui_file, self)
+
+        self.spinner_label = QtWidgets.QLabel(self)
+        self.spinner_movie = QMovie(resource_path("spinner.gif"))
+        self.spinner_movie.setScaledSize(QSize(100, 100))
+        self.spinner_label.setMovie(self.spinner_movie)
+        self.spinner_label.setAlignment(Qt.AlignCenter)
+        self.spinner_label.setStyleSheet("background-color: rgba(255, 255, 255, 180); border-radius: 10px;")
+        self.spinner_label.setVisible(False)
+        self.spinner_label.resize(120, 120)
+        self.spinner_label.move(self.width()//2 - 60, self.height()//2 - 60)
+
+
         self.devices = load_devices_from_db()
         self.sms_logs = []
         self.is_paused = False
@@ -209,6 +280,20 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         self.load_devices(self.devices)
         self.start_syslog_listener()
 
+    def show_spinner(self):
+        self.addButton.setEnabled(False)
+        self.spinner_label.setVisible(True)
+        self.spinner_movie.start()
+        QtWidgets.QApplication.processEvents()
+
+    def hide_spinner(self):
+        self.spinner_movie.stop()
+        self.spinner_label.setVisible(False)
+        self.addButton.setEnabled(True)
+
+    def update_devices_and_ui(self, new_devices):
+        self.devices = new_devices
+        self.load_devices(self.devices)
 
     def load_devices(self, device_list):
         self.deviceTable.setColumnCount(8)
@@ -251,28 +336,34 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         dialog = DeviceSettingsDialog(parent=self)
         if dialog.exec_() == QtWidgets.QDialog.Accepted:
             new_device = dialog.get_data()
-            insert_device_to_db(new_device)
+            self.show_spinner()
 
-            # Push config to Cisco
-            try:
-                configure_sms_applet_on_cisco(
-                    router_ip=new_device["ip"],
-                    username="admin",
-                    password="Bryan2011"
-                )
-            except Exception as e:
-                QtWidgets.QMessageBox.warning(self, "Cisco Error", f"Failed to configure SMS EEM applet:\n{e}")
+            def background_task():
+                try:
+                    insert_device_to_db(new_device)
+                    configure_sms_applet_on_cisco(
+                        router_ip=new_device["ip"],
+                        username="admin",
+                        password="Bryan2011"
+                    )
+                    updated_devices = load_devices_from_db()
 
-        
-            # Reload from database to ensure sync
-            self.devices = load_devices_from_db()
-            self.load_devices(self.devices)
+                    # Safely update UI and self.devices
+                    QTimer.singleShot(0, lambda: self.update_devices_and_ui(updated_devices))
+                except Exception as e:
+                    QTimer.singleShot(0, lambda: QtWidgets.QMessageBox.warning(
+                        self, "Error", f"Failed to add device:\n{e}"
+                    ))
+                finally:
+                    QTimer.singleShot(0, self.hide_spinner)
+
+            threading.Thread(target=background_task, daemon=True).start()
+
+
+
 
     def show_sms_log_dialog(self, index):
-        logs = [
-            {"id": 2, "time": "25-04-30 11:50:09", "from": "6281335588004", "size": 8, "message": "Yes send"},
-            {"id": 3, "time": "25-04-30 12:00:00", "from": "6281112345678", "size": 12, "message": "Hello again!"}
-        ]
+        logs = fetch_all_sms(self.devices[index]["ip"])
         dialog = SMSLogDialog(device_name=self.devices[index]["name"], sms_logs=logs, parent=self)
         dialog.exec_()
 
@@ -360,8 +451,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
     
     def display_devices(self, device_list):
         self.deviceTable.setRowCount(len(device_list))
