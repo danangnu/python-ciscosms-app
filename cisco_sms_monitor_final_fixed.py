@@ -12,6 +12,7 @@ from PyQt5 import QtWidgets, uic
 from sms_log_dialog import SMSLogDialog
 from PyQt5.QtGui import QMovie
 from PyQt5.QtCore import Qt, QSize, QTimer, QObject, pyqtSignal, QMetaObject, pyqtSlot
+from PyQt5.QtWidgets import QPushButton, QHBoxLayout, QLabel
 
 import mysql.connector
 import sip
@@ -31,6 +32,20 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
         super(DeviceSettingsDialog, self).__init__(parent)
         uic.loadUi(resource_path("device_settings_dialog.ui"), self)
 
+        # Add Detect button next to APN field
+        self.detectApnButton = QPushButton("Detect")
+        apn_row_layout = QHBoxLayout()
+        apn_row_layout.addWidget(self.apnLineEdit)
+        apn_row_layout.addWidget(self.detectApnButton)
+
+        # Replace the widget in the layout (4th item in the vertical layout, index = 3)
+        layout: QtWidgets.QVBoxLayout = self.layout()
+        layout.insertLayout(3, apn_row_layout)  # Index 3 = after SIM input
+
+        # Connect detection logic
+        self.detectApnButton.clicked.connect(self.handle_detect_apn)
+
+        # Set existing fields
         self.device = device
         if device:
             self.nameLineEdit.setText(device["name"])
@@ -38,6 +53,7 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
             self.simLineEdit.setText(device["sim"])
             self.apnLineEdit.setText(device["apn"])
             self.emailLineEdit.setText(device["email"])
+
         self.saveButton.clicked.connect(self.accept)
         self.cancelButton.clicked.connect(self.reject)
 
@@ -49,6 +65,33 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
             "apn": self.apnLineEdit.text(),
             "email": self.emailLineEdit.text(),
         }
+    
+    def handle_detect_apn(self):
+        ip = self.ipLineEdit.text()
+        if not ip:
+            QtWidgets.QMessageBox.warning(self, "Missing IP", "Please enter the router IP first.")
+            return
+
+        try:            
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(ip, username="admin", password="Bryan2011", look_for_keys=False, allow_agent=False)
+
+            stdin, stdout, stderr = ssh.exec_command("show cellular 0/0/0 profile")
+            output = stdout.read().decode()
+            ssh.close()
+
+            # Extract APN from active profile
+            match = re.search(r"Profile 1 = ACTIVE.*?APN\) = ([^\s]+)", output, re.DOTALL)
+            if match:
+                apn = match.group(1)
+                self.apnLineEdit.setText(apn)
+                QtWidgets.QMessageBox.information(self, "APN Detected", f"Detected APN: {apn}")
+            else:
+                QtWidgets.QMessageBox.warning(self, "Not Found", "Could not detect APN in the output.")
+
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "SSH Error", str(e))
     
 def is_device_online(ip):
     # Determine ping command based on OS
@@ -170,23 +213,40 @@ def insert_device_to_db(device):
 def fetch_sms_details(router_ip, sms_index):
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ssh.connect(router_ip, username="admin", password="Bryan2011")
+    ssh.connect(router_ip, username="admin", password="Bryan2011", look_for_keys=False, allow_agent=False)
+
     command = f"cellular 0/0/0 lte sms view {sms_index}"
     stdin, stdout, stderr = ssh.exec_command(command)
     sms_output = stdout.read().decode()
     ssh.close()
+
+    # Debug: log raw output in case parsing fails
+    print(f"📩 Raw SMS output:\n{sms_output}")
+
     sms_id = re.search(r"SMS ID: (\d+)", sms_output)
     sms_time = re.search(r"TIME: ([\d-]+ [\d:]+)", sms_output)
     sms_from = re.search(r"FROM: (\d+)", sms_output)
     sms_size = re.search(r"SIZE: (\d+)", sms_output)
     sms_content_match = re.search(r"SIZE: \d+\s*(.+)", sms_output, re.DOTALL)
+
+    if not all([sms_id, sms_time, sms_from, sms_size, sms_content_match]):
+        print("⚠️ Failed to extract SMS fields. One or more regex groups not found.")
+        return {
+            "ID": "Unknown",
+            "Time": "Unknown",
+            "From": "Unknown",
+            "Size": "Unknown",
+            "Content": "Failed to parse SMS content",
+        }
+
     sms_details = {
-        "ID": sms_id.group(1) if sms_id else "Unknown",
-        "Time": sms_time.group(1) if sms_time else "Unknown",
-        "From": sms_from.group(1) if sms_from else "Unknown",
-        "Size": sms_size.group(1) if sms_size else "Unknown",
-        "Content": sms_content_match.group(1).strip() if sms_content_match else "Unknown",
+        "ID": sms_id.group(1),
+        "Time": sms_time.group(1),
+        "From": sms_from.group(1),
+        "Size": sms_size.group(1),
+        "Content": sms_content_match.group(1).strip(),
     }
+
     return sms_details
 
 def create_status_label(status):
@@ -480,9 +540,16 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         self.smsTable.setHorizontalHeaderLabels(["Router", "ID", "Time", "From", "Size", "Message"])
         self.smsTable.setRowCount(len(logs))
         for i, sms in enumerate(logs):
+            formatted_time = sms["Time"]
+            try:
+                dt_obj = datetime.strptime(sms["Time"], "%y-%m-%d %H:%M:%S")  # e.g. "25-05-28 14:38:06"
+                formatted_time = dt_obj.strftime("%d/%m/%Y %H:%M:%S")
+            except Exception as e:
+                print(f"⚠️ Time format error: {e} -> using raw")
+
             self.smsTable.setItem(i, 0, QtWidgets.QTableWidgetItem(sms.get("Router", "Unknown")))
             self.smsTable.setItem(i, 1, QtWidgets.QTableWidgetItem(sms["ID"]))
-            self.smsTable.setItem(i, 2, QtWidgets.QTableWidgetItem(sms["Time"]))
+            self.smsTable.setItem(i, 2, QtWidgets.QTableWidgetItem(formatted_time))
             self.smsTable.setItem(i, 3, QtWidgets.QTableWidgetItem(sms["From"]))
             self.smsTable.setItem(i, 4, QtWidgets.QTableWidgetItem(str(sms["Size"])))
             self.smsTable.setItem(i, 5, QtWidgets.QTableWidgetItem(sms["Content"]))
@@ -491,7 +558,7 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         try:
             ssh = paramiko.SSHClient()
             ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh.connect(router_ip, username=username, password=password)
+            ssh.connect(router_ip, username=username, password=password, look_for_keys=False, allow_agent=False)
 
             command = f'cellular 0/0/0 lte sms send {recipient} "{message}"'
             print(f"📤 Sending SMS: {command}")
