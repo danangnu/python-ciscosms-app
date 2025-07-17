@@ -29,6 +29,13 @@
     </widget>
    </item>
    <item>
+    <widget class="QLineEdit" name="gatewayLineEdit">
+     <property name="placeholderText">
+      <string>Gateway</string>
+     </property>
+    </widget>
+   </item>
+   <item>
     <widget class="QLineEdit" name="simLineEdit">
      <property name="placeholderText">
       <string>SIM Number</string>
