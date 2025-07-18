@@ -7,12 +7,13 @@ import threading
 import re
 import platform
 import subprocess
+import traceback
 from datetime import datetime
 from PyQt5 import QtWidgets, uic
 from sms_log_dialog import SMSLogDialog
 from PyQt5.QtGui import QMovie, QIcon
 from PyQt5.QtCore import Qt, QSize, QTimer, QObject, pyqtSignal, QMetaObject, pyqtSlot
-from PyQt5.QtWidgets import QPushButton, QHBoxLayout, QLabel, QToolButton, QMenu, QAction
+from PyQt5.QtWidgets import QWidget, QVBoxLayout, QPushButton, QHBoxLayout, QLabel, QToolButton, QMenu, QAction, QSizePolicy
 
 import mysql.connector
 import sip
@@ -27,21 +28,81 @@ def resource_path(relative_path):
         return os.path.join(sys._MEIPASS, relative_path)
     return os.path.join(os.path.abspath("."), relative_path)
 
+class LoadingSpinner(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setStyleSheet("background-color: rgba(255, 255, 255, 180);")  # Optional dim
+
+        layout = QVBoxLayout(self)
+        layout.setAlignment(Qt.AlignCenter)
+
+        self.label = QLabel()
+        self.label.setAlignment(Qt.AlignCenter)
+        self.movie = QMovie("spinner.gif")  # Your spinner GIF file
+        self.movie.setScaledSize(QSize(64, 64))
+        self.label.setMovie(self.movie)
+        layout.addWidget(self.label)
+
+        self.setVisible(False)
+
+    def start(self):
+        self.setVisible(True)
+        self.movie.start()
+
+    def stop(self):
+        self.setVisible(False)
+        self.movie.stop()
+
+class DetectSignals(QObject):
+    apnDetected = pyqtSignal(str)
+    gatewayDetected = pyqtSignal(str)
+    detectFailed = pyqtSignal(str)
+
 class DeviceSettingsDialog(QtWidgets.QDialog):
     def __init__(self, device=None, parent=None):
         super(DeviceSettingsDialog, self).__init__(parent)
         uic.loadUi(resource_path("device_settings_dialog.ui"), self)
+
+        self.detectSignals = DetectSignals()
+        self.detectSignals.apnDetected.connect(self.on_apn_detected)
+        self.detectSignals.gatewayDetected.connect(self.on_gateway_detected)
+        self.detectSignals.detectFailed.connect(self.on_apn_failed)
+
+        self.overlay = QtWidgets.QWidget(self)
+        self.overlay.setStyleSheet("background: rgba(255, 255, 255, 0.7);")
+        self.overlay.hide()
+
+        # Fill entire dialog
+        self.overlay.setGeometry(self.rect())
+        self.overlay.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+
+        self.overlaySpinner = LoadingSpinner(self.overlay)
+        self.overlaySpinner.setFixedSize(80, 80)
+        self.overlaySpinner.setGeometry(
+            self.overlay.width() // 2 - 40,
+            self.overlay.height() // 2 - 40,
+            80,
+            80
+        )
+
+        # Same for gateway detect
+        self.gatewaySpinner = LoadingSpinner(self)
+
         # Add Detect button next to Gateway field
         self.detectGatewayButton = QPushButton("Detect")
         getway_row_layout = QHBoxLayout()
         getway_row_layout.addWidget(self.gatewayLineEdit)
         getway_row_layout.addWidget(self.detectGatewayButton)
+        getway_row_layout.addWidget(self.gatewaySpinner)
 
         # Add Detect button next to APN field
         self.detectApnButton = QPushButton("Detect")
         apn_row_layout = QHBoxLayout()
         apn_row_layout.addWidget(self.apnLineEdit)
         apn_row_layout.addWidget(self.detectApnButton)
+
+        self.resizeEvent = self.resizeEvento  # Override resize event to update overlay
 
         # Replace the widget in the layout (4th item in the vertical layout, index = 3)
         layout: QtWidgets.QVBoxLayout = self.layout()
@@ -65,6 +126,18 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
         self.saveButton.clicked.connect(self.accept)
         self.cancelButton.clicked.connect(self.reject)
 
+    def resizeEvento(self, event):
+        super().resizeEvent(event)
+        self.overlay.setGeometry(self.rect())
+        self.overlaySpinner.setGeometry(
+            self.overlay.width() // 2 - 40,
+            self.overlay.height() // 2 - 40,
+            80,
+            80
+        )
+
+
+
     def get_data(self):
         return {
             "name": self.nameLineEdit.text(),
@@ -81,26 +154,47 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(self, "Missing IP", "Please enter the router IP first.")
             return
 
-        try:            
-            ssh = paramiko.SSHClient()
-            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh.connect(ip, username="admin", password="Bryan2011", look_for_keys=False, allow_agent=False)
+        self.overlay.show()
+        self.overlaySpinner.start()  # Spinner should be defined as LoadingSpinner
 
-            stdin, stdout, stderr = ssh.exec_command("show cellular 0/0/0 profile")
-            output = stdout.read().decode()
-            ssh.close()
+        def run():
+            try:
+                ssh = paramiko.SSHClient()
+                ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                ssh.connect(ip, username="admin", password="Bryan2011", look_for_keys=False, allow_agent=False)
 
-            # Extract APN from active profile
-            match = re.search(r"Profile 1 = ACTIVE.*?APN\) = ([^\s]+)", output, re.DOTALL)
-            if match:
-                apn = match.group(1)
-                self.apnLineEdit.setText(apn)
-                QtWidgets.QMessageBox.information(self, "APN Detected", f"Detected APN: {apn}")
-            else:
-                QtWidgets.QMessageBox.warning(self, "Not Found", "Could not detect APN in the output.")
+                stdin, stdout, stderr = ssh.exec_command("show cellular 0/0/0 profile")
+                output = stdout.read().decode()
+                ssh.close()
 
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "SSH Error", str(e))
+                match = re.search(r"Profile 1 = ACTIVE.*?APN\) = ([^\s]+)", output, re.DOTALL)
+                if match:
+                    apn = match.group(1)
+                    self.detectSignals.apnDetected.emit(apn)
+                else:
+                    self.detectSignals.detectFailed.emit("Could not detect APN in the output.")
+
+            except Exception as e:
+                self.detectSignals.detectFailed.emit(str(e))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def on_apn_detected(self, apn):
+        self.apnLineEdit.setText(apn)
+        self.overlaySpinner.stop()
+        self.overlay.hide()
+        QtWidgets.QMessageBox.information(self, "APN Detected", f"Detected APN: {apn}")
+
+    def on_gateway_detected(self, gateway):
+        self.gatewayLineEdit.setText(gateway)
+        self.overlaySpinner.stop()
+        self.overlay.hide()
+        QtWidgets.QMessageBox.information(self, "Gateway Detected", f"Detected Gateway: {gateway}")
+
+    def on_apn_failed(self, message):
+        self.overlaySpinner.stop()
+        self.overlay.hide()
+        QtWidgets.QMessageBox.warning(self, "Detection Failed", message)
 
     def handle_detect_gateway(self):
         ip = self.ipLineEdit.text().strip()
@@ -108,35 +202,39 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(self, "Missing IP", "Please enter the router IP first.")
             return
 
-        try:
-            ssh = paramiko.SSHClient()
-            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh.connect(ip, username="admin", password="Bryan2011", look_for_keys=False, allow_agent=False)
+        self.overlay.show()
+        self.overlaySpinner.start()
 
-            # Run config command
-            stdin, stdout, stderr = ssh.exec_command("show running-config | include ip route")
-            output = stdout.read().decode()
-            ssh.close()
+        def run():
+            try:
+                ssh = paramiko.SSHClient()
+                ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                ssh.connect(ip, username="admin", password="Bryan2011", look_for_keys=False, allow_agent=False)
 
-            gateway = None
-            ipv4_pattern = re.compile(r'^(\d{1,3}\.){3}\d{1,3}$')
+                stdin, stdout, stderr = ssh.exec_command("show running-config | include ip route")
+                output = stdout.read().decode()
+                ssh.close()
 
-            # Priority 1: with "track"
-            for line in output.splitlines():
-                if line.startswith("ip route 0.0.0.0 0.0.0.0") and "track" in line:                 
-                    parts = line.split()                   
-                    if len(parts) >= 5 and ipv4_pattern.match(parts[4]):
-                        gateway = parts[4]
-                        break
+                gateway = None
+                ipv4_pattern = re.compile(r'^(\d{1,3}\.){3}\d{1,3}$')
 
-            if gateway:
-                self.gatewayLineEdit.setText(gateway)
-                QtWidgets.QMessageBox.information(self, "Gateway Detected", f"Gateway: {gateway}")
-            else:
-                QtWidgets.QMessageBox.warning(self, "Not Found", "Could not detect gateway (only IP-based next-hop is supported).")
+                for line in output.splitlines():
+                    if line.startswith("ip route 0.0.0.0 0.0.0.0") and "track" in line:
+                        parts = line.split()
+                        if len(parts) >= 5 and ipv4_pattern.match(parts[4]):
+                            gateway = parts[4]
+                            break
 
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "SSH Error", f"Failed to connect or parse gateway:\n{str(e)}")
+                if gateway:
+                    self.detectSignals.gatewayDetected.emit(gateway)
+                else:
+                    self.detectSignals.detectFailed.emit("Could not detect gateway (only IP-based next-hop is supported).")
+
+            except Exception as e:
+                self.detectSignals.detectFailed.emit(str(e))
+
+        threading.Thread(target=run, daemon=True).start()
+
 
     
 def is_device_online(ip):
@@ -272,6 +370,15 @@ def insert_device_to_db(device):
     cursor.close()
     conn.close()
 
+def extract_sms_content(sms_text: str) -> str:
+    lines = sms_text.strip().splitlines()
+    for i, line in enumerate(lines):
+        if line.strip().startswith("SIZE:"):
+            # Return the line after 'SIZE:' (should be the content)
+            if i + 1 < len(lines):
+                return lines[i + 1].strip().strip('"')
+    return ""
+
 def fetch_last_sms(ip, username="admin", password="Bryan2011"):
     try:
         ssh = paramiko.SSHClient()
@@ -281,27 +388,28 @@ def fetch_last_sms(ip, username="admin", password="Bryan2011"):
         # Get all SMS
         stdin, stdout, stderr = ssh.exec_command("cellular 0/0/0 lte sms view all")
         sms_list_output = stdout.read().decode()
-
+        ssh.close()
         # Extract SMS indices
         index_matches = re.findall(r'SMS ID: (\d+)', sms_list_output)
         if not index_matches:
-            ssh.close()
             return "No SMS"
 
         last_index = max(map(int, index_matches))
 
         # Get the latest SMS
+        ssh.connect(ip, username=username, password=password, look_for_keys=False, allow_agent=False)
         cmd = f"cellular 0/0/0 lte sms view {last_index}"
         stdin, stdout, stderr = ssh.exec_command(cmd)
         sms_output = stdout.read().decode()
         ssh.close()
 
         # Extract message content (optional: truncate if too long)
-        msg_match = re.search(r'Message:\s*(.*)', sms_output)
-        return msg_match.group(1).strip()[:50] + "..." if msg_match else "Unreadable SMS"
+        msg_match = extract_sms_content(sms_output)
+        return msg_match
 
     except Exception as e:
         return f"Error: {str(e)}"
+        traceback.print_exc()
 
 def fetch_sms_details(router_ip, sms_index):
     ssh = paramiko.SSHClient()
@@ -424,9 +532,14 @@ class SendSMSDialog(QtWidgets.QDialog):
 
 
 class WorkerSignals(QObject):
-    finished = pyqtSignal(list)
+    deviceAdded = pyqtSignal(list)
+    smsLogsFetched = pyqtSignal(str, list)
     def __init__(self, parent=None):
         super().__init__(parent)
+
+class SMSUpdateSignal(QObject):
+    smsFetched = pyqtSignal(int, str)  # row index, SMS text
+
 
 class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
     def __init__(self):
@@ -435,20 +548,18 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         uic.loadUi(ui_file, self)
         self.just_added_device = False
         self.worker_signals = WorkerSignals(self)
-        self.worker_signals.finished.connect(self.update_devices_and_ui)
+        self.worker_signals.deviceAdded.connect(self.update_devices_and_ui)
+        self.worker_signals.smsLogsFetched.connect(self.display_sms_log_dialog_result)
+
+        self.sms_signal = SMSUpdateSignal()
+        self.sms_signal.smsFetched.connect(self.on_sms_fetched)
         print("Signal connected!")
-        self.spinner_label = QtWidgets.QLabel(self)
-        self.spinner_movie = QMovie(resource_path("spinner.gif"))
-        self.spinner_movie.setScaledSize(QSize(100, 100))
-        self.spinner_label.setMovie(self.spinner_movie)
-        self.spinner_label.setAlignment(Qt.AlignCenter)
-        self.spinner_label.setStyleSheet("background-color: rgba(255, 255, 255, 180); border-radius: 10px;")
-        self.spinner_label.setVisible(False)
-        self.spinner_label.resize(120, 120)
-        self.spinner_label.move(self.width()//2 - 60, self.height()//2 - 60)
+        self.spinner = LoadingSpinner(self)
+        self.spinner.setGeometry(self.rect())  # Match full window
+
+        self.resizeEvent = self._resizeEvent 
 
         self.devices = load_devices_from_db()
-        QTimer.singleShot(2000, lambda: self.worker_signals.finished.emit(self.devices))
         self.sms_logs = []
         self.is_paused = False
 
@@ -462,11 +573,9 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         self.load_devices(self.devices)
         self.start_syslog_listener()
 
-    @pyqtSlot(list)
-    def emit_finished_signal(self, updated_devices):
-        print("[MAIN] emit_finished_signal called")
-        self.worker_signals.finished.emit(updated_devices)
-
+    def _resizeEvent(self, event):
+        self.spinner.setGeometry(self.rect())  # Keep full size
+        super().resizeEvent(event)
 
     def get_router_name(self, ip):
         for device in self.devices:
@@ -562,17 +671,18 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             QTimer.singleShot(100 + i * 100, lambda row=i, ip=d["ip"]: self.update_last_sms(row, ip))
 
     def update_last_sms(self, row, ip):
-        import threading
-        from PyQt5.QtWidgets import QTableWidgetItem
-        from PyQt5.QtCore import QTimer
-
         def run():
             sms = fetch_last_sms(ip)
-            print(f"[RESULT] SMS from {ip}: {sms}")
-            # Use QTimer.singleShot(0, ...) to safely update UI from main thread
-            QTimer.singleShot(0, lambda: self.deviceTable.setItem(row, 6, QTableWidgetItem(sms)))
+            self.sms_signal.smsFetched.emit(row, sms)
 
         threading.Thread(target=run, daemon=True).start()
+
+
+
+    @pyqtSlot(int, str)
+    def on_sms_fetched(self, row, sms):
+        self.deviceTable.setItem(row, 6, QtWidgets.QTableWidgetItem(sms))
+
 
     def open_settings_dialog(self, index):
         device = self.devices[index]
@@ -594,9 +704,9 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         dialog = DeviceSettingsDialog(parent=self)
         if dialog.exec_() == QtWidgets.QDialog.Accepted:
             new_device = dialog.get_data()
-            self.show_spinner()
+            self.spinner.start()
             self.just_added_device = True  # <-- set flag
-            
+
             def background_task():
                 try:
                     insert_device_to_db(new_device)
@@ -605,46 +715,46 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
                         username="admin",
                         password="Bryan2011"
                     )
-                    time.sleep(3)
+                    time.sleep(2)
                     updated_devices = load_devices_from_db()
-                    print("[BG] Emitting finished signal (via QMetaObject)")
-                    QMetaObject.invokeMethod(
-                        self,
-                        "emit_finished_signal",
-                        Qt.QueuedConnection,
-                        (updated_devices,)
-                    )
+
+                    # Emit signal on main thread
+                    self.worker_signals.deviceAdded.emit(updated_devices)
                 except Exception as e:
-                    QMetaObject.invokeMethod(
-                        self,
-                        "emit_finished_signal",
-                        Qt.QueuedConnection,
-                        ([],)
-                    )
                     QTimer.singleShot(0, lambda: QtWidgets.QMessageBox.warning(
                         self, "Error", f"Failed to add device:\n{e}"
                     ))
                 finally:
-                    QTimer.singleShot(0, self.hide_spinner)
+                    QTimer.singleShot(0, self.spinner.stop())
 
             threading.Thread(target=background_task, daemon=True).start()
 
-
+    @pyqtSlot(list)
     def update_devices_and_ui(self, updated_devices):
-        print("✅ SLOT CALLED WITH DATA:", updated_devices)
         self.devices = updated_devices
         self.load_devices(self.devices)
-        print("✅ UI updated with new devices.")
-        if self.just_added_device:
-            QtWidgets.QMessageBox.information(self, "Success", "Device added successfully and table refreshed!")
-            # Optionally, you could trigger another callback here
-            # self.refresh_devices_from_db()
-            self.just_added_device = False  # reset flag
 
     def show_sms_log_dialog(self, index):
-        logs = fetch_all_sms(self.devices[index]["ip"])
-        dialog = SMSLogDialog(device_name=self.devices[index]["name"], sms_logs=logs, parent=self)
+        self.spinner.start()
+        name = self.devices[index]["name"]
+        ip = self.devices[index]["ip"]
+
+        def task():
+            try:
+                logs = fetch_all_sms(ip)
+                self.worker_signals.smsLogsFetched.emit(name, logs)
+            except Exception as e:
+                QTimer.singleShot(0, lambda: QtWidgets.QMessageBox.critical(self, "Error", str(e)))
+                self.worker_signals.smsLogsFetched.emit(name, [])
+
+        threading.Thread(target=task, daemon=True).start()
+
+    @pyqtSlot(str, list)
+    def display_sms_log_dialog_result(self, name, logs):
+        self.spinner.stop()
+        dialog = SMSLogDialog(device_name=name, sms_logs=logs, parent=self)
         dialog.exec_()
+
 
     def filter_devices(self):
         query = self.searchLineEdit.text().lower()
