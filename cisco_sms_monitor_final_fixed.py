@@ -8,6 +8,8 @@ import re
 import platform
 import subprocess
 import traceback
+import json
+from cryptography.fernet import Fernet
 from datetime import datetime
 from PyQt5 import QtWidgets, uic
 from sms_log_dialog import SMSLogDialog
@@ -27,6 +29,49 @@ def resource_path(relative_path):
     if hasattr(sys, '_MEIPASS'):
         return os.path.join(sys._MEIPASS, relative_path)
     return os.path.join(os.path.abspath("."), relative_path)
+
+FERNET_KEY = b"hZtFdYoCGy2E68Fz46zqFbW4NHnSLmP4F78w_BV9mN4="
+fernet = Fernet(FERNET_KEY)
+
+def encrypt_password(password):
+    return fernet.encrypt(password.encode())
+
+def decrypt_password(encrypted):
+    return fernet.decrypt(encrypted).decode()
+
+def get_db_config():
+    try:
+        with open("db_config.json", "r") as f:
+            config = json.load(f)
+            return {
+                "host": config.get("host"),
+                "port": config.get("port"),
+                "user": config.get("user"),
+                "password": config.get("password"),
+                "database": config.get("database")
+            }
+    except Exception as e:
+        print(f"⚠️ Failed to read DB config: {e}")
+        return None
+
+
+def get_ssh_credentials():
+    try:
+        db_config = get_db_config()
+        conn = mysql.connector.connect(**db_config)
+        cursor = conn.cursor()
+        cursor.execute("SELECT username, password FROM user_ssh ORDER BY id DESC LIMIT 1")
+        row = cursor.fetchone()
+        cursor.close()
+        conn.close()
+
+        if row:
+            return row[0], decrypt_password(row[1])
+
+    except Exception as e:
+        print(f"⚠️ Failed to load SSH credentials: {e}")
+        return None, None
+
 
 class LoadingSpinner(QWidget):
     def __init__(self, parent=None):
@@ -161,7 +206,8 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
             try:
                 ssh = paramiko.SSHClient()
                 ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                ssh.connect(ip, username="admin", password="Bryan2011", look_for_keys=False, allow_agent=False)
+                username, password = get_ssh_credentials()
+                ssh.connect(ip, username=username, password=password, look_for_keys=False, allow_agent=False)
 
                 stdin, stdout, stderr = ssh.exec_command("show cellular 0/0/0 profile")
                 output = stdout.read().decode()
@@ -209,7 +255,8 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
             try:
                 ssh = paramiko.SSHClient()
                 ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                ssh.connect(ip, username="admin", password="Bryan2011", look_for_keys=False, allow_agent=False)
+                username, password = get_ssh_credentials()
+                ssh.connect(ip, username=username, password=password, look_for_keys=False, allow_agent=False)
 
                 stdin, stdout, stderr = ssh.exec_command("show running-config | include ip route")
                 output = stdout.read().decode()
@@ -249,12 +296,9 @@ def is_device_online(ip):
         return False
 
 def load_devices_from_db():
-    conn = mysql.connector.connect(
-        host="localhost",
-        user="root",
-        password="admin1234!",
-        database="cisco_sms"
-    )
+    db_config = get_db_config()
+    conn = mysql.connector.connect(**db_config)
+    
     cursor = conn.cursor()
     cursor.execute("SELECT name, ip, gateway, sim, apn, email, id FROM devices")
     rows = cursor.fetchall()
@@ -279,12 +323,8 @@ def load_devices_from_db():
     return devices
 
 def update_device_in_db(device):
-    conn = mysql.connector.connect(
-        host="localhost",
-        user="root",
-        password="admin1234!",
-        database="cisco_sms"
-    )
+    db_config = get_db_config()
+    conn = mysql.connector.connect(**db_config)
     cursor = conn.cursor()
     cursor.execute("""
         UPDATE devices
@@ -341,12 +381,8 @@ def configure_sms_applet_on_cisco(router_ip, username, password):
         print(f"Failed to configure EEM on {router_ip}: {e}")
 
 def delete_device_from_db(device_id):
-    conn = mysql.connector.connect(
-        host="localhost",
-        user="root",
-        password="admin1234!",
-        database="cisco_sms"
-    )
+    db_config = get_db_config()
+    conn = mysql.connector.connect(**db_config)
     cursor = conn.cursor()
     cursor.execute("DELETE FROM devices WHERE id = %s", (device_id,))
     conn.commit()
@@ -355,12 +391,8 @@ def delete_device_from_db(device_id):
 
 
 def insert_device_to_db(device):
-    conn = mysql.connector.connect(
-        host="localhost",
-        user="root",
-        password="admin1234!",
-        database="cisco_sms"
-    )
+    db_config = get_db_config()
+    conn = mysql.connector.connect(**db_config)
     cursor = conn.cursor()
     cursor.execute("""
         INSERT INTO devices (name, ip, gateway, sim, apn, email)
@@ -379,10 +411,11 @@ def extract_sms_content(sms_text: str) -> str:
                 return lines[i + 1].strip().strip('"')
     return ""
 
-def fetch_last_sms(ip, username="admin", password="Bryan2011"):
+def fetch_last_sms(ip):
     try:
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        username, password = get_ssh_credentials()
         ssh.connect(ip, username=username, password=password, look_for_keys=False, allow_agent=False)
 
         # Get all SMS
@@ -414,7 +447,8 @@ def fetch_last_sms(ip, username="admin", password="Bryan2011"):
 def fetch_sms_details(router_ip, sms_index):
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ssh.connect(router_ip, username="admin", password="Bryan2011", look_for_keys=False, allow_agent=False)
+    username, password = get_ssh_credentials()
+    ssh.connect(router_ip, username=username, password=password, look_for_keys=False, allow_agent=False)
 
     command = f"cellular 0/0/0 lte sms view {sms_index}"
     stdin, stdout, stderr = ssh.exec_command(command)
@@ -465,7 +499,8 @@ def create_status_label(status):
 def fetch_all_sms(router_ip):
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ssh.connect(router_ip, username="admin", password="Bryan2011", look_for_keys=False, allow_agent=False)
+    username, password = get_ssh_credentials()
+    ssh.connect(router_ip, username=username, password=password, look_for_keys=False, allow_agent=False)
     shell = ssh.invoke_shell()
     time.sleep(1)
     shell.recv(1000)
@@ -529,7 +564,107 @@ class SendSMSDialog(QtWidgets.QDialog):
 
     def get_sms_data(self):
         return self.to_input.text(), self.message_input.toPlainText()
+    
+class SSHCredentialsDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        uic.loadUi(resource_path("ssh_credentials_dialog.ui"), self)
 
+        self.config_path = "ssh_key.key"
+        self.saveButton.clicked.connect(self.save_credentials)
+        self.cancelButton.clicked.connect(self.reject)
+
+        self.load_credentials()
+
+    def load_credentials(self):
+        try:
+            db_config = get_db_config()
+            conn = mysql.connector.connect(**db_config)
+            cursor = conn.cursor()
+            cursor.execute("SELECT username, password FROM user_ssh ORDER BY id DESC LIMIT 1")
+            row = cursor.fetchone()
+            if row:
+                self.usernameLineEdit.setText(row[0])
+                self.passwordLineEdit.setText(decrypt_password(row[1]))
+            cursor.close()
+            conn.close()
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Error", str(e))
+
+    def save_credentials(self):
+        username = self.usernameLineEdit.text()
+        password = self.passwordLineEdit.text()
+
+        if not username or not password:
+            QtWidgets.QMessageBox.warning(self, "Missing Fields", "Username and password are required.")
+            return
+
+        encrypted = encrypt_password(password)
+        try:
+            db_config = get_db_config()
+            conn = mysql.connector.connect(**db_config)
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM user_ssh")  # Replace with UPDATE if per-device later
+            cursor.execute("INSERT INTO user_ssh (username, password) VALUES (%s, %s)", (username, encrypted))
+            conn.commit()
+            cursor.close()
+            conn.close()
+            QtWidgets.QMessageBox.information(self, "Saved", "SSH credentials updated.")
+            self.accept()
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Error", str(e))
+
+
+class DBSettingsDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        uic.loadUi(resource_path("db_settings_dialog.ui"), self)
+
+        self.testButton.clicked.connect(self.test_connection)
+        self.saveButton.clicked.connect(self.save_settings)
+        self.cancelButton.clicked.connect(self.reject)
+
+        self.config_path = "db_config.json"
+        self.load_settings()
+
+    def load_settings(self):
+        try:
+            with open(self.config_path, "r") as f:
+                config = json.load(f)
+                self.hostLineEdit.setText(config.get("host", "localhost"))
+                self.portSpinBox.setValue(config.get("port", 3306))
+                self.userLineEdit.setText(config.get("user", "root"))
+                self.passwordLineEdit.setText(config.get("password", ""))
+                self.databaseLineEdit.setText(config.get("database", "test"))
+        except FileNotFoundError:
+            pass
+
+    def save_settings(self):
+        config = {
+            "host": self.hostLineEdit.text(),
+            "port": self.portSpinBox.value(),
+            "user": self.userLineEdit.text(),
+            "password": self.passwordLineEdit.text(),
+            "database": self.databaseLineEdit.text()
+        }
+        with open(self.config_path, "w") as f:
+            json.dump(config, f, indent=2)
+        QtWidgets.QMessageBox.information(self, "Saved", "Database settings saved.")
+        self.accept()
+
+    def test_connection(self):
+        try:
+            conn = mysql.connector.connect(
+                host=self.hostLineEdit.text(),
+                port=self.portSpinBox.value(),
+                user=self.userLineEdit.text(),
+                password=self.passwordLineEdit.text(),
+                database=self.databaseLineEdit.text()
+            )
+            conn.close()
+            QtWidgets.QMessageBox.information(self, "Success", "Connection successful!")
+        except mysql.connector.Error as err:
+            QtWidgets.QMessageBox.critical(self, "Connection Failed", str(err))
 
 class WorkerSignals(QObject):
     deviceAdded = pyqtSignal(list)
@@ -546,6 +681,20 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         super().__init__()
         ui_file = resource_path("combined_sms_monitor.ui")
         uic.loadUi(ui_file, self)
+        menu_bar = self.menuBar()
+
+        settings_menu = menu_bar.addMenu("Settings")
+
+        db_settings_action = QtWidgets.QAction("Database Settings", self)
+        db_settings_action.setIcon(QIcon("icons/gear.jpg"))  # Optional: add settings icon
+        db_settings_action.triggered.connect(self.open_db_settings)
+
+        settings_menu.addAction(db_settings_action)
+
+        ssh_settings_action = QtWidgets.QAction("Manage SSH Credentials", self)
+        ssh_settings_action.triggered.connect(self.open_ssh_credentials_dialog)
+        settings_menu.addAction(ssh_settings_action)
+
         self.just_added_device = False
         self.worker_signals = WorkerSignals(self)
         self.worker_signals.deviceAdded.connect(self.update_devices_and_ui)
@@ -603,6 +752,14 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             except Exception as e:
                 QtWidgets.QMessageBox.critical(self, "Error", f"Failed to delete device:\n{e}")
 
+    def open_db_settings(self):
+        dialog = DBSettingsDialog(self)
+        dialog.exec_()
+
+    def open_ssh_credentials_dialog(self):
+        dialog = SSHCredentialsDialog(self)
+        dialog.exec_()
+
 
     def refresh_devices_from_db(self):
         self.devices = load_devices_from_db()
@@ -633,7 +790,6 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             self.deviceTable.setItem(i, 3, QtWidgets.QTableWidgetItem(d["sim"]))
             self.deviceTable.setItem(i, 4, QtWidgets.QTableWidgetItem(d["apn"]))
             self.deviceTable.setItem(i, 5, QtWidgets.QTableWidgetItem(d["email"]))
-            # self.deviceTable.setItem(i, 6, QtWidgets.QTableWidgetItem(d.get("lastSMS", "")))
             self.deviceTable.setItem(i, 6, QtWidgets.QTableWidgetItem("Loading..."))
             self.deviceTable.setItem(i, 7, QtWidgets.QTableWidgetItem("▓" * d.get("signal", 0)))
             status_widget = create_status_label(device_list[i]["status"])
@@ -710,10 +866,11 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             def background_task():
                 try:
                     insert_device_to_db(new_device)
+                    username, password = get_ssh_credentials()
                     configure_sms_applet_on_cisco(
                         router_ip=new_device["ip"],
-                        username="admin",
-                        password="Bryan2011"
+                        username=username,
+                        password=password
                     )
                     time.sleep(2)
                     updated_devices = load_devices_from_db()
@@ -724,13 +881,12 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
                     QTimer.singleShot(0, lambda: QtWidgets.QMessageBox.warning(
                         self, "Error", f"Failed to add device:\n{e}"
                     ))
-                finally:
-                    QTimer.singleShot(0, self.spinner.stop())
 
             threading.Thread(target=background_task, daemon=True).start()
 
     @pyqtSlot(list)
     def update_devices_and_ui(self, updated_devices):
+        self.spinner.stop()
         self.devices = updated_devices
         self.load_devices(self.devices)
 
@@ -830,7 +986,8 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         dialog = SendSMSDialog(device_name=device["name"], router_ip=device["ip"], parent=self)
         if dialog.exec_() == QtWidgets.QDialog.Accepted:
             to_number, message = dialog.get_sms_data()
-            self.send_sms(device["ip"], "admin", "Bryan2011", to_number, message)
+            username, password = get_ssh_credentials()
+            self.send_sms(device["ip"], username, password, to_number, message)
 
     def start_syslog_listener(self):
         def listen():
@@ -857,10 +1014,13 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         t.start()
 
 def main():
-    app = QtWidgets.QApplication(sys.argv)
-    window = CiscoSMSMonitorApp()
-    window.show()
-    sys.exit(app.exec_())
+    try:
+        app = QtWidgets.QApplication(sys.argv)
+        window = CiscoSMSMonitorApp()
+        window.show()
+        sys.exit(app.exec_())
+    except Exception as e:
+        print(f"❌ App crashed: {e}")
 
 if __name__ == "__main__":
     main()

@@ -5,7 +5,7 @@ a = Analysis(
     ['cisco_sms_monitor_final_fixed.py'],
     pathex=[],
     binaries=[],
-    datas=[('combined_sms_monitor.ui', '.'), ('device_settings_dialog.ui', '.'), ('sms_log_dialog.ui', '.')],
+    datas=[('combined_sms_monitor.ui', '.'), ('device_settings_dialog.ui', '.'), ('sms_log_dialog.ui', '.'), ('icons', 'icons'), ('C:\\Users\\dnurdiansyah\\AppData\\Local\\Programs\\Python\\Python313\\Lib\\site-packages\\mysql\\connector\\locales', 'mysql\\connector\\locales')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
