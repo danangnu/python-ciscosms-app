@@ -84,7 +84,7 @@ class LoadingSpinner(QWidget):
 
         self.label = QLabel()
         self.label.setAlignment(Qt.AlignCenter)
-        self.movie = QMovie("spinner.gif")  # Your spinner GIF file
+        self.movie = QMovie(resource_path("spinner.gif"))  # Your spinner GIF file
         self.movie.setScaledSize(QSize(64, 64))
         self.label.setMovie(self.movie)
         layout.addWidget(self.label)
@@ -686,7 +686,7 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         settings_menu = menu_bar.addMenu("Settings")
 
         db_settings_action = QtWidgets.QAction("Database Settings", self)
-        db_settings_action.setIcon(QIcon("icons/gear.jpg"))  # Optional: add settings icon
+        db_settings_action.setIcon(QIcon(resource_path("icons/gear.jpg")))  # Optional: add settings icon
         db_settings_action.triggered.connect(self.open_db_settings)
 
         settings_menu.addAction(db_settings_action)
@@ -797,15 +797,15 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
 
             action_button = QToolButton()
             action_button.setText("Edit")
-            action_button.setIcon(QIcon("icons/edit.png"))
+            action_button.setIcon(QIcon(resource_path("icons/edit.png")))
             action_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
             action_button.setPopupMode(QToolButton.MenuButtonPopup)
 
             # Create dropdown menu
             menu = QMenu(action_button)
-            sms_logs_action = QAction(QIcon("icons/sms.png"),"SMS Logs", self)
-            send_sms_action = QAction(QIcon("icons/send.png"),"Send SMS", self)
-            delete_action = QAction(QIcon("icons/delete.png"),"Delete", self)
+            sms_logs_action = QAction(QIcon(resource_path("icons/sms.png")),"SMS Logs", self)
+            send_sms_action = QAction(QIcon(resource_path("icons/send.png")),"Send SMS", self)
+            delete_action = QAction(QIcon(resource_path("icons/delete.png")),"Delete", self)
 
             menu.addAction(sms_logs_action)
             menu.addAction(send_sms_action)
