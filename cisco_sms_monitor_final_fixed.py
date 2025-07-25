@@ -669,6 +669,7 @@ class DBSettingsDialog(QtWidgets.QDialog):
 class WorkerSignals(QObject):
     deviceAdded = pyqtSignal(list)
     smsLogsFetched = pyqtSignal(str, list)
+    refreshCompleted = pyqtSignal(list)
     def __init__(self, parent=None):
         super().__init__(parent)
 
@@ -681,6 +682,7 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         super().__init__()
         ui_file = resource_path("combined_sms_monitor.ui")
         uic.loadUi(ui_file, self)
+        self.setWindowIcon(QIcon(resource_path("icons/cisco.png")))
         menu_bar = self.menuBar()
 
         settings_menu = menu_bar.addMenu("Settings")
@@ -691,7 +693,7 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
 
         settings_menu.addAction(db_settings_action)
 
-        ssh_settings_action = QtWidgets.QAction("Manage SSH Credentials", self)
+        ssh_settings_action = QtWidgets.QAction(QIcon("icons/ssh.png"),"Manage SSH Credentials", self)
         ssh_settings_action.triggered.connect(self.open_ssh_credentials_dialog)
         settings_menu.addAction(ssh_settings_action)
 
@@ -699,6 +701,9 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         self.worker_signals = WorkerSignals(self)
         self.worker_signals.deviceAdded.connect(self.update_devices_and_ui)
         self.worker_signals.smsLogsFetched.connect(self.display_sms_log_dialog_result)
+
+        self.worker_signals.refreshCompleted.connect(self.update_devices_after_refresh)
+
 
         self.sms_signal = SMSUpdateSignal()
         self.sms_signal.smsFetched.connect(self.on_sms_fetched)
@@ -762,8 +767,25 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
 
 
     def refresh_devices_from_db(self):
-        self.devices = load_devices_from_db()
+        self.spinner.start()
+
+        def refresh_task():
+            try:
+                devices = load_devices_from_db()
+                # Schedule UI update on the main thread
+                self.worker_signals.refreshCompleted.emit(devices)
+            except Exception as e:
+                QTimer.singleShot(0, lambda: QtWidgets.QMessageBox.critical(self, "Error", f"Refresh failed: {e}"))
+                QTimer.singleShot(0, self.spinner.stop)
+
+        # ✅ Start the thread (this was missing)
+        threading.Thread(target=refresh_task, daemon=True).start()
+
+    @pyqtSlot(list)
+    def update_devices_after_refresh(self, devices):
+        self.devices = devices
         self.load_devices(self.devices)
+        self.spinner.stop()
 
     def show_spinner(self):
         self.addButton.setEnabled(False)
@@ -832,8 +854,6 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             self.sms_signal.smsFetched.emit(row, sms)
 
         threading.Thread(target=run, daemon=True).start()
-
-
 
     @pyqtSlot(int, str)
     def on_sms_fetched(self, row, sms):
@@ -1016,6 +1036,8 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
 def main():
     try:
         app = QtWidgets.QApplication(sys.argv)
+        app_icon = QIcon(resource_path("cisco.ico"))
+        app.setWindowIcon(app_icon)
         window = CiscoSMSMonitorApp()
         window.show()
         sys.exit(app.exec_())
