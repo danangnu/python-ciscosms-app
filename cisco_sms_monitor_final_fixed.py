@@ -9,6 +9,7 @@ import platform
 import subprocess
 import traceback
 import json
+import smtplib
 from cryptography.fernet import Fernet
 from datetime import datetime
 from PyQt5 import QtWidgets, uic
@@ -16,6 +17,9 @@ from sms_log_dialog import SMSLogDialog
 from PyQt5.QtGui import QMovie, QIcon
 from PyQt5.QtCore import Qt, QSize, QTimer, QObject, pyqtSignal, QMetaObject, pyqtSlot
 from PyQt5.QtWidgets import QWidget, QVBoxLayout, QPushButton, QHBoxLayout, QLabel, QToolButton, QMenu, QAction, QSizePolicy
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
 
 import mysql.connector
 import sip
@@ -23,6 +27,12 @@ import sip
 # No crash – safely register using sip
 sip.setapi('QString', 2)
 sip.setapi('QVariant', 2)
+
+# Email settings
+SMTP_SERVER = "192.168.18.25"  # Change if using a different provider
+SMTP_PORT = 25
+EMAIL_SENDER = "info@alliedrec.com.au"
+EMAIL_PASSWORD = "Nyepi2017"  # Consider using an App Password
 
 def resource_path(relative_path):
     """ Get absolute path to resource (works for .exe and dev) """
@@ -71,7 +81,141 @@ def get_ssh_credentials():
     except Exception as e:
         print(f"⚠️ Failed to load SSH credentials: {e}")
         return None, None
+    
+def get_email_profiles():
+    db_config = get_db_config()
+    conn = mysql.connector.connect(**db_config)
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT id, profile_name, smtp_server, smtp_port, sender_email, sender_password, security, is_default
+        FROM email_settings ORDER BY is_default DESC, profile_name ASC
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
 
+def get_default_email_profile():
+    db_config = get_db_config()
+    conn = mysql.connector.connect(**db_config)
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT id, profile_name, smtp_server, smtp_port, sender_email, sender_password, security, is_default
+        FROM email_settings ORDER BY is_default DESC, profile_name ASC LIMIT 1
+    """)
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return row
+
+def upsert_email_profile(profile):
+    """
+    profile dict: {id (optional), profile_name, smtp_server, smtp_port, sender_email,
+                   sender_password, security, is_default(bool)}
+    """
+    db_config = get_db_config()
+    conn = mysql.connector.connect(**db_config)
+    cur = conn.cursor()
+
+    # If setting default, unset others
+    if profile.get("is_default"):
+        cur.execute("UPDATE email_settings SET is_default = 0")
+
+    if profile.get("id"):
+        cur.execute("""
+            UPDATE email_settings
+               SET profile_name=%s, smtp_server=%s, smtp_port=%s,
+                   sender_email=%s, sender_password=%s, security=%s, is_default=%s
+             WHERE id=%s
+        """, (profile["profile_name"], profile["smtp_server"], int(profile["smtp_port"]),
+              profile["sender_email"], profile["sender_password"], profile["security"],
+              1 if profile.get("is_default") else 0, int(profile["id"])))
+    else:
+        cur.execute("""
+            INSERT INTO email_settings
+            (profile_name, smtp_server, smtp_port, sender_email, sender_password, security, is_default)
+            VALUES (%s,%s,%s,%s,%s,%s,%s)
+        """, (profile["profile_name"], profile["smtp_server"], int(profile["smtp_port"]),
+              profile["sender_email"], profile["sender_password"], profile["security"],
+              1 if profile.get("is_default") else 0))
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def delete_email_profile(profile_id):
+    db_config = get_db_config()
+    conn = mysql.connector.connect(**db_config)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM email_settings WHERE id=%s", (int(profile_id),))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def get_email_config_from_db():
+    """Retrieve SMTP and sender details from database."""
+    try:
+        db_config = get_db_config()
+        conn = mysql.connector.connect(**db_config)
+        cursor = conn.cursor(dictionary=True)
+
+        # Example: assuming your table is `email_config`
+        cursor.execute("""
+            SELECT smtp_server, smtp_port, smtp_user, smtp_password, sender_email
+            FROM email_config
+            WHERE active = 1
+            LIMIT 1
+        """)
+        config = cursor.fetchone()
+
+        cursor.close()
+        conn.close()
+        return config
+
+    except Exception as e:
+        print(f"❌ Error loading email config from DB: {e}")
+        return None
+    
+def send_email(sms_details, emailTo):
+    """Send an email with SMS details using config loaded from database."""
+    try:
+        config = get_email_config_from_db()
+        if not config:
+            print("❌ No email configuration found in database.")
+            return
+
+        msg = MIMEMultipart()
+        msg["From"] = config["sender_email"]
+        msg["To"] = emailTo
+        msg["Subject"] = f"New SMS Received from {sms_details['From']}"
+
+        body = f"""
+            📩 **New SMS Received**
+            --------------------------------------
+            🆔 ID: {sms_details['ID']}
+            ⏰ Time: {sms_details['Time']}
+            📞 From: {sms_details['From']}
+            📏 Size: {sms_details['Size']}
+            📜 Message: 
+            {sms_details['Content']}
+            --------------------------------------
+            """
+
+        msg.attach(MIMEText(body, "plain"))
+
+        server = smtplib.SMTP(config["smtp_server"], config["smtp_port"])
+        
+        # If SMTP requires login
+        if config["smtp_user"] and config["smtp_password"]:
+            server.login(config["smtp_user"], config["smtp_password"])
+        
+        server.sendmail(config["sender_email"], emailTo, msg.as_string())
+        server.quit()
+
+        print("✅ Email notification sent successfully!")
+
+    except Exception as e:
+        print(f"❌ Failed to send email: {e}")
 
 class LoadingSpinner(QWidget):
     def __init__(self, parent=None):
@@ -334,6 +478,27 @@ def update_device_in_db(device):
     conn.commit()
     cursor.close()
     conn.close()
+
+def get_email_by_router_ip(router_ip):
+    """
+    Fetch email for the given router_ip from the devices table.
+    """
+    db_config = get_db_config()
+    conn = mysql.connector.connect(**db_config)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT email
+        FROM devices
+        WHERE ip = %s
+    """, (router_ip,))
+
+    result = cursor.fetchone()
+
+    cursor.close()
+    conn.close()
+
+    return result[0] if result else None
 
 
 def get_ip_address():
@@ -666,6 +831,73 @@ class DBSettingsDialog(QtWidgets.QDialog):
         except mysql.connector.Error as err:
             QtWidgets.QMessageBox.critical(self, "Connection Failed", str(err))
 
+class EmailSettingsDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Email Settings")
+
+        layout = QVBoxLayout()
+        form_layout = QtWidgets.QFormLayout()
+
+        self.smtp_server_input = QtWidgets.QLineEdit()
+        self.smtp_port_input = QtWidgets.QLineEdit()
+        self.email_sender_input = QtWidgets.QLineEdit()
+        self.email_password_input = QtWidgets.QLineEdit()
+        self.email_password_input.setEchoMode(QtWidgets.QLineEdit.Password)
+
+        form_layout.addRow("SMTP Server:", self.smtp_server_input)
+        form_layout.addRow("SMTP Port:", self.smtp_port_input)
+        form_layout.addRow("Sender Email:", self.email_sender_input)
+        form_layout.addRow("Password:", self.email_password_input)
+
+        layout.addLayout(form_layout)
+
+        save_button = QPushButton("Save")
+        save_button.clicked.connect(self.save_settings)
+        layout.addWidget(save_button)
+
+        self.setLayout(layout)
+
+        self.load_settings()
+
+    def load_settings(self):
+        conn = mysql.connector.connect(**get_db_config())
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT smtp_server, smtp_port, email_sender, email_password FROM email_settings LIMIT 1")
+        row = cursor.fetchone()
+        cursor.close()
+        conn.close()
+
+        if row:
+            self.smtp_server_input.setText(row["smtp_server"])
+            self.smtp_port_input.setText(str(row["smtp_port"]))
+            self.email_sender_input.setText(row["email_sender"])
+            self.email_password_input.setText(row["email_password"])
+
+    def save_settings(self):
+        smtp_server = self.smtp_server_input.text()
+        smtp_port = self.smtp_port_input.text()
+        email_sender = self.email_sender_input.text()
+        email_password = self.email_password_input.text()
+
+        conn = mysql.connector.connect(**get_db_config())
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO email_settings (smtp_server, smtp_port, email_sender, email_password)
+            VALUES (%s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                smtp_server = VALUES(smtp_server),
+                smtp_port = VALUES(smtp_port),
+                email_sender = VALUES(email_sender),
+                email_password = VALUES(email_password)
+        """, (smtp_server, smtp_port, email_sender, email_password))
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+        self.accept()
+
+
 class WorkerSignals(QObject):
     deviceAdded = pyqtSignal(list)
     smsLogsFetched = pyqtSignal(str, list)
@@ -692,6 +924,12 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         db_settings_action.triggered.connect(self.open_db_settings)
 
         settings_menu.addAction(db_settings_action)
+
+        email_settings_action = QtWidgets.QAction("Email Settings", self)
+        email_settings_action.setIcon(QIcon(resource_path("icons/gear.jpg")))  # Optional: add settings icon
+        email_settings_action.triggered.connect(self.open_email_settings_dialog)
+
+        settings_menu.addAction(email_settings_action)
 
         ssh_settings_action = QtWidgets.QAction(QIcon("icons/ssh.png"),"Manage SSH Credentials", self)
         ssh_settings_action.triggered.connect(self.open_ssh_credentials_dialog)
@@ -760,6 +998,10 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
     def open_db_settings(self):
         dialog = DBSettingsDialog(self)
         dialog.exec_()
+
+    def open_email_settings_dialog(self):
+        dlg = EmailSettingsDialog(self)
+        dlg.exec_()
 
     def open_ssh_credentials_dialog(self):
         dialog = SSHCredentialsDialog(self)
@@ -1026,6 +1268,9 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
                 if match:
                     sms_index = match.group(1)
                     sms = fetch_sms_details(router_ip, sms_index)
+                    last_two_digits = "".join(router_ip.split(".")[-2:])
+                    router_ip = f"192.168.{last_two_digits}"
+                    send_email(sms, get_email_by_router_ip(router_ip))
                     sms["Router"] = self.get_router_name(router_ip)
                     self.add_sms_log(sms)
                 else:
