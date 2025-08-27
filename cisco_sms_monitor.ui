@@ -1,51 +1,51 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <ui version="4.0">
- <class>CiscoSMSMonitor</class>
- <widget class="QMainWindow" name="CiscoSMSMonitor">
-  <property name="geometry">
-   <rect>
-    <x>0</x>
-    <y>0</y>
-    <width>800</width>
-    <height>600</height>
-   </rect>
-  </property>
-  <property name="windowTitle">
-   <string>Cisco SMS Monitor</string>
-  </property>
-  <widget class="QWidget" name="centralwidget">
-   <layout class="QVBoxLayout" name="verticalLayout">
-    <item>
-     <widget class="QLineEdit" name="searchLineEdit">
-      <property name="placeholderText">
-       <string>Search by IP or Device Name</string>
-      </property>
-     </widget>
-    </item>
-    <item>
-     <widget class="QTableWidget" name="deviceTable"/>
-    </item>
-    <item>
-     <layout class="QHBoxLayout" name="buttonLayout">
-      <item>
-       <widget class="QPushButton" name="addButton">
-        <property name="text">
-         <string>Add Device</string>
+    <class>CiscoSMSMonitor</class>
+    <widget class="QMainWindow" name="CiscoSMSMonitor">
+        <property name="geometry">
+            <rect>
+                <x>0</x>
+                <y>0</y>
+                <width>800</width>
+                <height>600</height>
+            </rect>
         </property>
-       </widget>
-      </item>
-      <item>
-       <widget class="QPushButton" name="refreshButton">
-        <property name="text">
-         <string>Refresh</string>
+        <property name="windowTitle">
+            <string>Cisco SMS Monitor</string>
         </property>
-       </widget>
-      </item>
-     </layout>
-    </item>
-   </layout>
-  </widget>
- </widget>
- <resources/>
- <connections/>
+        <widget class="QWidget" name="centralwidget">
+            <layout class="QVBoxLayout" name="verticalLayout">
+                <item>
+                    <widget class="QLineEdit" name="searchLineEdit">
+                        <property name="placeholderText">
+                            <string>Search by IP or Device Name</string>
+                        </property>
+                    </widget>
+                </item>
+                <item>
+                    <widget class="QTableWidget" name="deviceTable"/>
+                </item>
+                <item>
+                    <layout class="QHBoxLayout" name="buttonLayout">
+                        <item>
+                            <widget class="QPushButton" name="addButton">
+                                <property name="text">
+                                    <string>Add Device</string>
+                                </property>
+                            </widget>
+                        </item>
+                        <item>
+                            <widget class="QPushButton" name="refreshButton">
+                                <property name="text">
+                                    <string>Refresh</string>
+                                </property>
+                            </widget>
+                        </item>
+                    </layout>
+                </item>
+            </layout>
+        </widget>
+    </widget>
+    <resources/>
+    <connections/>
 </ui>
