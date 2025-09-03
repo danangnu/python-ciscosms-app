@@ -1,81 +1,82 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <ui version="4.0">
- <class>DeviceSettingsDialog</class>
- <widget class="QDialog" name="DeviceSettingsDialog">
-  <property name="geometry">
-   <rect>
-    <x>0</x>
-    <y>0</y>
-    <width>400</width>
-    <height>300</height>
-   </rect>
-  </property>
-  <property name="windowTitle">
-   <string>Edit Device Settings</string>
-  </property>
-  <layout class="QVBoxLayout" name="verticalLayout">
-   <item>
-    <widget class="QLineEdit" name="nameLineEdit">
-     <property name="placeholderText">
-      <string>Device Name</string>
-     </property>
+    <class>DeviceSettingsDialog</class>
+    <widget class="QDialog" name="DeviceSettingsDialog">
+        <property name="geometry">
+            <rect>
+                <x>0</x>
+                <y>0</y>
+                <width>400</width>
+                <height>300</height>
+            </rect>
+        </property>
+        <property name="windowTitle">
+            <string>Edit Device Settings</string>
+        </property>
+        <layout class="QVBoxLayout" name="verticalLayout">
+            <item>
+                <widget class="QLineEdit" name="nameLineEdit">
+                    <property name="placeholderText">
+                        <string>Device Name</string>
+                    </property>
+                </widget>
+            </item>
+            <item>
+                <widget class="QLineEdit" name="ipLineEdit">
+                    <property name="placeholderText">
+                        <string>IP Address</string>
+                    </property>
+                </widget>
+            </item>
+            <item>
+                <widget class="QLineEdit" name="gatewayLineEdit">
+                    <property name="placeholderText">
+                        <string>Gateway</string>
+                    </property>
+                </widget>
+            </item>
+            <item>
+                <widget class="QLineEdit" name="simLineEdit">
+                    <property name="placeholderText">
+                        <string>SIM Number</string>
+                    </property>
+                </widget>
+            </item>
+            
+            <item>
+                <widget class="QLineEdit" name="apnLineEdit">
+                    <property name="placeholderText">
+                        <string>APN</string>
+                    </property>
+                </widget>
+            </item>
+            <item>
+                <widget class="QLineEdit" name="emailLineEdit">
+                    <property name="placeholderText">
+                        <string>Email</string>
+                    </property>
+                </widget>
+            </item>
+            <item>
+                <layout class="QHBoxLayout" name="buttonLayout">
+                    <item>
+                        <widget class="QPushButton" name="saveButton">
+                            <property name="text">
+                                <string>Save</string>
+                            </property>
+                        </widget>
+                    </item>
+                    <item>
+                        <widget class="QPushButton" name="cancelButton">
+                            <property name="text">
+                                <string>Cancel</string>
+                            </property>
+                        </widget>
+                    </item>
+                </layout>
+            </item>
+        </layout>
     </widget>
-   </item>
-   <item>
-    <widget class="QLineEdit" name="ipLineEdit">
-     <property name="placeholderText">
-      <string>IP Address</string>
-     </property>
-    </widget>
-   </item>
-   <item>
-    <widget class="QLineEdit" name="gatewayLineEdit">
-     <property name="placeholderText">
-      <string>Gateway</string>
-     </property>
-    </widget>
-   </item>
-   <item>
-    <widget class="QLineEdit" name="simLineEdit">
-     <property name="placeholderText">
-      <string>SIM Number</string>
-     </property>
-    </widget>
-   </item>
-   <item>
-    <widget class="QLineEdit" name="apnLineEdit">
-     <property name="placeholderText">
-      <string>APN</string>
-     </property>
-    </widget>
-   </item>
-   <item>
-    <widget class="QLineEdit" name="emailLineEdit">
-     <property name="placeholderText">
-      <string>Email</string>
-     </property>
-    </widget>
-   </item>
-   <item>
-    <layout class="QHBoxLayout" name="buttonLayout">
-     <item>
-      <widget class="QPushButton" name="saveButton">
-       <property name="text">
-        <string>Save</string>
-       </property>
-      </widget>
-     </item>
-     <item>
-      <widget class="QPushButton" name="cancelButton">
-       <property name="text">
-        <string>Cancel</string>
-       </property>
-      </widget>
-     </item>
-    </layout>
-   </item>
-  </layout>
- </widget>
- <resources/>
- <connections/>
+    <resources/>
+    <connections/>
 </ui>

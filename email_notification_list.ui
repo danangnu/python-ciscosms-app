@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+    <class>EmailNotification</class>
+    <widget class="QDialog" name="EmailNotification">
+        <property name="windowTitle">
+            <string>Email Settings</string>
+        </property>
+        <layout class="QVBoxLayout">
+            <item>
+                <layout class="QVBoxLayout" name="verticalLayout_content">
+                    <item>
+                        <widget class="QLabel" name="labelContent">
+                            <property name="text">
+                                <string>Subject:</string>
+                            </property>
+                        </widget>
+                    </item>
+                    <item>
+                        <widget class="QLineEdit" name="subjectEdit">
+                            <property name="placeholderText">
+                                <string>Subject</string>
+                            </property>
+                        </widget>
+                    </item>
+                </layout>
+            </item>
+            <item>
+                <layout class="QVBoxLayout" name="verticalLayout_content">
+                    <item>
+                        <widget class="QLabel" name="labelContent">
+                            <property name="text">
+                                <string>Email:</string>
+                            </property>
+                        </widget>
+                    </item>
+                    <item>
+                        <widget class="QPlainTextEdit" name="emailEdit">
+                            <property name="placeholderText">
+                                <string>Email</string>
+                            </property>
+                        </widget>
+                    </item>
+                </layout>
+            </item>
+            <item>
+                <layout class="QVBoxLayout" name="verticalLayout_content">
+                    <item>
+                        <widget class="QLabel" name="labelContent">
+                            <property name="text">
+                                <string>Content:</string>
+                            </property>
+                        </widget>
+                    </item>
+                    <item>
+                        <widget class="QPlainTextEdit" name="contentEdit">
+                            <property name="placeholderText">
+                                <string>content</string>
+                            </property>
+                        </widget>
+                    </item>
+                </layout>
+            </item>
+            <item>
+                <layout class="QHBoxLayout">
+                    <item>
+                        <widget class="QPushButton" name="saveButton">
+                            <property name="text">
+                                <string>Save</string>
+                            </property>
+                        </widget>
+                    </item>
+                    <item>
+                        <widget class="QPushButton" name="cancelButton">
+                            <property name="text">
+                                <string>Cancel</string>
+                            </property>
+                        </widget>
+                    </item>
+                </layout>
+            </item>
+        </layout>
+    </widget>
+    <resources/>
+    <connections/>
+</ui>

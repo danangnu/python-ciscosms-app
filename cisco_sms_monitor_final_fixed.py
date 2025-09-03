@@ -19,7 +19,10 @@ from PyQt5.QtCore import Qt, QSize, QTimer, QObject, pyqtSignal, QMetaObject, py
 from PyQt5.QtWidgets import QWidget, QVBoxLayout, QPushButton, QHBoxLayout, QLabel, QToolButton, QMenu, QAction, QSizePolicy
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-
+from PyQt5.QtWidgets import QMainWindow
+from PyQt5 import QtCore
+from datetime import datetime
+import traceback
 
 import mysql.connector
 import sip
@@ -64,6 +67,21 @@ def get_db_config():
         print(f"⚠️ Failed to read DB config: {e}")
         return None
 
+
+def get_db_config_ti():
+    try:
+        with open("db_config.json", "r") as f:
+            config = json.load(f)
+            return {
+                "host": config.get("host"),
+                "port": config.get("port"),
+                "user": config.get("user"),
+                "password": config.get("password"),
+                "database": config.get("database_trackit")
+            }
+    except Exception as e:
+        print(f"⚠️ Failed to read DB config: {e}")
+        return None
 
 def get_ssh_credentials():
     try:
@@ -439,6 +457,84 @@ def is_device_online(ip):
     except Exception:
         return False
 
+# Fast, SSH-relevant reachability check (better than ping in many networks)
+def is_device_online(ip: str, port: int = 22, timeout: float = 2.0) -> bool:
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+# More reliable local IP (avoid 127.* from gethostbyname(hostname))
+def get_ip_address() -> str:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    finally:
+        s.close()
+
+_ipv4_re = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+
+def is_device_register(ip: str, *, timeout: int = 8) -> bool:
+    """
+    True if router 'ip' has our syslog host configured (logging host <our_ip>).
+    - Fast-fails if device is offline or creds missing.
+    - Uses tight timeouts to avoid UI stalls.
+    """
+    # 1) Don’t attempt SSH if it’s not even reachable
+    if not is_device_online(ip):
+        return False
+
+    username, password = get_ssh_credentials()
+    if not username or not password:
+        print("⚠️ No SSH credentials available.")
+        return False
+
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        ssh.connect(
+            ip,
+            username=username,
+            password=password,
+            look_for_keys=False,
+            allow_agent=False,
+            timeout=timeout,
+            banner_timeout=timeout,
+            auth_timeout=timeout,
+        )
+
+        # Only fetch lines that matter; avoid pagination issues and big outputs
+        cmd = r"show running-config | include ^logging host "
+        stdin, stdout, stderr = ssh.exec_command(cmd)
+        output = stdout.read().decode(errors="ignore")
+    except Exception as e:
+        print(f"⚠️ is_device_register error for {ip}: {e}")
+        return False
+    finally:
+        try:
+            ssh.close()
+        except Exception:
+            pass
+
+    # 2) Extract configured logging hosts (IPv4) from the lines
+    hosts = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line.startswith("logging host"):
+            continue
+        m = _ipv4_re.search(line)
+        if m:
+            hosts.append(m.group(0))
+
+    # 3) Compare against our real local IP
+    my_ip = get_ip_address()
+    return my_ip in hosts
+
+
+   
+
 def load_devices_from_db():
     db_config = get_db_config()
     conn = mysql.connector.connect(**db_config)
@@ -452,6 +548,8 @@ def load_devices_from_db():
     for row in rows:
         ip = row[1]
         online = is_device_online(ip)
+        register = is_device_register(ip) if online else False
+        status = "Offline" if not online else ("Not Register" if not register else "Online")
         devices.append({
             "name": row[0],
             "ip": ip,
@@ -461,10 +559,232 @@ def load_devices_from_db():
             "email": row[5],
             "lastSMS": "",
             "signal": 0,
-            "status": "Online" if online else "Offline",
+            "status": status,
             "id": row[6]
         })
     return devices
+
+def is_phone_number(s: str) -> bool:
+    # Boleh diawali +, lalu 7–15 digit
+    return bool(re.fullmatch(r"\+?\d{7,15}", s))
+
+def is_hex_string(s: str) -> bool:
+    try:
+        int(s, 16)  # coba convert ke integer basis 16
+        return len(s) % 2 == 0  # panjang harus genap (tiap 2 char = 1 byte)
+    except ValueError:
+        return False
+def semi_octet_decode(hexstr: str) -> str:
+    """Decode nomor telp dari semi-octet swap"""
+    digits = ""
+    for i in range(0, len(hexstr), 2):
+        digits += hexstr[i+1] + hexstr[i]
+    return digits.rstrip("F")  # remove padding F
+
+def gsm7_decode(hexstr: str) -> str:
+    """Decode GSM7 (7-bit default alphabet)"""
+    bits = ""
+    for i in range(0, len(hexstr), 2):
+        bits += bin(int(hexstr[i:i+2], 16))[2:].zfill(8)[::-1]  # little-endian per octet
+    
+    septets = [bits[i:i+7][::-1] for i in range(0, len(bits), 7)]
+    septets = [s for s in septets if len(s) == 7]  
+
+    decoded = ""
+    for s in septets:
+        val = int(s, 2)
+        if 32 <= val <= 126:
+            decoded += chr(val)
+        else:
+            decoded += "?"  # fallback
+    return decoded.strip("?")
+
+def normalize_sender(sender: str) -> str:
+    """
+    Normalisasi pengirim SMS dari Cisco.
+    Bisa nomor telp (614xxxx) atau brand name (PIZZAHUT).
+    """
+    # case 1: sudah nomor telp
+    if re.fullmatch(r"\+?\d{6,15}", sender):
+        return sender
+
+    # case 2: hex string
+    if re.fullmatch(r"[0-9A-Fa-f]+", sender):
+        try:
+            # coba decode semi-octet → nomor
+            num = semi_octet_decode(sender)
+            if re.fullmatch(r"\d{6,15}", num):
+                return num
+
+            # kalau bukan nomor → coba decode ke GSM7 → brand
+            text = gsm7_decode(sender)
+            return text if text else sender
+        except Exception:
+            return sender
+
+    return sender
+
+def gsm7_unpack(hexstr):
+    # 1. Swap semi-octets (contoh: "0D" -> "D0")
+    swapped = "".join([hexstr[i+1] + hexstr[i] for i in range(0, len(hexstr), 2)])
+    data = bytes.fromhex(swapped)
+
+    # 2. GSM 7-bit unpacking
+    septets = []
+    carry = 0
+    carry_bits = 0
+    for b in data:
+        val = ((b << carry_bits) & 0x7F) | carry
+        septets.append(val)
+        carry = b >> (7 - carry_bits)
+        carry_bits += 1
+        if carry_bits == 7:
+            septets.append(carry)
+            carry = 0
+            carry_bits = 0
+
+    # 3. Convert septets to text
+    text = "".join(chr(s) for s in septets if 32 <= s <= 126)
+    return text
+
+def get_all_sms(ip):
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    username, password = get_ssh_credentials()
+    ssh.connect(ip, username=username, password=password, look_for_keys=False, allow_agent=False)
+
+    stdin, stdout, stderr = ssh.exec_command("cellular 0/0/0 lte sms view all")
+    sms_list_output = stdout.read().decode()
+    ssh.close()
+    return sms_list_output
+
+
+
+
+
+def parse_sms(raw_output):
+    sms_blocks = raw_output.strip().split("--------------------------------------------------------------------------------")
+    sms_list = []
+
+    for block in sms_blocks:
+        if not block.strip():
+            continue
+
+        sms = {}
+        for line in block.strip().splitlines():
+            if line.startswith("SMS ID:"):
+                sms["ID"] = int(line.replace("SMS ID:", "").strip())
+            elif line.startswith("TIME:"):
+                raw_time = line.replace("TIME:", "").strip()
+                sms_time = datetime.strptime(raw_time, "%y-%m-%d %H:%M:%S")  
+                sms["Time"] = sms_time
+            elif line.startswith("FROM:"):
+                raw = line.replace("FROM:", "").strip()
+                if is_phone_number(raw):
+                    smsFrom = raw
+                    if raw.startswith("61"):
+                        smsFrom = "0" + raw[2:]   # ubah ke format lokal
+                elif is_hex_string(raw):
+                    smsFrom = gsm7_unpack(raw)  # butuh fungsi decode PDU
+                else:
+                    smsFrom = raw
+                sms["From"] = smsFrom
+                sms["CiscoFrom"] = raw
+            elif line.startswith("SIZE:"):
+                sms["Size"] = int(line.replace("SIZE:", "").strip())
+            else:
+                # anggap sisanya adalah pesan SMS
+                sms["Message"] = sms.get("Message", "") + " " + line.strip()
+        sms_list.append(sms)
+    return sms_list
+
+def get_new_sms_by_time(ip, last_time):
+    raw = get_all_sms(ip)
+    all_sms = parse_sms(raw)
+
+    # Ambil SMS yang lebih baru dari last_time
+    new_sms = [sms for sms in all_sms if sms["Time"] > last_time]
+    return new_sms
+
+def save_sms_to_db(sms_list, device):
+    db_config = get_db_config()
+    conn = mysql.connector.connect(**db_config)
+
+    cursor = conn.cursor()
+    sql = """
+    INSERT IGNORE INTO sms_logs (dates, sms_from, cisco_from, size, message, devices_id)
+    VALUES (%s, %s, %s, %s, %s, %s)
+    """
+    for sms in sms_list:
+        cursor.execute(sql, (sms["Time"], sms["From"], sms["CiscoFrom"], sms["Size"], sms["Message"], device["id"]))
+    conn.commit()
+    cursor.close()
+
+    db_config = get_db_config()
+    conn = mysql.connector.connect(**db_config)
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM email_notification LIMIT 1")
+    row = cursor.fetchone()  # Ambil 1 baris
+    if row:  # pastikan ada data
+        subject = row[1]  # kolom 2
+        email   = row[2]  # kolom 3
+        content = row[3]  # kolom 4
+    else:
+        subject = email = content = None
+    conn.close()
+
+    db_config = get_db_config_ti()
+    conn = mysql.connector.connect(**db_config)
+    now = datetime.now()
+    cursor = conn.cursor()
+    sql = """
+    INSERT INTO logbulkmail(dates, times, sendto, mailsubject, mailcontent, mailstatus, mailtype, cc, spoofas, spoofname, attachment) 
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """
+    for sms in sms_list:
+        mailcontent = (
+            f"{content}<br />---------<br />From: {sms['From']}<br />"
+            f"Received: {sms['Time']}<br />SIM Detail: {device['name']} - {device['sim']}<br />"
+            f"Message: {sms['Message']}"
+        )
+        device["name"] + " - " + device["sim"] + "<br />" + "Message: " + sms["Message"]
+        emailReceive = sms["From"] + "@alliedsms.com.au"
+        
+        cursor.execute(sql, (now.date(), now.strftime("%I:%M:%S %p"), email, subject + " - " +  emailReceive, mailcontent, "Queue In Database", "Email", 1, emailReceive, emailReceive, 0))
+    conn.commit()
+    cursor.close()
+
+
+def fetch_from_all_devices(devices):
+    for device in devices:
+        db_config = get_db_config()
+        conn = mysql.connector.connect(**db_config)
+        cursor = conn.cursor()
+        cursor.execute("SELECT MAX(dates) FROM sms_logs WHERE devices_id=%s", (device["id"],))
+        # Ambil last time per device
+        last_time_str = cursor.fetchone()[0] or "2000-01-01 00:00:00"
+        conn.close()
+
+        if last_time_str == "2000-01-01 00:00:00":
+            last_time = datetime.strptime(last_time_str, "%Y-%m-%d %H:%M:%S")
+        else:
+            last_time = last_time_str
+
+        new_sms = get_new_sms_by_time(device["ip"], last_time)
+        if new_sms:
+            save_sms_to_db(new_sms, device)
+            print(f"✅ {len(new_sms)} SMS baru dari {device['ip']} disimpan")
+        
+    db_config = get_db_config()
+    conn = mysql.connector.connect(**db_config)
+    cursor = conn.cursor()
+    cursor.execute("SELECT `devices`.name, sms_logs.`dates`, sms_logs.`sms_from`, sms_logs.`message` FROM devices INNER JOIN sms_logs ON sms_logs.`devices_id` = devices.`id`")
+    smsList = cursor.fetchall()
+    # Ambil last time per device
+    conn.close()
+
+    return smsList
+
 
 def update_device_in_db(device):
     db_config = get_db_config()
@@ -654,6 +974,8 @@ def create_status_label(status):
     
     if status == "Online":
         text = '<span style="color: black;">Online </span><span style="color: #34d399; font-size: 20px;">●</span>'
+    elif status == "Not Register":
+        text = '<span style="color: black;">Not Register </span><span style="color: #708090; font-size: 20px;">●</span>'
     else:
         text = '<span style="color: black;">Offline </span><span style="color: #f87171; font-size: 20px;">●</span>'
 
@@ -701,6 +1023,27 @@ def fetch_all_sms(router_ip):
         }
         all_sms.append(sms_details)
     return all_sms
+
+def safe_set_text(widget, value):
+
+    text_value = str(value) if value is not None else ""
+
+    if hasattr(widget, "setPlainText"):  
+        # QPlainTextEdit
+        widget.setPlainText(text_value)
+    elif hasattr(widget, "setText"):  
+        # QLineEdit, QLabel, QPushButton, dll
+        widget.setText(text_value)
+    else:
+        raise TypeError(f"Widget {type(widget).__name__} is not support with this function")
+
+def safe_get_text(widget):
+    if hasattr(widget, "toPlainText"):  # QPlainTextEdit
+        return widget.toPlainText().strip()
+    elif hasattr(widget, "text"):  # QLineEdit, QLabel, QPushButton, dll
+        return widget.text().strip()
+    else:
+        raise TypeError(f"Widget {type(widget).__name__} tidak mendukung pengambilan teks")
 
 class SendSMSDialog(QtWidgets.QDialog):
     def __init__(self, device_name, router_ip, parent=None):
@@ -801,6 +1144,7 @@ class DBSettingsDialog(QtWidgets.QDialog):
                 self.userLineEdit.setText(config.get("user", "root"))
                 self.passwordLineEdit.setText(config.get("password", ""))
                 self.databaseLineEdit.setText(config.get("database", "test"))
+                self.databaseTILineEdit.setText(config.get("database_trackit", "test"))
         except FileNotFoundError:
             pass
 
@@ -810,7 +1154,8 @@ class DBSettingsDialog(QtWidgets.QDialog):
             "port": self.portSpinBox.value(),
             "user": self.userLineEdit.text(),
             "password": self.passwordLineEdit.text(),
-            "database": self.databaseLineEdit.text()
+            "database": self.databaseLineEdit.text(),
+            "database_trackit": self.databaseTILineEdit.text()
         }
         with open(self.config_path, "w") as f:
             json.dump(config, f, indent=2)
@@ -825,6 +1170,14 @@ class DBSettingsDialog(QtWidgets.QDialog):
                 user=self.userLineEdit.text(),
                 password=self.passwordLineEdit.text(),
                 database=self.databaseLineEdit.text()
+            )
+            conn.close()
+            conn = mysql.connector.connect(
+                host=self.hostLineEdit.text(),
+                port=self.portSpinBox.value(),
+                user=self.userLineEdit.text(),
+                password=self.passwordLineEdit.text(),
+                database=self.databaseTILineEdit.text()
             )
             conn.close()
             QtWidgets.QMessageBox.information(self, "Success", "Connection successful!")
@@ -919,10 +1272,64 @@ class IPItem(QtWidgets.QTableWidgetItem):
                 # Non-IP values go last
                 return (999, 999, 999, 999)
         return ip_key(self.text()) < ip_key(other.text())
+    
+class EmailNotificationDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        uic.loadUi(resource_path("email_notification_list.ui"), self)
+        self.saveButton.clicked.connect(self.save_setting)
+        self.cancelButton.clicked.connect(self.reject)
+
+        self.loadData()
+
+    def loadData(self):
+        try:
+            db_config = get_db_config()
+            conn = mysql.connector.connect(**db_config)
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM email_notification LIMIT 1")
+            row = cursor.fetchone()
+            if row:
+                safe_set_text(self.subjectEdit, row[1])
+                safe_set_text(self.emailEdit, row[2])
+                safe_set_text(self.contentEdit, row[3])
+                # self.subjectEdit.setText(row[1])
+                # self.emailEdit.setPlainText(row[2])
+                # self.contentEdit.setPlainText(row[3])
+            cursor.close()
+            conn.close()
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Error", str(e))
+
+    def save_setting(self):
+        subject = safe_get_text(self.subjectEdit) 
+        email = safe_get_text(self.emailEdit) 
+        content = safe_get_text(self.contentEdit) 
+        # email = self.emailEdit.toPlainText()
+        # content = self.contentEdit.toPlainText()
+
+        if not subject or not email or not content:
+            QtWidgets.QMessageBox.warning(self, "Missing Fields", "subject, email and content are required.")
+            return
+        try:
+            db_config = get_db_config()
+            conn = mysql.connector.connect(**db_config)
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM email_notification")  # Replace with UPDATE if per-device later
+            cursor.execute("INSERT INTO email_notification (subject, email, content) VALUES (%s, %s, %s)", (subject, email, content))
+            conn.commit()
+            cursor.close()
+            conn.close()
+            QtWidgets.QMessageBox.information(self, "Saved", "Email Notification Setting updated.")
+            self.accept()
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Error", str(e))
 
 class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
+
+        
         ui_file = resource_path("combined_sms_monitor.ui")
         uic.loadUi(ui_file, self)
         self.setWindowIcon(QIcon(resource_path("icons/cisco.png")))
@@ -993,6 +1400,10 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         ssh_settings_action.triggered.connect(self.open_ssh_credentials_dialog)
         settings_menu.addAction(ssh_settings_action)
 
+        notification_list = QtWidgets.QAction(QIcon("icons/gear.jpg"),"Email Notification", self)
+        notification_list.triggered.connect(self.open_email_notification)
+        settings_menu.addAction(notification_list)
+
         self.just_added_device = False
         self.worker_signals = WorkerSignals(self)
         self.worker_signals.deviceAdded.connect(self.update_devices_and_ui)
@@ -1015,13 +1426,42 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
 
         self.addButton.clicked.connect(self.add_device)
         self.refreshButton.clicked.connect(self.refresh_devices_from_db)
+        self.refreshButtonSMS.clicked.connect(self.fetch_all_devices)
         self.searchLineEdit.textChanged.connect(self.filter_devices)
         self.pauseButton.clicked.connect(self.toggle_pause)
         self.exportButton.clicked.connect(self.export_to_csv)
         self.smsSearchLineEdit.textChanged.connect(self.filter_sms_logs)
 
         self.load_devices(self.devices)
+
         self.start_syslog_listener()
+        # Timer untuk fetch SMS tiap 1 menit
+        self.timer = QtCore.QTimer(self)
+        self.timer.timeout.connect(self.fetch_all_devices)  # fungsi yang kamu buat
+        self.timer.start(60 * 5000)  # 60 detik
+
+        # Pertama kali langsung jalan
+        self.fetch_all_devices()
+
+    def fetch_all_devices(self):
+        self.devices = load_devices_from_db()
+        print("🔄 Ambil SMS dari semua device...")
+        # panggil fungsi fetch_from_all_devices() yang kita buat sebelumnya
+        smsList = fetch_from_all_devices(self.devices)
+        self.smsTable.setColumnCount(4)
+        self.smsTable.setColumnWidth(0, 150)
+        self.smsTable.setColumnWidth(1, 150)
+        self.smsTable.setColumnWidth(2, 150)
+        self.smsTable.setColumnWidth(3, 350)
+        self.smsTable.setHorizontalHeaderLabels([
+            "Device", "Message Receive", "Message From", "Message Content"
+        ])
+        self.smsTable.setRowCount(len(smsList))
+        for i, d in enumerate(smsList):
+            self.smsTable.setItem(i, 0, QtWidgets.QTableWidgetItem(str(d[0] or "")))
+            self.smsTable.setItem(i, 1, QtWidgets.QTableWidgetItem(str(d[1] or "")))
+            self.smsTable.setItem(i, 2, QtWidgets.QTableWidgetItem(str(d[2] or "")))
+            self.smsTable.setItem(i, 3, QtWidgets.QTableWidgetItem(str(d[3] or "")))
 
     def _resizeEvent(self, event):
         self.spinner.setGeometry(self.rect())  # Keep full size
@@ -1118,6 +1558,10 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
     def open_email_settings_dialog(self):
         dlg = EmailSettingsDialog(self)
         dlg.exec_()
+        
+    def open_email_notification(self):
+        dlg = EmailNotificationDialog(self)
+        dlg.show()
 
     def open_ssh_credentials_dialog(self):
         dialog = SSHCredentialsDialog(self)
@@ -1156,6 +1600,31 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         self.spinner_label.setVisible(False)
         self.addButton.setEnabled(True)
 
+    def device_register(self,index):
+        ip = self.devices[index]["ip"]
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        username, password = get_ssh_credentials()
+        ssh.connect(ip, username=username, password=password, look_for_keys=False, allow_agent=False)
+        shell = ssh.invoke_shell()
+        commands = [
+            "conf t",
+            f"logging host {get_ip_address()}",
+            "end",
+            "write memory"
+        ]
+
+        for cmd in commands:
+            shell.send(cmd + "\n")
+            import time
+            time.sleep(1)  # kasih jeda supaya Cisco proses command
+        time.sleep(2)  # tunggu output terkumpul
+        output = shell.recv(5000).decode()
+        ssh.close()
+        devices = load_devices_from_db()
+        self.load_devices(devices)
+
+    
     def load_devices(self, device_list):
         print(f"🔄 Loading {len(device_list)} devices into table")
         self.deviceTable.setSortingEnabled(False)  # prevent churn while filling
@@ -1191,6 +1660,20 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             status_widget = create_status_label(device_list[i]["status"])
             self.deviceTable.setCellWidget(i, 8, status_widget)
 
+           
+            # Create dropdown menu
+            if device_list[i]["status"] == "Not Register":
+                action_button = QToolButton()
+                action_button.setText("Device Register")
+                action_button.setIcon(QIcon(resource_path("icons/gear.jpg")))
+                action_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+                action_button.clicked.connect(lambda _, row=i: self.device_register(row))
+            else:
+                action_button = QToolButton()
+                action_button.setText("Edit")
+                action_button.setIcon(QIcon(resource_path("icons/edit.png")))
+                action_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+                action_button.setPopupMode(QToolButton.MenuButtonPopup)
             # Actions (menu) — unchanged except the bit we added earlier for SIM check
             action_button = QToolButton()
             action_button.setText("Edit")
@@ -1218,6 +1701,8 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             menu.addAction(send_sms_action)
             menu.addSeparator()
             menu.addAction(delete_action)
+
+
 
             action_button.setMenu(menu)
 
@@ -1316,6 +1801,7 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         self.spinner.stop()
         dialog = SMSLogDialog(device_name=name, sms_logs=logs, parent=self)
         dialog.exec_()
+
 
 
     def filter_devices(self):
@@ -1442,6 +1928,6 @@ def main():
         sys.exit(app.exec_())
     except Exception as e:
         print(f"❌ App crashed: {e}")
-
+        traceback.print_exc()
 if __name__ == "__main__":
     main()
