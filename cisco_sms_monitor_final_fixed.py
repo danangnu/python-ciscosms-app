@@ -457,25 +457,81 @@ def is_device_online(ip):
     except Exception:
         return False
 
-def is_device_register(ip):
+# Fast, SSH-relevant reachability check (better than ping in many networks)
+def is_device_online(ip: str, port: int = 22, timeout: float = 2.0) -> bool:
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+# More reliable local IP (avoid 127.* from gethostbyname(hostname))
+def get_ip_address() -> str:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    finally:
+        s.close()
+
+_ipv4_re = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+
+def is_device_register(ip: str, *, timeout: int = 8) -> bool:
+    """
+    True if router 'ip' has our syslog host configured (logging host <our_ip>).
+    - Fast-fails if device is offline or creds missing.
+    - Uses tight timeouts to avoid UI stalls.
+    """
+    # 1) Don’t attempt SSH if it’s not even reachable
+    if not is_device_online(ip):
+        return False
+
+    username, password = get_ssh_credentials()
+    if not username or not password:
+        print("⚠️ No SSH credentials available.")
+        return False
+
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    username, password = get_ssh_credentials()
-    ssh.connect(ip, username=username, password=password, look_for_keys=False, allow_agent=False)
+    try:
+        ssh.connect(
+            ip,
+            username=username,
+            password=password,
+            look_for_keys=False,
+            allow_agent=False,
+            timeout=timeout,
+            banner_timeout=timeout,
+            auth_timeout=timeout,
+        )
 
-    stdin, stdout, stderr = ssh.exec_command("show running-config | include logging")
-    logging_list = stdout.read().decode()
-    ssh.close()
-
-    lines = logging_list.splitlines()
-    hosts = [line.replace("logging host ", "").strip() 
-            for line in lines if line.strip().startswith("logging host")]
-
-    ip_to_check = get_ip_address()
-    if ip_to_check in hosts:
-        return True
-    else:
+        # Only fetch lines that matter; avoid pagination issues and big outputs
+        cmd = r"show running-config | include ^logging host "
+        stdin, stdout, stderr = ssh.exec_command(cmd)
+        output = stdout.read().decode(errors="ignore")
+    except Exception as e:
+        print(f"⚠️ is_device_register error for {ip}: {e}")
         return False
+    finally:
+        try:
+            ssh.close()
+        except Exception:
+            pass
+
+    # 2) Extract configured logging hosts (IPv4) from the lines
+    hosts = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line.startswith("logging host"):
+            continue
+        m = _ipv4_re.search(line)
+        if m:
+            hosts.append(m.group(0))
+
+    # 3) Compare against our real local IP
+    my_ip = get_ip_address()
+    return my_ip in hosts
+
 
    
 
@@ -492,7 +548,8 @@ def load_devices_from_db():
     for row in rows:
         ip = row[1]
         online = is_device_online(ip)
-        register = is_device_register(ip)
+        register = is_device_register(ip) if online else False
+        status = "Offline" if not online else ("Not Register" if not register else "Online")
         devices.append({
             "name": row[0],
             "ip": ip,
@@ -502,7 +559,7 @@ def load_devices_from_db():
             "email": row[5],
             "lastSMS": "",
             "signal": 0,
-            "status": "Not Register" if register == False else "Online" if online else "Offline",
+            "status": status,
             "id": row[6]
         })
     return devices
@@ -1204,6 +1261,18 @@ class WorkerSignals(QObject):
 class SMSUpdateSignal(QObject):
     smsFetched = pyqtSignal(int, str)  # row index, SMS text
 
+class IPItem(QtWidgets.QTableWidgetItem):
+    """QTableWidgetItem that sorts IPv4 addresses numerically."""
+    def __lt__(self, other):
+        def ip_key(s):
+            try:
+                a, b, c, d = (int(x) for x in s.split("."))
+                return (a, b, c, d)
+            except Exception:
+                # Non-IP values go last
+                return (999, 999, 999, 999)
+        return ip_key(self.text()) < ip_key(other.text())
+    
 class EmailNotificationDialog(QtWidgets.QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1264,6 +1333,53 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         ui_file = resource_path("combined_sms_monitor.ui")
         uic.loadUi(ui_file, self)
         self.setWindowIcon(QIcon(resource_path("icons/cisco.png")))
+        self.statusBar()
+        # === Filter & Sort toolbar ===
+        toolbar = self.addToolBar("Filter & Sort")
+        toolbar.setMovable(False)
+
+        # Status filter
+        from PyQt5.QtWidgets import QComboBox, QCheckBox
+        toolbar.addWidget(QLabel("Status:"))
+        self.statusFilterCombo = QComboBox()
+        self.statusFilterCombo.addItems(["All", "Online", "Offline"])
+        toolbar.addWidget(self.statusFilterCombo)
+
+        # SIM-only filter
+        self.simOnlyCheck = QCheckBox("SIM only")
+        toolbar.addWidget(self.simOnlyCheck)
+
+        # Sort controls
+        toolbar.addSeparator()
+        toolbar.addWidget(QLabel("Sort by:"))
+        self.sortByCombo = QComboBox()
+        self.sortByCombo.addItems(["Device", "IP", "Status", "Gateway"])
+        toolbar.addWidget(self.sortByCombo)
+
+        self.sortOrderButton = QPushButton("Asc")
+        self.sortOrderButton.setCheckable(True)  # checked = Desc
+        toolbar.addWidget(self.sortOrderButton)
+
+        # Hook up signals
+        self.statusFilterCombo.currentIndexChanged.connect(self.apply_filters_and_sort)
+        self.simOnlyCheck.toggled.connect(self.apply_filters_and_sort)
+        self.sortByCombo.currentIndexChanged.connect(self.apply_filters_and_sort)
+
+        def toggle_sort_order():
+            if self.sortOrderButton.isChecked():
+                self.sortOrderButton.setText("Desc")
+            else:
+                self.sortOrderButton.setText("Asc")
+            self.apply_filters_and_sort()
+
+        self.sortOrderButton.clicked.connect(toggle_sort_order)
+
+        # Enable interactive sorting by clicking headers too
+        self.deviceTable.setSortingEnabled(True)
+        self.deviceTable.horizontalHeader().sortIndicatorChanged.connect(
+            lambda *_: None  # no-op; sorting is handled automatically by the widget
+        )
+
         menu_bar = self.menuBar()
 
         settings_menu = menu_bar.addMenu("Settings")
@@ -1351,6 +1467,64 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         self.spinner.setGeometry(self.rect())  # Keep full size
         super().resizeEvent(event)
 
+    def filter_devices(self):
+        self.apply_filters_and_sort()
+
+
+    def apply_filters_and_sort(self):
+        # --- 1) Start from the full device list ---
+        devices = list(self.devices)
+
+        # --- 2) Apply text search (same as your filter_devices) ---
+        query = (self.searchLineEdit.text() or "").lower().strip()
+        if query:
+            devices = [
+                d for d in devices
+                if query in d["name"].lower()
+                or query in d["ip"]
+                or query in (d.get("sim") or "")
+            ]
+
+        # --- 3) Apply Status filter ---
+        status_sel = self.statusFilterCombo.currentText()
+        if status_sel in ("Online", "Offline"):
+            devices = [d for d in devices if d["status"] == status_sel]
+
+        # --- 4) Apply SIM-only filter ---
+        if self.simOnlyCheck.isChecked():
+            devices = [d for d in devices if (d.get("sim") or "").strip()]
+
+        # --- 5) Sort selection ---
+        # Map visible labels to column indices used in the table
+        # 0: Device, 1: IP, 2: Gateway, 8: Status (table indices)
+        sort_map = {
+            "Device": 0,
+            "IP": 1,
+            "Gateway": 2,
+            "Status": 8
+        }
+        sort_label = self.sortByCombo.currentText()
+        sort_col = sort_map.get(sort_label, 0)
+
+        # (Re)load table with filtered devices
+        # Preserve current header sort indicator if user clicked the header
+        header = self.deviceTable.horizontalHeader()
+        cur_sort_col = header.sortIndicatorSection()
+        cur_sort_order = header.sortIndicatorOrder()
+
+        self.load_devices(devices)
+
+        # Programmatic sort: prefer toolbar selection; if header already used, keep it.
+        if sort_col is not None:
+            # Use IP-aware sorting via IPItem (we inserted below in load_devices)
+            # Decide order
+            order = Qt.AscendingOrder if not self.sortOrderButton.isChecked() else Qt.DescendingOrder
+            self.deviceTable.sortItems(sort_col, order)
+        else:
+            # If unknown selection, keep prior header sorting
+            self.deviceTable.sortItems(cur_sort_col, cur_sort_order)
+
+
     def get_router_name(self, ip):
         for device in self.devices:
             if device["ip"] == ip:
@@ -1372,7 +1546,7 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             try:
                 delete_device_from_db(device["id"])  # Implement this function to delete by ID
                 self.devices.pop(row_index)
-                self.load_devices(self.devices)
+                self.apply_filters_and_sort()
                 QtWidgets.QMessageBox.information(self, "Deleted", f"Device '{name}' was deleted.")
             except Exception as e:
                 QtWidgets.QMessageBox.critical(self, "Error", f"Failed to delete device:\n{e}")
@@ -1412,7 +1586,7 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
     @pyqtSlot(list)
     def update_devices_after_refresh(self, devices):
         self.devices = devices
-        self.load_devices(self.devices)
+        self.apply_filters_and_sort()
         self.spinner.stop()
 
     def show_spinner(self):
@@ -1453,20 +1627,36 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
     
     def load_devices(self, device_list):
         print(f"🔄 Loading {len(device_list)} devices into table")
+        self.deviceTable.setSortingEnabled(False)  # prevent churn while filling
+
         self.deviceTable.setColumnCount(10)
         self.deviceTable.setHorizontalHeaderLabels([
             "Device", "IP", "Gateway", "SIM", "APN", "Email", "Last SMS", "Signal", "Status", "Actions"
         ])
         self.deviceTable.setRowCount(len(device_list))
+
         for i, d in enumerate(device_list):
+            # Device
             self.deviceTable.setItem(i, 0, QtWidgets.QTableWidgetItem(d["name"]))
-            self.deviceTable.setItem(i, 1, QtWidgets.QTableWidgetItem(d["ip"]))
+
+            # IP (use IPItem for correct numeric sorting)
+            self.deviceTable.setItem(i, 1, IPItem(d["ip"]))
+
+            # Gateway
             self.deviceTable.setItem(i, 2, QtWidgets.QTableWidgetItem(d["gateway"]))
+
+            # SIM / APN / Email
             self.deviceTable.setItem(i, 3, QtWidgets.QTableWidgetItem(d["sim"]))
             self.deviceTable.setItem(i, 4, QtWidgets.QTableWidgetItem(d["apn"]))
             self.deviceTable.setItem(i, 5, QtWidgets.QTableWidgetItem(d["email"]))
+
+            # Last SMS placeholder
             self.deviceTable.setItem(i, 6, QtWidgets.QTableWidgetItem("Loading..."))
+
+            # Signal bars
             self.deviceTable.setItem(i, 7, QtWidgets.QTableWidgetItem("▓" * d.get("signal", 0)))
+
+            # Status (string sort is fine, “Offline” > “Online”; toolbar lets user flip order)
             status_widget = create_status_label(device_list[i]["status"])
             self.deviceTable.setCellWidget(i, 8, status_widget)
 
@@ -1484,30 +1674,50 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
                 action_button.setIcon(QIcon(resource_path("icons/edit.png")))
                 action_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
                 action_button.setPopupMode(QToolButton.MenuButtonPopup)
+            # Actions (menu) — unchanged except the bit we added earlier for SIM check
+            action_button = QToolButton()
+            action_button.setText("Edit")
+            action_button.setIcon(QIcon(resource_path("icons/edit.png")))
+            action_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+            action_button.setPopupMode(QToolButton.MenuButtonPopup)
 
-                menu = QMenu(action_button)
-                sms_logs_action = QAction(QIcon(resource_path("icons/sms.png")),"SMS Logs", self)
-                send_sms_action = QAction(QIcon(resource_path("icons/send.png")),"Send SMS", self)
-                delete_action = QAction(QIcon(resource_path("icons/delete.png")),"Delete", self)
+            menu = QMenu(action_button)
+            sms_logs_action = QAction(QIcon(resource_path("icons/sms.png")),"SMS Logs", self)
+            send_sms_action = QAction(QIcon(resource_path("icons/send.png")),"Send SMS", self)
+            delete_action = QAction(QIcon(resource_path("icons/delete.png")),"Delete", self)
 
-                menu.addAction(sms_logs_action)
-                menu.addAction(send_sms_action)
-                menu.addSeparator()
-                menu.addAction(delete_action)
+            menu.addAction(sms_logs_action)
 
-                # Assign menu to button
-                action_button.setMenu(menu)
+            sim_present = bool((d.get("sim") or "").strip())
+            send_sms_action.setEnabled(sim_present)
+            if not sim_present:
+                # status tip shows in your status bar (we enabled it)
+                send_sms_action.setStatusTip("Send SMS disabled: SIM is empty for this device")
+                # optional: put a disabled reason line above it (uncomment if you like)
+                # reason_action = QAction("⚠️ SIM required to send SMS", self)
+                # reason_action.setEnabled(False)
+                # menu.addAction(reason_action)
 
-                # Connect actions
-                action_button.clicked.connect(lambda _, row=i: self.open_settings_dialog(row))
-                sms_logs_action.triggered.connect(lambda _, row=i: self.show_sms_log_dialog(row))
-                send_sms_action.triggered.connect(lambda _, row=i: self.show_send_sms_dialog(row))
-                delete_action.triggered.connect(lambda _, row=i: self.delete_device(row))
+            menu.addAction(send_sms_action)
+            menu.addSeparator()
+            menu.addAction(delete_action)
+
+
+
+            action_button.setMenu(menu)
+
+            action_button.clicked.connect(lambda _, row=i: self.open_settings_dialog(row))
+            sms_logs_action.triggered.connect(lambda _, row=i: self.show_sms_log_dialog(row))
+            send_sms_action.triggered.connect(lambda _, row=i: self.show_send_sms_dialog(row))
+            delete_action.triggered.connect(lambda _, row=i: self.delete_device(row))
 
             self.deviceTable.setCellWidget(i, 9, action_button)
 
+        # Kick off async “Last SMS” fetches
         for i, d in enumerate(device_list):
             QTimer.singleShot(100 + i * 100, lambda row=i, ip=d["ip"]: self.update_last_sms(row, ip))
+
+        self.deviceTable.setSortingEnabled(True)  # re-enable interactive sorting
 
     def update_last_sms(self, row, ip):
         def run():
@@ -1533,7 +1743,7 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
 
             # Reload device list
             self.devices = load_devices_from_db()
-            self.load_devices(self.devices)
+            self.apply_filters_and_sort()
             QtWidgets.QMessageBox.information(self, "Success", "Device updated successfully.")
 
 
@@ -1569,7 +1779,7 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
     def update_devices_and_ui(self, updated_devices):
         self.spinner.stop()
         self.devices = updated_devices
-        self.load_devices(self.devices)
+        self.apply_filters_and_sort()
 
     def show_sms_log_dialog(self, index):
         self.spinner.start()
@@ -1665,6 +1875,16 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
 
     def show_send_sms_dialog(self, index):
         device = self.devices[index]
+
+        # ✅ Guard: block if SIM is empty
+        if not (device.get("sim") or "").strip():
+            QtWidgets.QMessageBox.warning(
+                self,
+                "SIM Missing",
+                f"Cannot send SMS for '{device.get('name','Unknown')}'.\nPlease set the SIM value first."
+            )
+            return
+
         dialog = SendSMSDialog(device_name=device["name"], router_ip=device["ip"], parent=self)
         if dialog.exec_() == QtWidgets.QDialog.Accepted:
             to_number, message = dialog.get_sms_data()
