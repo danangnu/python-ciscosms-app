@@ -159,6 +159,39 @@ def is_device_online(ip: str, port: int = 22, timeout: float = 2.0) -> bool:
     except OSError:
         return False
 
+def _shell_send_and_read(shell, cmd, sleep=0.5, drain_loops=8):
+    """Send a command into an existing invoke_shell() and read all output."""
+    shell.send(cmd.rstrip() + "\n")
+    time.sleep(sleep)
+    out = ""
+    # drain a few times until no more data arrives
+    for _ in range(drain_loops):
+        chunk = ""
+        while shell.recv_ready():
+            chunk += shell.recv(65535).decode(errors="ignore")
+        out += chunk
+        if chunk == "":
+            break
+        time.sleep(0.15)
+    return out
+
+def _find_cellular_slot_from_brief(full_text: str) -> str:
+    m = re.search(r"(?mi)^\s*Cellular\s*(\d+(?:/\d+){0,2})\b", full_text)
+    if m: return m.group(1)
+    m = re.search(r"(?mi)^\s*Cellular(\d+(?:/\d+){0,2})\b", full_text)
+    return m.group(1) if m else ""
+
+def _parse_apn(text: str) -> str:
+    for rx in [
+        r"(?im)\bAPN\)?\s*[:=]\s*([A-Za-z0-9._:-]+)",
+        r"(?im)^\s*apn\s+([A-Za-z0-9._:-]+)\b",
+        r"(?im)Profile\s*1.*?\bAPN\b.*?([A-Za-z0-9._:-]+)",
+    ]:
+        m = re.search(rx, text)
+        if m:
+            return m.group(1)
+    return ""
+
 def has_cellular_interface(ip: str, timeout: int = 6) -> bool:
     """
     Backward-compatible helper used elsewhere.
@@ -1329,70 +1362,69 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
         if not ip:
             QtWidgets.QMessageBox.warning(self, "Missing IP", "Please enter the router IP first.")
             return
+
         self.overlay.show(); self.overlaySpinner.start()
 
         def run():
+            ssh = None
             try:
-                ssh = paramiko.SSHClient()
-                ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
                 username, password = get_ssh_credentials()
                 if not username or not password:
                     self.detectSignals.detectFailed.emit("SSH credentials not set.")
                     return
 
-                ssh.connect(ip, username=username, password=password, look_for_keys=False, allow_agent=False)
+                ssh = paramiko.SSHClient()
+                ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                ssh.connect(ip, username=username, password=password,
+                            look_for_keys=False, allow_agent=False)
 
-                # Always turn off paging then fetch the FULL brief
-                shell = ssh.invoke_shell(); time.sleep(0.5); shell.recv(9999)
-                shell.send("terminal length 0\n"); time.sleep(0.3); shell.recv(9999)
+                # ONE channel only: interactive shell
+                sh = ssh.invoke_shell()
+                time.sleep(0.4)
+                if sh.recv_ready():
+                    _ = sh.recv(65535)  # clear banner
 
-                shell.send("show ip interface brief\n"); time.sleep(0.7)
-                brief = ""
-                while shell.recv_ready():
-                    brief += shell.recv(4096).decode(errors="ignore")
-                    time.sleep(0.1)
+                _shell_send_and_read(sh, "terminal length 0")
+                brief = _shell_send_and_read(sh, "show ip interface brief")
 
                 slot = _find_cellular_slot_from_brief(brief)
                 if not slot:
+                    try: sh.close()
+                    except: pass
                     ssh.close()
                     self.detectSignals.detectFailed.emit("No Cellular interface found in 'show ip interface brief'.")
                     return
 
-                # Try several platform variants
-                candidates = [
+                # Try multiple show variants through the SAME shell
+                outputs = []
+                for cmd in [
                     f"show cellular {slot} profile",
                     f"show cellular {slot} lte profile",
                     f"show cellular {slot} all",
                     f"show running-config | section ^cellular {slot}",
-                    "show running-config | include (?i)\\bapn\\b",
-                ]
+                    "show running-config | include apn",
+                ]:
+                    outputs.append(f"\n--- {cmd} ---\n" + _shell_send_and_read(sh, cmd))
 
-                output = ""
-                for cmd in candidates:
-                    _stdin, stdout, _stderr = ssh.exec_command(cmd)
-                    text = stdout.read().decode(errors="ignore")
-                    if len(text.strip()) > 0:
-                        output += f"\n--- {cmd} ---\n{text}"
-                    # stop early if we see APN or Profile in this chunk
-                    if re.search(r"(?i)\b(APN|Profile)\b", text):
-                        break
-
+                try: sh.close()
+                except: pass
                 ssh.close()
 
-                apn = _parse_apn(output)
+                big = "".join(outputs)
+                apn = _parse_apn(big)
                 if apn:
                     self.detectSignals.apnDetected.emit(apn)
                 else:
-                    # Helpful message for troubleshooting
-                    msg = "Could not detect APN. Checked commands:\n" + "\n".join(candidates[:3])
-                    self.detectSignals.detectFailed.emit(msg)
+                    self.detectSignals.detectFailed.emit(
+                        "Could not detect APN from device output.\n"
+                        "Checked: show cellular <slot> profile / lte profile / all, and running-config."
+                    )
 
             except Exception as e:
                 try:
-                    ssh.close()
-                except Exception:
-                    pass
-                self.detectSignals.detectFailed.emit(str(e))
+                    if ssh: ssh.close()
+                except: pass
+                self.detectSignals.detectFailed.emit(f"{type(e).__name__}: {e}")
 
         threading.Thread(target=run, daemon=True).start()
 
