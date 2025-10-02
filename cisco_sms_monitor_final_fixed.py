@@ -5,44 +5,32 @@ import paramiko
 import time
 import threading
 import re
-import platform
-import subprocess
-import traceback
 import json
 import smtplib
 from cryptography.fernet import Fernet
 from datetime import datetime
-from PyQt5 import QtWidgets, uic
+from PyQt5 import QtWidgets, uic, QtCore
 from sms_log_dialog import SMSLogDialog
 from PyQt5.QtGui import QMovie, QIcon
-from PyQt5.QtCore import Qt, QSize, QTimer, QObject, pyqtSignal, QMetaObject, pyqtSlot
-from PyQt5.QtWidgets import QWidget, QVBoxLayout, QPushButton, QHBoxLayout, QLabel, QToolButton, QMenu, QAction, QSizePolicy
+from PyQt5.QtCore import Qt, QSize, QTimer, QObject, pyqtSignal, pyqtSlot
+from PyQt5.QtWidgets import QWidget, QVBoxLayout, QPushButton, QHBoxLayout, QLabel, QToolButton, QMenu, QAction
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from PyQt5.QtWidgets import QMainWindow
-from PyQt5 import QtCore
-from datetime import datetime
-import traceback
-
 import mysql.connector
 import sip
+import traceback
 
-# No crash – safely register using sip
+# ---------- Qt/sip safe setup ----------
 sip.setapi('QString', 2)
 sip.setapi('QVariant', 2)
 
-# Email settings
-SMTP_SERVER = "192.168.18.25"  # Change if using a different provider
-SMTP_PORT = 25
-EMAIL_SENDER = "info@alliedrec.com.au"
-EMAIL_PASSWORD = "Nyepi2017"  # Consider using an App Password
-
+# ---------- Helpers / resources ----------
 def resource_path(relative_path):
-    """ Get absolute path to resource (works for .exe and dev) """
     if hasattr(sys, '_MEIPASS'):
         return os.path.join(sys._MEIPASS, relative_path)
     return os.path.join(os.path.abspath("."), relative_path)
 
+# ---------- Crypto for SSH password ----------
 FERNET_KEY = b"hZtFdYoCGy2E68Fz46zqFbW4NHnSLmP4F78w_BV9mN4="
 fernet = Fernet(FERNET_KEY)
 
@@ -50,8 +38,17 @@ def encrypt_password(password):
     return fernet.encrypt(password.encode())
 
 def decrypt_password(encrypted):
-    return fernet.decrypt(encrypted).decode()
+    if encrypted is None:
+        return None
+    if isinstance(encrypted, memoryview):
+        encrypted = encrypted.tobytes()
+    elif isinstance(encrypted, bytearray):
+        encrypted = bytes(encrypted)
+    elif isinstance(encrypted, str):
+        encrypted = encrypted.encode("utf-8")
+    return fernet.decrypt(encrypted).decode("utf-8")
 
+# ---------- DB config ----------
 def get_db_config():
     try:
         with open("db_config.json", "r") as f:
@@ -66,7 +63,6 @@ def get_db_config():
     except Exception as e:
         print(f"⚠️ Failed to read DB config: {e}")
         return None
-
 
 def get_db_config_ti():
     try:
@@ -83,101 +79,110 @@ def get_db_config_ti():
         print(f"⚠️ Failed to read DB config: {e}")
         return None
 
+# ---------- SSH creds ----------
 def get_ssh_credentials():
     try:
         db_config = get_db_config()
+        if not db_config:
+            return None, None
         conn = mysql.connector.connect(**db_config)
         cursor = conn.cursor()
         cursor.execute("SELECT username, password FROM user_ssh ORDER BY id DESC LIMIT 1")
         row = cursor.fetchone()
-        cursor.close()
-        conn.close()
+        cursor.close(); conn.close()
 
-        if row:
-            return row[0], decrypt_password(row[1])
+        if not row:
+            print("⚠️ No SSH credentials found in user_ssh.")
+            return None, None
 
+        username = row[0]
+        try:
+            password = decrypt_password(row[1])
+        except Exception as e:
+            print(f"⚠️ Failed to decrypt SSH password: {e}")
+            return None, None
+        return username, password
     except Exception as e:
         print(f"⚠️ Failed to load SSH credentials: {e}")
         return None, None
-    
-def get_email_profiles():
-    db_config = get_db_config()
-    conn = mysql.connector.connect(**db_config)
-    cur = conn.cursor(dictionary=True)
-    cur.execute("""
-        SELECT id, profile_name, smtp_server, smtp_port, sender_email, sender_password, security, is_default
-        FROM email_settings ORDER BY is_default DESC, profile_name ASC
-    """)
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-    return rows
 
-def get_default_email_profile():
-    db_config = get_db_config()
-    conn = mysql.connector.connect(**db_config)
-    cur = conn.cursor(dictionary=True)
-    cur.execute("""
-        SELECT id, profile_name, smtp_server, smtp_port, sender_email, sender_password, security, is_default
-        FROM email_settings ORDER BY is_default DESC, profile_name ASC LIMIT 1
-    """)
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
-    return row
+def badge_widget(text: str, bg="#6b7280", fg="#fff") -> QWidget:
+    w = QWidget()
+    l = QHBoxLayout(w); l.setContentsMargins(0, 0, 0, 0)
+    lbl = QLabel(text)
+    lbl.setStyleSheet(
+        f"QLabel {{ background:{bg}; color:{fg}; padding:2px 6px; "
+        f"border-radius:6px; font-weight:600; font-size:11px; }}"
+    )
+    l.addWidget(lbl); l.addStretch(1)
+    return w
 
-def upsert_email_profile(profile):
+def _find_cellular_slot_from_brief(full_text: str) -> str:
     """
-    profile dict: {id (optional), profile_name, smtp_server, smtp_port, sender_email,
-                   sender_password, security, is_default(bool)}
+    Returns the numeric slot-part for the first Cellular interface, e.g. '0/0/0' or '0/0/1'.
+    If none found, returns ''.
     """
-    db_config = get_db_config()
-    conn = mysql.connector.connect(**db_config)
-    cur = conn.cursor()
+    m = re.search(r"(?mi)^\s*Cellular\s*(\d+(?:/\d+){0,2})\b", full_text)
+    if m:
+        return m.group(1)
+    # Older/other formatting: 'Cellular0/0/0' without space
+    m = re.search(r"(?mi)^\s*Cellular(\d+(?:/\d+){0,2})\b", full_text)
+    return m.group(1) if m else ""
 
-    # If setting default, unset others
-    if profile.get("is_default"):
-        cur.execute("UPDATE email_settings SET is_default = 0")
 
-    if profile.get("id"):
-        cur.execute("""
-            UPDATE email_settings
-               SET profile_name=%s, smtp_server=%s, smtp_port=%s,
-                   sender_email=%s, sender_password=%s, security=%s, is_default=%s
-             WHERE id=%s
-        """, (profile["profile_name"], profile["smtp_server"], int(profile["smtp_port"]),
-              profile["sender_email"], profile["sender_password"], profile["security"],
-              1 if profile.get("is_default") else 0, int(profile["id"])))
-    else:
-        cur.execute("""
-            INSERT INTO email_settings
-            (profile_name, smtp_server, smtp_port, sender_email, sender_password, security, is_default)
-            VALUES (%s,%s,%s,%s,%s,%s,%s)
-        """, (profile["profile_name"], profile["smtp_server"], int(profile["smtp_port"]),
-              profile["sender_email"], profile["sender_password"], profile["security"],
-              1 if profile.get("is_default") else 0))
+def _parse_apn(text: str) -> str:
+    """
+    Extract APN from various show outputs.
+    """
+    # Common XE format: "... APN) = telstra.internet"
+    m = re.search(r"(?im)\bAPN\)?\s*[:=]\s*([A-Za-z0-9._:-]+)", text)
+    if m:
+        return m.group(1)
 
-    conn.commit()
-    cur.close()
-    conn.close()
+    # Some show run / controller/profile formats: "apn telstra.internet"
+    m = re.search(r"(?im)^\s*apn\s+([A-Za-z0-9._:-]+)\b", text)
+    if m:
+        return m.group(1)
 
-def delete_email_profile(profile_id):
-    db_config = get_db_config()
-    conn = mysql.connector.connect(**db_config)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM email_settings WHERE id=%s", (int(profile_id),))
-    conn.commit()
-    cur.close()
-    conn.close()
+    # Another variant: "Profile 1 ... APN: internet"
+    m = re.search(r"(?im)Profile\s*1.*?\bAPN\b.*?([A-Za-z0-9._:-]+)", text)
+    if m:
+        return m.group(1)
 
+    return ""
+
+# ---------- Networking helpers ----------
+def is_device_online(ip: str, port: int = 22, timeout: float = 2.0) -> bool:
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+def has_cellular_interface(ip: str, timeout: int = 6) -> bool:
+    """
+    Backward-compatible helper used elsewhere.
+    Returns True if any Cellular interface exists on the router, regardless of IP.
+    """
+    state = probe_cellular_state(ip, timeout=timeout)
+    return state["present"]
+
+def get_ip_address() -> str:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    finally:
+        s.close()
+
+_ipv4_re = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+
+# ---------- Email (TrackIT queue) ----------
 def get_email_config_from_db():
-    """Retrieve SMTP and sender details from database."""
     try:
         db_config = get_db_config()
         conn = mysql.connector.connect(**db_config)
         cursor = conn.cursor(dictionary=True)
-
-        # Example: assuming your table is `email_config`
         cursor.execute("""
             SELECT smtp_server, smtp_port, smtp_user, smtp_password, sender_email
             FROM email_config
@@ -185,17 +190,70 @@ def get_email_config_from_db():
             LIMIT 1
         """)
         config = cursor.fetchone()
-
-        cursor.close()
-        conn.close()
+        cursor.close(); conn.close()
         return config
-
     except Exception as e:
         print(f"❌ Error loading email config from DB: {e}")
         return None
-    
+
+def probe_cellular_state(ip: str, timeout: int = 6):
+    """
+    Inspect 'show ip interface brief' and return a dict:
+      present      -> at least one Cellular* interface exists
+      ip_assigned  -> at least one Cellular has an IPv4 (not 'unassigned')
+      admin_up     -> at least one Cellular is not 'administratively down'
+    On any SSH/problem, returns {'present': False, 'ip_assigned': False, 'admin_up': False}.
+    """
+    if not is_device_online(ip):
+        return {"present": False, "ip_assigned": False, "admin_up": False}
+
+    username, password = get_ssh_credentials()
+    if not username or not password:
+        return {"present": False, "ip_assigned": False, "admin_up": False}
+
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        ssh.connect(ip, username=username, password=password,
+                    look_for_keys=False, allow_agent=False,
+                    timeout=timeout, banner_timeout=timeout, auth_timeout=timeout)
+
+        # Get the whole table (more robust than piping include)
+        _, stdout, _ = ssh.exec_command("show ip interface brief")
+        out = stdout.read().decode(errors="ignore")
+    except Exception:
+        return {"present": False, "ip_assigned": False, "admin_up": False}
+    finally:
+        try: ssh.close()
+        except: pass
+
+    present = False
+    ip_assigned = False
+    admin_up = False
+
+    # Parse each line that starts with "Cellular"
+    for line in out.splitlines():
+        if not re.search(r"(?i)^\s*Cellular\d+(?:/\d+)*\b", line):
+            continue
+
+        present = True
+
+        # Normalize columns; IOS can have variable spacing
+        cols = re.split(r"\s+", line.strip())
+        # Expect columns: Interface, IP-Address, OK?, Method, Status, Protocol
+        # Be defensive on indexes
+        ip_col = cols[1] if len(cols) > 1 else ""
+        status_col = " ".join(cols[4:-1]) if len(cols) >= 6 else (cols[4] if len(cols) > 4 else "")
+
+        if ip_col and ip_col.lower() != "unassigned":
+            ip_assigned = True
+
+        if status_col and "administratively down" not in status_col.lower():
+            admin_up = True
+
+    return {"present": present, "ip_assigned": ip_assigned, "admin_up": admin_up}
+
 def send_email(sms_details, emailTo):
-    """Send an email with SMS details using config loaded from database."""
     try:
         config = get_email_config_from_db()
         if not config:
@@ -208,431 +266,115 @@ def send_email(sms_details, emailTo):
         msg["Subject"] = f"New SMS Received from {sms_details['From']}"
 
         body = f"""
-            📩 **New SMS Received**
-            --------------------------------------
-            🆔 ID: {sms_details['ID']}
-            ⏰ Time: {sms_details['Time']}
-            📞 From: {sms_details['From']}
-            📏 Size: {sms_details['Size']}
-            📜 Message: 
-            {sms_details['Content']}
-            --------------------------------------
-            """
+📩 New SMS Received
+--------------------------------------
+ID:   {sms_details['ID']}
+Time: {sms_details['Time']}
+From: {sms_details['From']}
+Size: {sms_details['Size']}
 
+Message:
+{sms_details['Content']}
+--------------------------------------
+"""
         msg.attach(MIMEText(body, "plain"))
 
         server = smtplib.SMTP(config["smtp_server"], config["smtp_port"])
-        
-        # If SMTP requires login
         if config["smtp_user"] and config["smtp_password"]:
             server.login(config["smtp_user"], config["smtp_password"])
-        
         server.sendmail(config["sender_email"], emailTo, msg.as_string())
         server.quit()
-
-        print("✅ Email notification sent successfully!")
-
+        print("✅ Email notification queued/sent.")
     except Exception as e:
         print(f"❌ Failed to send email: {e}")
 
+# ---------- UI helpers ----------
 class LoadingSpinner(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setStyleSheet("background-color: rgba(255, 255, 255, 180);")  # Optional dim
-
+        self.setStyleSheet("background-color: rgba(255, 255, 255, 180);")
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignCenter)
-
         self.label = QLabel()
         self.label.setAlignment(Qt.AlignCenter)
-        self.movie = QMovie(resource_path("spinner.gif"))  # Your spinner GIF file
+        self.movie = QMovie(resource_path("spinner.gif"))
         self.movie.setScaledSize(QSize(64, 64))
         self.label.setMovie(self.movie)
         layout.addWidget(self.label)
-
         self.setVisible(False)
-
     def start(self):
-        self.setVisible(True)
-        self.movie.start()
-
+        self.setVisible(True); self.movie.start()
     def stop(self):
-        self.setVisible(False)
-        self.movie.stop()
+        self.setVisible(False); self.movie.stop()
 
-class DetectSignals(QObject):
-    apnDetected = pyqtSignal(str)
-    gatewayDetected = pyqtSignal(str)
-    detectFailed = pyqtSignal(str)
+def make_device_cell(name: str, is_hub: bool, has_cellular: bool) -> QWidget:
+    w = QWidget()
+    layout = QHBoxLayout(w)
+    layout.setContentsMargins(6, 0, 0, 0)
 
-class DeviceSettingsDialog(QtWidgets.QDialog):
-    def __init__(self, device=None, parent=None):
-        super(DeviceSettingsDialog, self).__init__(parent)
-        uic.loadUi(resource_path("device_settings_dialog.ui"), self)
+    def pill(text, bg, fg="#fff"):
+        lbl = QLabel(text)
+        lbl.setStyleSheet(f"""
+            QLabel {{
+                background:{bg}; color:{fg}; padding:2px 6px;
+                border-radius:6px; font-weight:600; font-size:11px;
+            }}
+        """)
+        return lbl
 
-        self.detectSignals = DetectSignals()
-        self.detectSignals.apnDetected.connect(self.on_apn_detected)
-        self.detectSignals.gatewayDetected.connect(self.on_gateway_detected)
-        self.detectSignals.detectFailed.connect(self.on_apn_failed)
+    if is_hub:
+        layout.addWidget(pill("HUB", "#2563eb"))
 
-        self.overlay = QtWidgets.QWidget(self)
-        self.overlay.setStyleSheet("background: rgba(255, 255, 255, 0.7);")
-        self.overlay.hide()
+    label = QLabel(("  " + name) if is_hub else name)
+    layout.addWidget(label)
+    layout.addStretch(1)
+    return w
 
-        # Fill entire dialog
-        self.overlay.setGeometry(self.rect())
-        self.overlay.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+def create_status_label(status):
+    label = QLabel()
+    if status == "Online":
+        text = '<span style="color: black;">Online </span><span style="color: #34d399; font-size: 20px;">●</span>'
+    elif status == "Not Register":
+        text = '<span style="color: black;">Not Register </span><span style="color: #708090; font-size: 20px;">●</span>'
+    else:
+        text = '<span style="color: black;">Offline </span><span style="color: #f87171; font-size: 20px;">●</span>'
+    label.setText(text); label.setAlignment(Qt.AlignCenter)
+    return label
 
-        self.overlaySpinner = LoadingSpinner(self.overlay)
-        self.overlaySpinner.setFixedSize(80, 80)
-        self.overlaySpinner.setGeometry(
-            self.overlay.width() // 2 - 40,
-            self.overlay.height() // 2 - 40,
-            80,
-            80
-        )
-
-        # Same for gateway detect
-        self.gatewaySpinner = LoadingSpinner(self)
-
-        # Add Detect button next to Gateway field
-        self.detectGatewayButton = QPushButton("Detect")
-        getway_row_layout = QHBoxLayout()
-        getway_row_layout.addWidget(self.gatewayLineEdit)
-        getway_row_layout.addWidget(self.detectGatewayButton)
-        getway_row_layout.addWidget(self.gatewaySpinner)
-
-        # Add Detect button next to APN field
-        self.detectApnButton = QPushButton("Detect")
-        apn_row_layout = QHBoxLayout()
-        apn_row_layout.addWidget(self.apnLineEdit)
-        apn_row_layout.addWidget(self.detectApnButton)
-
-        self.resizeEvent = self.resizeEvento  # Override resize event to update overlay
-
-        # Replace the widget in the layout (4th item in the vertical layout, index = 3)
-        layout: QtWidgets.QVBoxLayout = self.layout()
-        layout.insertLayout(2, getway_row_layout)  # Index 2 = after IP input
-        layout.insertLayout(3, apn_row_layout)  # Index 3 = after SIM input
-
-        # Connect detection logic
-        self.detectApnButton.clicked.connect(self.handle_detect_apn)
-        self.detectGatewayButton.clicked.connect(self.handle_detect_gateway)
-
-        # Set existing fields
-        self.device = device
-        if device:
-            self.nameLineEdit.setText(device["name"])
-            self.ipLineEdit.setText(device["ip"])
-            self.gatewayLineEdit.setText(device["gateway"])
-            self.simLineEdit.setText(device["sim"])
-            self.apnLineEdit.setText(device["apn"])
-            self.emailLineEdit.setText(device["email"])
-
-        self.saveButton.clicked.connect(self.accept)
-        self.cancelButton.clicked.connect(self.reject)
-
-    def resizeEvento(self, event):
-        super().resizeEvent(event)
-        self.overlay.setGeometry(self.rect())
-        self.overlaySpinner.setGeometry(
-            self.overlay.width() // 2 - 40,
-            self.overlay.height() // 2 - 40,
-            80,
-            80
-        )
-
-
-
-    def get_data(self):
-        return {
-            "name": self.nameLineEdit.text(),
-            "ip": self.ipLineEdit.text(),
-            "gateway": self.gatewayLineEdit.text(),
-            "sim": self.simLineEdit.text(),
-            "apn": self.apnLineEdit.text(),
-            "email": self.emailLineEdit.text(),
-        }
-    
-    def handle_detect_apn(self):
-        ip = self.ipLineEdit.text()
-        if not ip:
-            QtWidgets.QMessageBox.warning(self, "Missing IP", "Please enter the router IP first.")
-            return
-
-        self.overlay.show()
-        self.overlaySpinner.start()  # Spinner should be defined as LoadingSpinner
-
-        def run():
-            try:
-                ssh = paramiko.SSHClient()
-                ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                username, password = get_ssh_credentials()
-                ssh.connect(ip, username=username, password=password, look_for_keys=False, allow_agent=False)
-
-                stdin, stdout, stderr = ssh.exec_command("show cellular 0/0/0 profile")
-                output = stdout.read().decode()
-                ssh.close()
-
-                match = re.search(r"Profile 1 = ACTIVE.*?APN\) = ([^\s]+)", output, re.DOTALL)
-                if match:
-                    apn = match.group(1)
-                    self.detectSignals.apnDetected.emit(apn)
-                else:
-                    self.detectSignals.detectFailed.emit("Could not detect APN in the output.")
-
-            except Exception as e:
-                self.detectSignals.detectFailed.emit(str(e))
-
-        threading.Thread(target=run, daemon=True).start()
-
-    def on_apn_detected(self, apn):
-        self.apnLineEdit.setText(apn)
-        self.overlaySpinner.stop()
-        self.overlay.hide()
-        QtWidgets.QMessageBox.information(self, "APN Detected", f"Detected APN: {apn}")
-
-    def on_gateway_detected(self, gateway):
-        self.gatewayLineEdit.setText(gateway)
-        self.overlaySpinner.stop()
-        self.overlay.hide()
-        QtWidgets.QMessageBox.information(self, "Gateway Detected", f"Detected Gateway: {gateway}")
-
-    def on_apn_failed(self, message):
-        self.overlaySpinner.stop()
-        self.overlay.hide()
-        QtWidgets.QMessageBox.warning(self, "Detection Failed", message)
-
-    def handle_detect_gateway(self):
-        ip = self.ipLineEdit.text().strip()
-        if not ip:
-            QtWidgets.QMessageBox.warning(self, "Missing IP", "Please enter the router IP first.")
-            return
-
-        self.overlay.show()
-        self.overlaySpinner.start()
-
-        def run():
-            try:
-                ssh = paramiko.SSHClient()
-                ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                username, password = get_ssh_credentials()
-                ssh.connect(ip, username=username, password=password, look_for_keys=False, allow_agent=False)
-
-                stdin, stdout, stderr = ssh.exec_command("show running-config | include ip route")
-                output = stdout.read().decode()
-                ssh.close()
-
-                gateway = None
-                ipv4_pattern = re.compile(r'^(\d{1,3}\.){3}\d{1,3}$')
-
-                for line in output.splitlines():
-                    if line.startswith("ip route 0.0.0.0 0.0.0.0") and "track" in line:
-                        parts = line.split()
-                        if len(parts) >= 5 and ipv4_pattern.match(parts[4]):
-                            gateway = parts[4]
-                            break
-
-                if gateway:
-                    self.detectSignals.gatewayDetected.emit(gateway)
-                else:
-                    self.detectSignals.detectFailed.emit("Could not detect gateway (only IP-based next-hop is supported).")
-
-            except Exception as e:
-                self.detectSignals.detectFailed.emit(str(e))
-
-        threading.Thread(target=run, daemon=True).start()
-
-
-    
-def is_device_online(ip):
-    # Determine ping command based on OS
-    param = "-n" if platform.system().lower() == "windows" else "-c"
-    command = ["ping", param, "1", ip]
-
-    try:
-        output = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        return output.returncode == 0
-    except Exception:
-        return False
-
-# Fast, SSH-relevant reachability check (better than ping in many networks)
-def is_device_online(ip: str, port: int = 22, timeout: float = 2.0) -> bool:
-    try:
-        with socket.create_connection((ip, port), timeout=timeout):
-            return True
-    except OSError:
-        return False
-
-# More reliable local IP (avoid 127.* from gethostbyname(hostname))
-def get_ip_address() -> str:
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
-    finally:
-        s.close()
-
-_ipv4_re = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
-
-def is_device_register(ip: str, *, timeout: int = 8) -> bool:
-    """
-    True if router 'ip' has our syslog host configured (logging host <our_ip>).
-    - Fast-fails if device is offline or creds missing.
-    - Uses tight timeouts to avoid UI stalls.
-    """
-    # 1) Don’t attempt SSH if it’s not even reachable
-    if not is_device_online(ip):
-        return False
-
-    username, password = get_ssh_credentials()
-    if not username or not password:
-        print("⚠️ No SSH credentials available.")
-        return False
-
-    ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    try:
-        ssh.connect(
-            ip,
-            username=username,
-            password=password,
-            look_for_keys=False,
-            allow_agent=False,
-            timeout=timeout,
-            banner_timeout=timeout,
-            auth_timeout=timeout,
-        )
-
-        # Only fetch lines that matter; avoid pagination issues and big outputs
-        cmd = r"show running-config | include ^logging host "
-        stdin, stdout, stderr = ssh.exec_command(cmd)
-        output = stdout.read().decode(errors="ignore")
-    except Exception as e:
-        print(f"⚠️ is_device_register error for {ip}: {e}")
-        return False
-    finally:
-        try:
-            ssh.close()
-        except Exception:
-            pass
-
-    # 2) Extract configured logging hosts (IPv4) from the lines
-    hosts = []
-    for line in output.splitlines():
-        line = line.strip()
-        if not line.startswith("logging host"):
-            continue
-        m = _ipv4_re.search(line)
-        if m:
-            hosts.append(m.group(0))
-
-    # 3) Compare against our real local IP
-    my_ip = get_ip_address()
-    return my_ip in hosts
-
-
-   
-
-def load_devices_from_db():
-    db_config = get_db_config()
-    conn = mysql.connector.connect(**db_config)
-    
-    cursor = conn.cursor()
-    cursor.execute("SELECT name, ip, gateway, sim, apn, email, id FROM devices")
-    rows = cursor.fetchall()
-    conn.close()
-
-    devices = []
-    for row in rows:
-        ip = row[1]
-        online = is_device_online(ip)
-        register = is_device_register(ip) if online else False
-        status = "Offline" if not online else ("Not Register" if not register else "Online")
-        devices.append({
-            "name": row[0],
-            "ip": ip,
-            "gateway": row[2],
-            "sim": row[3],
-            "apn": row[4],
-            "email": row[5],
-            "lastSMS": "",
-            "signal": 0,
-            "status": status,
-            "id": row[6]
-        })
-    return devices
-
+# ---------- SMS parsing helpers ----------
 def is_phone_number(s: str) -> bool:
-    # Boleh diawali +, lalu 7–15 digit
     return bool(re.fullmatch(r"\+?\d{7,15}", s))
 
 def is_hex_string(s: str) -> bool:
     try:
-        int(s, 16)  # coba convert ke integer basis 16
-        return len(s) % 2 == 0  # panjang harus genap (tiap 2 char = 1 byte)
+        int(s, 16)
+        return len(s) % 2 == 0
     except ValueError:
         return False
+
 def semi_octet_decode(hexstr: str) -> str:
-    """Decode nomor telp dari semi-octet swap"""
     digits = ""
     for i in range(0, len(hexstr), 2):
         digits += hexstr[i+1] + hexstr[i]
-    return digits.rstrip("F")  # remove padding F
+    return digits.rstrip("F")
 
 def gsm7_decode(hexstr: str) -> str:
-    """Decode GSM7 (7-bit default alphabet)"""
     bits = ""
     for i in range(0, len(hexstr), 2):
-        bits += bin(int(hexstr[i:i+2], 16))[2:].zfill(8)[::-1]  # little-endian per octet
-    
+        bits += bin(int(hexstr[i:i+2], 16))[2:].zfill(8)[::-1]
     septets = [bits[i:i+7][::-1] for i in range(0, len(bits), 7)]
-    septets = [s for s in septets if len(s) == 7]  
-
+    septets = [s for s in septets if len(s) == 7]
     decoded = ""
     for s in septets:
         val = int(s, 2)
-        if 32 <= val <= 126:
-            decoded += chr(val)
-        else:
-            decoded += "?"  # fallback
+        decoded += chr(val) if 32 <= val <= 126 else "?"
     return decoded.strip("?")
 
-def normalize_sender(sender: str) -> str:
-    """
-    Normalisasi pengirim SMS dari Cisco.
-    Bisa nomor telp (614xxxx) atau brand name (PIZZAHUT).
-    """
-    # case 1: sudah nomor telp
-    if re.fullmatch(r"\+?\d{6,15}", sender):
-        return sender
-
-    # case 2: hex string
-    if re.fullmatch(r"[0-9A-Fa-f]+", sender):
-        try:
-            # coba decode semi-octet → nomor
-            num = semi_octet_decode(sender)
-            if re.fullmatch(r"\d{6,15}", num):
-                return num
-
-            # kalau bukan nomor → coba decode ke GSM7 → brand
-            text = gsm7_decode(sender)
-            return text if text else sender
-        except Exception:
-            return sender
-
-    return sender
-
 def gsm7_unpack(hexstr):
-    # 1. Swap semi-octets (contoh: "0D" -> "D0")
     swapped = "".join([hexstr[i+1] + hexstr[i] for i in range(0, len(hexstr), 2)])
     data = bytes.fromhex(swapped)
-
-    # 2. GSM 7-bit unpacking
-    septets = []
-    carry = 0
-    carry_bits = 0
+    septets, carry, carry_bits = [], 0, 0
     for b in data:
         val = ((b << carry_bits) & 0x7F) | carry
         septets.append(val)
@@ -642,149 +384,117 @@ def gsm7_unpack(hexstr):
             septets.append(carry)
             carry = 0
             carry_bits = 0
-
-    # 3. Convert septets to text
     text = "".join(chr(s) for s in septets if 32 <= s <= 126)
     return text
 
-def get_all_sms(ip):
+def normalize_sender(sender: str) -> str:
+    if re.fullmatch(r"\+?\d{6,15}", sender):
+        return sender
+    if re.fullmatch(r"[0-9A-Fa-f]+", sender):
+        try:
+            num = semi_octet_decode(sender)
+            if re.fullmatch(r"\d{6,15}", num):
+                return num
+            text = gsm7_decode(sender)
+            return text if text else sender
+        except Exception:
+            return sender
+    return sender
+
+# ---------- Device/DB ----------
+def set_device_hub_flag(device_id: int, is_hub: bool) -> int:
+    db_config = get_db_config()
+    conn = mysql.connector.connect(**db_config)
+    cur = conn.cursor()
+    cur.execute("UPDATE devices SET is_hub=%s WHERE id=%s", (1 if is_hub else 0, device_id))
+    affected = cur.rowcount
+    conn.commit()
+    print(f"[HUB-FLAG] set is_hub={1 if is_hub else 0} for id={device_id} (affected={affected})")
+    # Read-back to prove it stuck
+    cur.execute("SELECT id, name, IFNULL(is_hub,0) FROM devices WHERE id=%s", (device_id,))
+    row = cur.fetchone()
+    print(f"[HUB-FLAG] readback -> {row}")
+    cur.close(); conn.close()
+    return affected
+
+def is_device_register(ip: str, *, timeout: int = 8) -> bool:
+    if not is_device_online(ip):
+        return False
+    username, password = get_ssh_credentials()
+    if not username or not password:
+        print("⚠️ No SSH credentials available.")
+        return False
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    username, password = get_ssh_credentials()
-    ssh.connect(ip, username=username, password=password, look_for_keys=False, allow_agent=False)
-
-    stdin, stdout, stderr = ssh.exec_command("cellular 0/0/0 lte sms view all")
-    sms_list_output = stdout.read().decode()
-    ssh.close()
-    return sms_list_output
-
-
-
-
-
-def parse_sms(raw_output):
-    sms_blocks = raw_output.strip().split("--------------------------------------------------------------------------------")
-    sms_list = []
-
-    for block in sms_blocks:
-        if not block.strip():
+    try:
+        ssh.connect(ip, username=username, password=password,
+                    look_for_keys=False, allow_agent=False,
+                    timeout=timeout, banner_timeout=timeout, auth_timeout=timeout)
+        cmd = r"show running-config | include ^logging host "
+        _, stdout, _ = ssh.exec_command(cmd)
+        output = stdout.read().decode(errors="ignore")
+    except Exception as e:
+        print(f"⚠️ is_device_register error for {ip}: {e}")
+        return False
+    finally:
+        try: ssh.close()
+        except: pass
+    hosts = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line.startswith("logging host"):
             continue
+        m = _ipv4_re.search(line)
+        if m: hosts.append(m.group(0))
+    my_ip = get_ip_address()
+    return my_ip in hosts
 
-        sms = {}
-        for line in block.strip().splitlines():
-            if line.startswith("SMS ID:"):
-                sms["ID"] = int(line.replace("SMS ID:", "").strip())
-            elif line.startswith("TIME:"):
-                raw_time = line.replace("TIME:", "").strip()
-                sms_time = datetime.strptime(raw_time, "%y-%m-%d %H:%M:%S")  
-                sms["Time"] = sms_time
-            elif line.startswith("FROM:"):
-                raw = line.replace("FROM:", "").strip()
-                if is_phone_number(raw):
-                    smsFrom = raw
-                    if raw.startswith("61"):
-                        smsFrom = "0" + raw[2:]   # ubah ke format lokal
-                elif is_hex_string(raw):
-                    smsFrom = gsm7_unpack(raw)  # butuh fungsi decode PDU
-                else:
-                    smsFrom = raw
-                sms["From"] = smsFrom
-                sms["CiscoFrom"] = raw
-            elif line.startswith("SIZE:"):
-                sms["Size"] = int(line.replace("SIZE:", "").strip())
-            else:
-                # anggap sisanya adalah pesan SMS
-                sms["Message"] = sms.get("Message", "") + " " + line.strip()
-        sms_list.append(sms)
-    return sms_list
-
-def get_new_sms_by_time(ip, last_time):
-    raw = get_all_sms(ip)
-    all_sms = parse_sms(raw)
-
-    # Ambil SMS yang lebih baru dari last_time
-    new_sms = [sms for sms in all_sms if sms["Time"] > last_time]
-    return new_sms
-
-def save_sms_to_db(sms_list, device):
-    db_config = get_db_config()
-    conn = mysql.connector.connect(**db_config)
-
-    cursor = conn.cursor()
-    sql = """
-    INSERT IGNORE INTO sms_logs (dates, sms_from, cisco_from, size, message, devices_id)
-    VALUES (%s, %s, %s, %s, %s, %s)
-    """
-    for sms in sms_list:
-        cursor.execute(sql, (sms["Time"], sms["From"], sms["CiscoFrom"], sms["Size"], sms["Message"], device["id"]))
-    conn.commit()
-    cursor.close()
-
+def load_devices_from_db():
     db_config = get_db_config()
     conn = mysql.connector.connect(**db_config)
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM email_notification LIMIT 1")
-    row = cursor.fetchone()  # Ambil 1 baris
-    if row:  # pastikan ada data
-        subject = row[1]  # kolom 2
-        email   = row[2]  # kolom 3
-        content = row[3]  # kolom 4
-    else:
-        subject = email = content = None
+    cursor.execute("SELECT name, ip, gateway, sim, apn, email, id, IFNULL(is_hub,0) FROM devices")
+    rows = cursor.fetchall()
     conn.close()
 
-    db_config = get_db_config_ti()
-    conn = mysql.connector.connect(**db_config)
-    now = datetime.now()
-    cursor = conn.cursor()
-    sql = """
-    INSERT INTO logbulkmail(dates, times, sendto, mailsubject, mailcontent, mailstatus, mailtype, cc, spoofas, spoofname, attachment) 
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-    """
-    for sms in sms_list:
-        mailcontent = (
-            f"{content}<br />---------<br />From: {sms['From']}<br />"
-            f"Received: {sms['Time']}<br />SIM Detail: {device['name']} - {device['sim']}<br />"
-            f"Message: {sms['Message']}"
-        )
-        device["name"] + " - " + device["sim"] + "<br />" + "Message: " + sms["Message"]
-        emailReceive = sms["From"] + "@alliedsms.com.au"
-        
-        cursor.execute(sql, (now.date(), now.strftime("%I:%M:%S %p"), email, subject + " - " +  emailReceive, mailcontent, "Queue In Database", "Email", 1, emailReceive, emailReceive, 0))
-    conn.commit()
-    cursor.close()
+    devices = []
+    for row in rows:
+        ip = row[1]
 
+        # 1) Reachability first
+        online = is_device_online(ip)
 
-def fetch_from_all_devices(devices):
-    for device in devices:
-        db_config = get_db_config()
-        conn = mysql.connector.connect(**db_config)
-        cursor = conn.cursor()
-        cursor.execute("SELECT MAX(dates) FROM sms_logs WHERE devices_id=%s", (device["id"],))
-        # Ambil last time per device
-        last_time_str = cursor.fetchone()[0] or "2000-01-01 00:00:00"
-        conn.close()
+        # 2) Only bother checking cellular if online
+        cell = has_cellular_interface(ip) if online else False
 
-        if last_time_str == "2000-01-01 00:00:00":
-            last_time = datetime.strptime(last_time_str, "%Y-%m-%d %H:%M:%S")
+        # 3) Only check "register" (syslog host) if it actually has cellular
+        register = is_device_register(ip) if (online and cell) else False
+
+        # 4) Status rule:
+        #    - NO CELL => never show "Not Register"
+        #    - Only cellular devices can be "Not Register"
+        if not online:
+            status = "Offline"
+        elif cell and not register:
+            status = "Not Register"
         else:
-            last_time = last_time_str
+            status = "Online"
 
-        new_sms = get_new_sms_by_time(device["ip"], last_time)
-        if new_sms:
-            save_sms_to_db(new_sms, device)
-            print(f"✅ {len(new_sms)} SMS baru dari {device['ip']} disimpan")
-        
-    db_config = get_db_config()
-    conn = mysql.connector.connect(**db_config)
-    cursor = conn.cursor()
-    cursor.execute("SELECT `devices`.name, sms_logs.`dates`, sms_logs.`sms_from`, sms_logs.`message` FROM devices INNER JOIN sms_logs ON sms_logs.`devices_id` = devices.`id`")
-    smsList = cursor.fetchall()
-    # Ambil last time per device
-    conn.close()
-
-    return smsList
-
+        devices.append({
+            "name": row[0],
+            "ip": ip,
+            "gateway": row[2] or "",
+            "sim": row[3] or "",
+            "apn": row[4] or "",
+            "email": row[5] or "",
+            "lastSMS": "",
+            "signal": 0,
+            "status": status,
+            "id": row[6],
+            "is_hub": bool(row[7]),
+            "has_cellular": bool(cell),
+        })
+    return devices
 
 def update_device_in_db(device):
     db_config = get_db_config()
@@ -795,152 +505,222 @@ def update_device_in_db(device):
         SET sim = %s, apn = %s, email = %s, name = %s, gateway = %s
         WHERE ip = %s
     """, (device["sim"], device["apn"], device["email"], device["name"], device["gateway"], device["ip"]))
-    conn.commit()
-    cursor.close()
-    conn.close()
-
-def get_email_by_router_ip(router_ip):
-    """
-    Fetch email for the given router_ip from the devices table.
-    """
-    db_config = get_db_config()
-    conn = mysql.connector.connect(**db_config)
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        SELECT email
-        FROM devices
-        WHERE ip = %s
-    """, (router_ip,))
-
-    result = cursor.fetchone()
-
-    cursor.close()
-    conn.close()
-
-    return result[0] if result else None
-
-
-def get_ip_address():
-    hostname = socket.gethostname()
-    ip_address = socket.gethostbyname(hostname)
-    return ip_address
-
-def configure_sms_applet_on_cisco(router_ip, username, password):
-    eem_script = f"""
-        configure terminal
-        !
-        ! Remove and re-create EEM applet
-        no event manager applet SMS_Extract
-        event manager applet SMS_Extract
-        event syslog pattern "Cellular0/0/0: New SMS received on index ([0-9]+)"
-        action 1.0 cli command "enable"
-        action 1.0 cli command "enable"
-        action 2.0 regexp "index ([0-9]+)" "$_syslog_msg" match sms_index
-        action 3.0 cli command "cellular 0/0/0 lte sms view $sms_index"
-        action 4.0 syslog msg "SMS Extracted -> ID: $sms_index"
-        exit
-        !
-        ! Configure remote syslog destination
-        logging host {get_ip_address()}
-        logging trap informational
-        exit
-        write memory
-    """
-
-    try:
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(router_ip, username=username, password=password, look_for_keys=False, allow_agent=False)
-        shell = ssh.invoke_shell()
-        time.sleep(1)
-        shell.recv(1000)  # Clear initial output
-        for line in eem_script.strip().split("\n"):
-            shell.send(line.strip() + "\n")
-            time.sleep(0.5)
-        output = shell.recv(5000).decode()
-        print(output)
-        ssh.close()
-        print(f"EEM applet configured on {router_ip}")
-    except Exception as e:
-        print(f"Failed to configure EEM on {router_ip}: {e}")
+    conn.commit(); cursor.close(); conn.close()
 
 def delete_device_from_db(device_id):
     db_config = get_db_config()
     conn = mysql.connector.connect(**db_config)
     cursor = conn.cursor()
     cursor.execute("DELETE FROM devices WHERE id = %s", (device_id,))
-    conn.commit()
-    cursor.close()
-    conn.close()
-
+    conn.commit(); cursor.close(); conn.close()
 
 def insert_device_to_db(device):
     db_config = get_db_config()
     conn = mysql.connector.connect(**db_config)
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO devices (name, ip, gateway, sim, apn, email)
-        VALUES (%s, %s, %s, %s, %s, %s)
-    """, (device["name"], device["ip"], device["gateway"], device["sim"], device["apn"], device["email"]))
-    conn.commit()
-    cursor.close()
-    conn.close()
+    cur = conn.cursor()
+    is_hub = 0
+    try:
+        ok, reason, _ = detect_dmvpn_hub_over_ssh(device["ip"])
+        if ok:
+            is_hub = 1
+            print(f"[Auto] {device['ip']} detected as DMVPN hub: {reason}")
+    except Exception:
+        pass
+    cur.execute("""
+        INSERT INTO devices (name, ip, gateway, sim, apn, email, is_hub)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+    """, (device["name"], device["ip"], device["gateway"], device["sim"],
+          device["apn"], device["email"], is_hub))
+    conn.commit(); cur.close(); conn.close()
+
+# ---------- Cisco/SSH ops ----------
+def detect_dmvpn_hub_over_ssh(ip: str, timeout: int = 10):
+    """
+    Detects DMVPN hub by reading interface Tunnel sections:
+    HUB if: 'tunnel mode gre multipoint' AND (no 'ip nhrp nhs' present OR 'ip nhrp redirect' present)
+    Runtime checks (show dmvpn/nhrp) are best-effort only and not required to conclude 'hub'.
+    """
+    username, password = get_ssh_credentials()
+    if not username or not password:
+        print(f"[HUB-DETECT] {ip} ERROR: no SSH creds")
+        return (False, "No SSH credentials", {})
+
+    if not is_device_online(ip):
+        print(f"[HUB-DETECT] {ip} ERROR: SSH port unreachable")
+        return (False, "SSH port unreachable", {})
+
+    facts = {"hub_cfg": False, "tunnel_names": [], "peer_count": 0}
+
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    def run(cmd: str) -> str:
+        try:
+            print(f"[HUB-DETECT] run: {cmd}")
+            _stdin, stdout, stderr = ssh.exec_command(cmd, timeout=timeout)
+            out = stdout.read().decode(errors="ignore")
+            err = stderr.read().decode(errors="ignore")
+            if err.strip():
+                # IOS often writes nothing to stderr; if it does, log it for diagnosis
+                print(f"[HUB-DETECT] WARN stderr for '{cmd}': {err.strip()}")
+            return out
+        except Exception as e:
+            print(f"[HUB-DETECT] CMD ERROR for '{cmd}': {e}")
+            return ""
+
+    try:
+        print(f"[HUB-DETECT] Connecting to {ip} (timeout={timeout})")
+        ssh.connect(
+            ip, username=username, password=password,
+            look_for_keys=False, allow_agent=False,
+            timeout=timeout, banner_timeout=timeout, auth_timeout=timeout
+        )
+        print(f"[HUB-DETECT] SSH connected.")
+
+        # --- Get tunnel config (prefer 'section', fall back to 'begin') ---
+        tun_cfg = run("show running-config | section ^interface Tunnel")
+        if not tun_cfg.strip():
+            tun_cfg = run("show running-config | begin ^interface Tunnel")
+
+        # Keep a small head-of-output print for replicability
+        head = "\n".join(tun_cfg.splitlines()[:20])
+        print(f"[HUB-DETECT] tunnel_section out (head):\n{head}\n---")
+
+        # Split into interface sections and evaluate
+        sections = re.split(r"(?m)^interface\s+", tun_cfg)
+        hub_tunnels = []
+        for sec in sections:
+            sec = sec.strip()
+            if not sec:
+                continue
+            # Section starts with "Tunnel1", "Tunnel2", etc.
+            m_name = re.match(r"(Tunnel\S+)", sec)
+            name = m_name.group(1) if m_name else "Tunnel?"
+
+            has_mgre    = re.search(r"(?m)^\s*tunnel mode gre multipoint\b", sec) is not None
+            has_nhs     = re.search(r"(?m)^\s*ip nhrp nhs\b", sec) is not None
+            has_redirect= re.search(r"(?m)^\s*ip nhrp redirect\b", sec) is not None
+
+            print(f"[HUB-DETECT] {name}: mGRE={has_mgre} NHS={has_nhs} REDIR={has_redirect}")
+
+            # HUB if mGRE and (no NHS)  OR  explicit redirect
+            if has_mgre and (not has_nhs or has_redirect):
+                hub_tunnels.append(name)
+
+        facts["hub_cfg"] = len(hub_tunnels) > 0
+        facts["tunnel_names"] = hub_tunnels
+
+        # If config already proves hub, return early (avoid flaky extra commands)
+        if facts["hub_cfg"]:
+            print(f"[HUB-DETECT] {ip} hub_cfg=True via config; tunnels={hub_tunnels}")
+            try:
+                ssh.close()
+            except Exception:
+                pass
+            return (True, f"DMVPN hub config on {', '.join(hub_tunnels)}", facts)
+
+        # --- Best-effort runtime checks (not required) ---
+        dmvpn_out = run("show dmvpn")
+        nhrp_out  = run("show ip nhrp")
+
+        peer_count = 0
+        if dmvpn_out:
+            peer_count += len(re.findall(r"(?i)\bPeer|Registered|Up|NHRP|NBMA\b", dmvpn_out))
+        if nhrp_out:
+            peer_count += len(re.findall(r"(?i)\bpeer\b|\bVia:\b|\bRegistrations\b", nhrp_out))
+        facts["peer_count"] = peer_count
+
+        if dmvpn_out and re.search(r"(?i)\bType:\s*Hub\b", dmvpn_out):
+            print(f"[HUB-DETECT] {ip} runtime indicates Type: Hub")
+            try:
+                ssh.close()
+            except Exception:
+                pass
+            return (True, "DMVPN hub (runtime)", facts)
+
+        try:
+            ssh.close()
+        except Exception:
+            pass
+
+        print(f"[HUB-DETECT] {ip} not a hub by config/runtime.")
+        return (False, "No DMVPN hub fingerprints found", facts)
+
+    except Exception as e:
+        try:
+            ssh.close()
+        except Exception:
+            pass
+        print(f"[HUB-DETECT] {ip} ERROR: {e}")
+        return (False, f"SSH error: {e}", {})
+
+def detect_default_gateway(ip, username, password, *, vrf=None, timeout=6):
+    cmd_route = f"show ip route{' vrf ' + vrf if vrf else ''}"
+    cmd_cfg   = "show running-config | include ^ip route 0.0.0.0 0.0.0.0"
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    ssh.connect(ip, username=username, password=password,
+                look_for_keys=False, allow_agent=False, timeout=timeout)
+    _, stdout, _ = ssh.exec_command(cmd_route)
+    out = stdout.read().decode(errors="ignore")
+
+    m = re.search(r"Gateway of last resort is\s+((?:\d{1,3}\.){3}\d{1,3})\s+to network\s+0\.0\.0\.0",
+                  out, re.IGNORECASE)
+    if m:
+        gw = m.group(1); ssh.close(); return gw, out
+    m2 = re.search(r"(?m)^\S*\*\s+0\.0\.0\.0/0.*?\bvia\s+((?:\d{1,3}\.){3}\d{1,3})\b", out)
+    if m2:
+        gw = m2.group(1); ssh.close(); return gw, out
+    _, stdout2, _ = ssh.exec_command(cmd_cfg)
+    cfg = stdout2.read().decode(errors="ignore")
+    m3 = re.search(r"(?m)^ip route 0\.0\.0\.0 0\.0\.0\.0\s+((?:\d{1,3}\.){3}\d{1,3})\b", cfg)
+    ssh.close()
+    return (m3.group(1) if m3 else None), out
 
 def extract_sms_content(sms_text: str) -> str:
     lines = sms_text.strip().splitlines()
     for i, line in enumerate(lines):
         if line.strip().startswith("SIZE:"):
-            # Return the line after 'SIZE:' (should be the content)
             if i + 1 < len(lines):
                 return lines[i + 1].strip().strip('"')
     return ""
 
 def fetch_last_sms(ip):
     try:
+        if not has_cellular_interface(ip):
+            return "No Cellular"
+
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         username, password = get_ssh_credentials()
         ssh.connect(ip, username=username, password=password, look_for_keys=False, allow_agent=False)
-
-        # Get all SMS
-        stdin, stdout, stderr = ssh.exec_command("cellular 0/0/0 lte sms view all")
+        _, stdout, _ = ssh.exec_command("cellular 0/0/0 lte sms view all")
         sms_list_output = stdout.read().decode()
         ssh.close()
-        # Extract SMS indices
         index_matches = re.findall(r'SMS ID: (\d+)', sms_list_output)
         if not index_matches:
             return "No SMS"
-
         last_index = max(map(int, index_matches))
-
-        # Get the latest SMS
         ssh.connect(ip, username=username, password=password, look_for_keys=False, allow_agent=False)
         cmd = f"cellular 0/0/0 lte sms view {last_index}"
-        stdin, stdout, stderr = ssh.exec_command(cmd)
+        _, stdout, _ = ssh.exec_command(cmd)
         sms_output = stdout.read().decode()
         ssh.close()
-
-        # Extract message content (optional: truncate if too long)
-        msg_match = extract_sms_content(sms_output)
-        return msg_match
-
+        msg = extract_sms_content(sms_output)
+        return msg
     except Exception as e:
-        return f"Error: {str(e)}"
         traceback.print_exc()
+        return f"Error: {str(e)}"
 
 def fetch_sms_details(router_ip, sms_index):
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     username, password = get_ssh_credentials()
     ssh.connect(router_ip, username=username, password=password, look_for_keys=False, allow_agent=False)
-
     command = f"cellular 0/0/0 lte sms view {sms_index}"
-    stdin, stdout, stderr = ssh.exec_command(command)
+    _, stdout, _ = ssh.exec_command(command)
     sms_output = stdout.read().decode()
     ssh.close()
-
-    # Debug: log raw output in case parsing fails
     print(f"📩 Raw SMS output:\n{sms_output}")
 
     sms_id = re.search(r"SMS ID: (\d+)", sms_output)
@@ -950,16 +730,11 @@ def fetch_sms_details(router_ip, sms_index):
     sms_content_match = re.search(r"SIZE: \d+\s*(.+)", sms_output, re.DOTALL)
 
     if not all([sms_id, sms_time, sms_from, sms_size, sms_content_match]):
-        print("⚠️ Failed to extract SMS fields. One or more regex groups not found.")
-        return {
-            "ID": "Unknown",
-            "Time": "Unknown",
-            "From": "Unknown",
-            "Size": "Unknown",
-            "Content": "Failed to parse SMS content",
-        }
+        print("⚠️ Failed to extract SMS fields.")
+        return {"ID": "Unknown", "Time": "Unknown", "From": "Unknown", "Size": "Unknown",
+                "Content": "Failed to parse SMS content"}
 
-    sms_details = {
+    return {
         "ID": sms_id.group(1),
         "Time": sms_time.group(1),
         "From": sms_from.group(1),
@@ -967,35 +742,14 @@ def fetch_sms_details(router_ip, sms_index):
         "Content": sms_content_match.group(1).strip(),
     }
 
-    return sms_details
-
-def create_status_label(status):
-    label = QtWidgets.QLabel()
-    
-    if status == "Online":
-        text = '<span style="color: black;">Online </span><span style="color: #34d399; font-size: 20px;">●</span>'
-    elif status == "Not Register":
-        text = '<span style="color: black;">Not Register </span><span style="color: #708090; font-size: 20px;">●</span>'
-    else:
-        text = '<span style="color: black;">Offline </span><span style="color: #f87171; font-size: 20px;">●</span>'
-
-    label.setText(text)
-    label.setAlignment(Qt.AlignCenter)
-    return label
-
 def fetch_all_sms(router_ip):
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     username, password = get_ssh_credentials()
     ssh.connect(router_ip, username=username, password=password, look_for_keys=False, allow_agent=False)
-    shell = ssh.invoke_shell()
-    time.sleep(1)
-    shell.recv(1000)
-    shell.send("terminal length 0\n")
-    time.sleep(0.5)
-    shell.recv(1000)
-    shell.send("cellular 0/0/0 lte sms view all\n")
-    time.sleep(1)
+    shell = ssh.invoke_shell(); time.sleep(1); shell.recv(1000)
+    shell.send("terminal length 0\n"); time.sleep(0.5); shell.recv(1000)
+    shell.send("cellular 0/0/0 lte sms view all\n"); time.sleep(1)
     output = ""
     while True:
         if shell.recv_ready():
@@ -1014,74 +768,322 @@ def fetch_all_sms(router_ip):
         sms_content_match = re.search(r"SIZE: \d+\s*\n(.+)", block)
         if not all([sms_id, sms_time, sms_from, sms_content_match]):
             continue
-        sms_details = {
+        all_sms.append({
             "ID": sms_id.group(1),
             "Time": sms_time.group(1),
             "From": sms_from.group(1),
             "Size": sms_size.group(1) if sms_size else "0",
             "Content": sms_content_match.group(1).strip(),
-        }
-        all_sms.append(sms_details)
+        })
     return all_sms
 
+# ---------- Email notification settings ----------
 def safe_set_text(widget, value):
-
     text_value = str(value) if value is not None else ""
-
-    if hasattr(widget, "setPlainText"):  
-        # QPlainTextEdit
+    if hasattr(widget, "setPlainText"):
         widget.setPlainText(text_value)
-    elif hasattr(widget, "setText"):  
-        # QLineEdit, QLabel, QPushButton, dll
+    elif hasattr(widget, "setText"):
         widget.setText(text_value)
     else:
-        raise TypeError(f"Widget {type(widget).__name__} is not support with this function")
+        raise TypeError(f"Widget {type(widget).__name__} is not supported")
 
 def safe_get_text(widget):
-    if hasattr(widget, "toPlainText"):  # QPlainTextEdit
+    if hasattr(widget, "toPlainText"):
         return widget.toPlainText().strip()
-    elif hasattr(widget, "text"):  # QLineEdit, QLabel, QPushButton, dll
+    elif hasattr(widget, "text"):
         return widget.text().strip()
     else:
-        raise TypeError(f"Widget {type(widget).__name__} tidak mendukung pengambilan teks")
+        raise TypeError(f"Widget {type(widget).__name__} is not supported")
 
-class SendSMSDialog(QtWidgets.QDialog):
-    def __init__(self, device_name, router_ip, parent=None):
+class EmailNotificationDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(f"Send SMS via {device_name}")
-        self.setFixedSize(300, 200)
+        uic.loadUi(resource_path("email_notification_list.ui"), self)
+        self.saveButton.clicked.connect(self.save_setting)
+        self.cancelButton.clicked.connect(self.reject)
+        self.loadData()
 
-        layout = QtWidgets.QVBoxLayout()
+    def loadData(self):
+        try:
+            db_config = get_db_config()
+            conn = mysql.connector.connect(**db_config)
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM email_notification LIMIT 1")
+            row = cursor.fetchone()
+            if row:
+                safe_set_text(self.subjectEdit, row[1])
+                safe_set_text(self.emailEdit, row[2])
+                safe_set_text(self.contentEdit, row[3])
+            cursor.close(); conn.close()
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Error", str(e))
 
-        self.to_input = QtWidgets.QLineEdit()
-        self.to_input.setPlaceholderText("Recipient Number")
-        layout.addWidget(QtWidgets.QLabel("To:"))
-        layout.addWidget(self.to_input)
+    def save_setting(self):
+        subject = safe_get_text(self.subjectEdit)
+        email   = safe_get_text(self.emailEdit)
+        content = safe_get_text(self.contentEdit)
+        if not subject or not email or not content:
+            QtWidgets.QMessageBox.warning(self, "Missing Fields", "subject, email and content are required.")
+            return
+        try:
+            db_config = get_db_config()
+            conn = mysql.connector.connect(**db_config)
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM email_notification")
+            cursor.execute("INSERT INTO email_notification (subject, email, content) VALUES (%s, %s, %s)",
+                           (subject, email, content))
+            conn.commit(); cursor.close(); conn.close()
+            QtWidgets.QMessageBox.information(self, "Saved", "Email Notification Setting updated.")
+            self.accept()
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Error", str(e))
 
-        self.message_input = QtWidgets.QPlainTextEdit()
-        self.message_input.setPlaceholderText("Enter your message")
-        layout.addWidget(QtWidgets.QLabel("Message:"))
-        layout.addWidget(self.message_input)
+# ---------- Email profiles (not shown in UI here, but retained) ----------
+def get_email_profiles():
+    db_config = get_db_config()
+    conn = mysql.connector.connect(**db_config)
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT id, profile_name, smtp_server, smtp_port, sender_email, sender_password, security, is_default
+        FROM email_settings ORDER BY is_default DESC, profile_name ASC
+    """)
+    rows = cur.fetchall(); cur.close(); conn.close()
+    return rows
 
-        send_btn = QtWidgets.QPushButton("Send")
-        send_btn.clicked.connect(self.accept)
-        layout.addWidget(send_btn)
+def get_default_email_profile():
+    db_config = get_db_config()
+    conn = mysql.connector.connect(**db_config)
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT id, profile_name, smtp_server, smtp_port, sender_email, sender_password, security, is_default
+        FROM email_settings ORDER BY is_default DESC, profile_name ASC LIMIT 1
+    """)
+    row = cur.fetchone(); cur.close(); conn.close()
+    return row
 
-        self.setLayout(layout)
-        self.router_ip = router_ip
+def upsert_email_profile(profile):
+    db_config = get_db_config()
+    conn = mysql.connector.connect(**db_config)
+    cur = conn.cursor()
+    if profile.get("is_default"):
+        cur.execute("UPDATE email_settings SET is_default = 0")
+    if profile.get("id"):
+        cur.execute("""
+            UPDATE email_settings
+               SET profile_name=%s, smtp_server=%s, smtp_port=%s,
+                   sender_email=%s, sender_password=%s, security=%s, is_default=%s
+             WHERE id=%s
+        """, (profile["profile_name"], profile["smtp_server"], int(profile["smtp_port"]),
+              profile["sender_email"], profile["sender_password"], profile["security"],
+              1 if profile.get("is_default") else 0, int(profile["id"])))
+    else:
+        cur.execute("""
+            INSERT INTO email_settings
+            (profile_name, smtp_server, smtp_port, sender_email, sender_password, security, is_default)
+            VALUES (%s,%s,%s,%s,%s,%s,%s)
+        """, (profile["profile_name"], profile["smtp_server"], int(profile["smtp_port"]),
+              profile["sender_email"], profile["sender_password"], profile["security"],
+              1 if profile.get("is_default") else 0))
+    conn.commit(); cur.close(); conn.close()
 
-    def get_sms_data(self):
-        return self.to_input.text(), self.message_input.toPlainText()
-    
+def delete_email_profile(profile_id):
+    db_config = get_db_config()
+    conn = mysql.connector.connect(**db_config)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM email_settings WHERE id=%s", (int(profile_id),))
+    conn.commit(); cur.close(); conn.close()
+
+# ---------- Cisco EEM ----------
+def configure_sms_applet_on_cisco(router_ip, username, password):
+    eem_script = f"""
+configure terminal
+no event manager applet SMS_Extract
+event manager applet SMS_Extract
+ event syslog pattern "Cellular0/0/0: New SMS received on index ([0-9]+)"
+ action 1.0 cli command "enable"
+ action 2.0 regexp "index ([0-9]+)" "$_syslog_msg" match sms_index
+ action 3.0 cli command "cellular 0/0/0 lte sms view $sms_index"
+ action 4.0 syslog msg "SMS Extracted -> ID: $sms_index"
+!
+logging host {get_ip_address()}
+logging trap informational
+end
+write memory
+"""
+    try:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(router_ip, username=username, password=password, look_for_keys=False, allow_agent=False)
+        shell = ssh.invoke_shell(); time.sleep(1); shell.recv(1000)
+        for line in eem_script.strip().split("\n"):
+            shell.send(line.rstrip() + "\n"); time.sleep(0.3)
+        _ = shell.recv(10000).decode(errors="ignore")
+        ssh.close()
+        print(f"EEM applet configured on {router_ip}")
+    except Exception as e:
+        print(f"Failed to configure EEM on {router_ip}: {e}")
+
+# ---------- SMS DB ingest ----------
+def get_all_sms(ip):
+    username, password = get_ssh_credentials()
+    if not username or not password or not is_device_online(ip) or not has_cellular_interface(ip):
+        return ""
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    ssh.connect(ip, username=username, password=password,
+                look_for_keys=False, allow_agent=False,
+                timeout=3, banner_timeout=3, auth_timeout=3)
+    _, stdout, _ = ssh.exec_command("cellular 0/0/0 lte sms view all")
+    out = stdout.read().decode(); ssh.close()
+    return out
+
+def parse_sms(raw_output):
+    sms_blocks = raw_output.strip().split("--------------------------------------------------------------------------------")
+    sms_list = []
+    for block in sms_blocks:
+        if not block.strip(): continue
+        sms = {}
+        for line in block.strip().splitlines():
+            if line.startswith("SMS ID:"):
+                sms["ID"] = int(line.replace("SMS ID:", "").strip())
+            elif line.startswith("TIME:"):
+                raw_time = line.replace("TIME:", "").strip()
+                sms_time = datetime.strptime(raw_time, "%y-%m-%d %H:%M:%S")
+                sms["Time"] = sms_time
+            elif line.startswith("FROM:"):
+                raw = line.replace("FROM:", "").strip()
+                if is_phone_number(raw):
+                    smsFrom = "0" + raw[2:] if raw.startswith("61") else raw
+                elif is_hex_string(raw):
+                    smsFrom = gsm7_unpack(raw)
+                else:
+                    smsFrom = raw
+                sms["From"] = smsFrom
+                sms["CiscoFrom"] = raw
+            elif line.startswith("SIZE:"):
+                sms["Size"] = int(line.replace("SIZE:", "").strip())
+            else:
+                sms["Message"] = sms.get("Message", "") + " " + line.strip()
+        sms_list.append(sms)
+    return sms_list
+
+def get_new_sms_by_time(ip, last_time):
+    raw = get_all_sms(ip)
+    all_sms = parse_sms(raw)
+    return [sms for sms in all_sms if sms["Time"] > last_time]
+
+def save_sms_to_db(sms_list, device):
+    db_config = get_db_config()
+    conn = mysql.connector.connect(**db_config)
+    cursor = conn.cursor()
+    sql = """
+    INSERT IGNORE INTO sms_logs (dates, sms_from, cisco_from, size, message, devices_id)
+    VALUES (%s, %s, %s, %s, %s, %s)
+    """
+    for sms in sms_list:
+        cursor.execute(sql, (sms["Time"], sms["From"], sms["CiscoFrom"], sms["Size"],
+                             sms["Message"], device["id"]))
+    conn.commit(); cursor.close()
+
+    # Email template (subject/email/content) from email_notification table
+    conn = mysql.connector.connect(**db_config)
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM email_notification LIMIT 1")
+    row = cursor.fetchone()
+    if row:
+        subject, email, content = row[1], row[2], row[3]
+    else:
+        subject = email = content = None
+    cursor.close(); conn.close()
+
+    # Queue to TrackIT DB
+    db_config_ti = get_db_config_ti()
+    if not db_config_ti: return
+    conn = mysql.connector.connect(**db_config_ti)
+    now = datetime.now()
+    cursor = conn.cursor()
+    sql = """
+    INSERT INTO logbulkmail(dates, times, sendto, mailsubject, mailcontent, mailstatus,
+                            mailtype, cc, spoofas, spoofname, attachment) 
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """
+    for sms in sms_list:
+        mailcontent = (f"{content}<br />---------<br />From: {sms['From']}<br />"
+                       f"Received: {sms['Time']}<br />SIM Detail: {device['name']} - {device['sim']}<br />"
+                       f"Message: {sms['Message']}")
+        emailReceive = sms["From"] + "@alliedsms.com.au"
+        cursor.execute(sql, (now.date(), now.strftime("%I:%M:%S %p"), email,
+                             subject + " - " +  emailReceive, mailcontent,
+                             "Queue In Database", "Email", 1, emailReceive, emailReceive, 0))
+    conn.commit(); cursor.close(); conn.close()
+
+def fetch_from_all_devices(devices):
+    def _as_dt(v):
+        if v is None:
+            return datetime.strptime("2000-01-01 00:00:00", "%Y-%m-%d %H:%M:%S")
+        if isinstance(v, datetime):
+            return v
+        try:
+            return datetime.strptime(str(v), "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return datetime.strptime("2000-01-01 00:00:00", "%Y-%m-%d %H:%M:%S")
+
+    db_config = get_db_config()
+    if not db_config:
+        print("❌ No DB config; fetch_from_all_devices aborted.")
+        return []
+
+    for device in devices:
+        ip = device.get("ip"); dev_id = device.get("id")
+        if not ip or not is_device_online(ip):
+            continue
+        # Skip routers without cellular entirely
+        if not device.get("has_cellular", False):
+            continue
+
+        last_time = datetime.strptime("2000-01-01 00:00:00", "%Y-%m-%d %H:%M:%S")
+        try:
+            conn = mysql.connector.connect(**db_config)
+            cur = conn.cursor()
+            cur.execute("SELECT MAX(dates) FROM sms_logs WHERE devices_id=%s", (dev_id,))
+            row = cur.fetchone(); cur.close(); conn.close()
+            last_time = _as_dt(row[0] if row else None)
+        except Exception as e:
+            print(f"⚠️ Failed reading last_time for device {dev_id} ({ip}): {e}")
+        try:
+            new_sms = get_new_sms_by_time(ip, last_time)
+        except Exception as e:
+            print(f"⚠️ get_new_sms_by_time failed for {ip}: {e}")
+            new_sms = []
+        if new_sms:
+            try:
+                save_sms_to_db(new_sms, device)
+                print(f"✅ {len(new_sms)} new SMS from {ip} saved")
+            except Exception as e:
+                print(f"❌ Failed saving SMS for {ip}: {e}")
+
+    try:
+        conn = mysql.connector.connect(**db_config)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT d.name, s.dates, s.sms_from, s.message
+            FROM devices d
+            INNER JOIN sms_logs s ON s.devices_id = d.id
+            ORDER BY s.dates DESC, s.id DESC
+        """)
+        sms_list = cur.fetchall(); cur.close(); conn.close()
+        return sms_list
+    except Exception as e:
+        print(f"❌ Failed to build SMS list for UI: {e}")
+        return []
+
+# ---------- Credentials/DB settings dialogs ----------
 class SSHCredentialsDialog(QtWidgets.QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         uic.loadUi(resource_path("ssh_credentials_dialog.ui"), self)
-
-        self.config_path = "ssh_key.key"
         self.saveButton.clicked.connect(self.save_credentials)
         self.cancelButton.clicked.connect(self.reject)
-
         self.load_credentials()
 
     def load_credentials(self):
@@ -1094,44 +1096,36 @@ class SSHCredentialsDialog(QtWidgets.QDialog):
             if row:
                 self.usernameLineEdit.setText(row[0])
                 self.passwordLineEdit.setText(decrypt_password(row[1]))
-            cursor.close()
-            conn.close()
+            cursor.close(); conn.close()
         except Exception as e:
             QtWidgets.QMessageBox.warning(self, "Error", str(e))
 
     def save_credentials(self):
-        username = self.usernameLineEdit.text()
-        password = self.passwordLineEdit.text()
-
+        username = self.usernameLineEdit.text().strip()
+        password = self.passwordLineEdit.text().strip()
         if not username or not password:
             QtWidgets.QMessageBox.warning(self, "Missing Fields", "Username and password are required.")
             return
-
         encrypted = encrypt_password(password)
         try:
             db_config = get_db_config()
             conn = mysql.connector.connect(**db_config)
             cursor = conn.cursor()
-            cursor.execute("DELETE FROM user_ssh")  # Replace with UPDATE if per-device later
+            cursor.execute("DELETE FROM user_ssh")
             cursor.execute("INSERT INTO user_ssh (username, password) VALUES (%s, %s)", (username, encrypted))
-            conn.commit()
-            cursor.close()
-            conn.close()
+            conn.commit(); cursor.close(); conn.close()
             QtWidgets.QMessageBox.information(self, "Saved", "SSH credentials updated.")
             self.accept()
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Error", str(e))
 
-
 class DBSettingsDialog(QtWidgets.QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         uic.loadUi(resource_path("db_settings_dialog.ui"), self)
-
         self.testButton.clicked.connect(self.test_connection)
         self.saveButton.clicked.connect(self.save_settings)
         self.cancelButton.clicked.connect(self.reject)
-
         self.config_path = "db_config.json"
         self.load_settings()
 
@@ -1170,16 +1164,14 @@ class DBSettingsDialog(QtWidgets.QDialog):
                 user=self.userLineEdit.text(),
                 password=self.passwordLineEdit.text(),
                 database=self.databaseLineEdit.text()
-            )
-            conn.close()
+            ); conn.close()
             conn = mysql.connector.connect(
                 host=self.hostLineEdit.text(),
                 port=self.portSpinBox.value(),
                 user=self.userLineEdit.text(),
                 password=self.passwordLineEdit.text(),
                 database=self.databaseTILineEdit.text()
-            )
-            conn.close()
+            ); conn.close()
             QtWidgets.QMessageBox.information(self, "Success", "Connection successful!")
         except mysql.connector.Error as err:
             QtWidgets.QMessageBox.critical(self, "Connection Failed", str(err))
@@ -1188,39 +1180,29 @@ class EmailSettingsDialog(QtWidgets.QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Email Settings")
-
         layout = QVBoxLayout()
         form_layout = QtWidgets.QFormLayout()
-
         self.smtp_server_input = QtWidgets.QLineEdit()
         self.smtp_port_input = QtWidgets.QLineEdit()
         self.email_sender_input = QtWidgets.QLineEdit()
         self.email_password_input = QtWidgets.QLineEdit()
         self.email_password_input.setEchoMode(QtWidgets.QLineEdit.Password)
-
         form_layout.addRow("SMTP Server:", self.smtp_server_input)
         form_layout.addRow("SMTP Port:", self.smtp_port_input)
         form_layout.addRow("Sender Email:", self.email_sender_input)
         form_layout.addRow("Password:", self.email_password_input)
-
         layout.addLayout(form_layout)
-
         save_button = QPushButton("Save")
         save_button.clicked.connect(self.save_settings)
         layout.addWidget(save_button)
-
         self.setLayout(layout)
-
         self.load_settings()
 
     def load_settings(self):
         conn = mysql.connector.connect(**get_db_config())
         cursor = conn.cursor(dictionary=True)
         cursor.execute("SELECT smtp_server, smtp_port, email_sender, email_password FROM email_settings LIMIT 1")
-        row = cursor.fetchone()
-        cursor.close()
-        conn.close()
-
+        row = cursor.fetchone(); cursor.close(); conn.close()
         if row:
             self.smtp_server_input.setText(row["smtp_server"])
             self.smtp_port_input.setText(str(row["smtp_port"]))
@@ -1232,7 +1214,6 @@ class EmailSettingsDialog(QtWidgets.QDialog):
         smtp_port = self.smtp_port_input.text()
         email_sender = self.email_sender_input.text()
         email_password = self.email_password_input.text()
-
         conn = mysql.connector.connect(**get_db_config())
         cursor = conn.cursor()
         cursor.execute("""
@@ -1244,156 +1225,267 @@ class EmailSettingsDialog(QtWidgets.QDialog):
                 email_sender = VALUES(email_sender),
                 email_password = VALUES(email_password)
         """, (smtp_server, smtp_port, email_sender, email_password))
-        conn.commit()
-        cursor.close()
-        conn.close()
-
+        conn.commit(); cursor.close(); conn.close()
         self.accept()
 
-
+# ---------- Signals ----------
 class WorkerSignals(QObject):
     deviceAdded = pyqtSignal(list)
     smsLogsFetched = pyqtSignal(str, list)
     refreshCompleted = pyqtSignal(list)
-    def __init__(self, parent=None):
-        super().__init__(parent)
 
 class SMSUpdateSignal(QObject):
-    smsFetched = pyqtSignal(int, str)  # row index, SMS text
+    smsFetched = pyqtSignal(int, str)
 
 class IPItem(QtWidgets.QTableWidgetItem):
-    """QTableWidgetItem that sorts IPv4 addresses numerically."""
     def __lt__(self, other):
         def ip_key(s):
             try:
                 a, b, c, d = (int(x) for x in s.split("."))
                 return (a, b, c, d)
             except Exception:
-                # Non-IP values go last
                 return (999, 999, 999, 999)
         return ip_key(self.text()) < ip_key(other.text())
-    
-class EmailNotificationDialog(QtWidgets.QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        uic.loadUi(resource_path("email_notification_list.ui"), self)
-        self.saveButton.clicked.connect(self.save_setting)
+
+# ---------- Device settings dialog (with Detect buttons) ----------
+class DetectSignals(QObject):
+    apnDetected = pyqtSignal(str)
+    gatewayDetected = pyqtSignal(str)
+    detectFailed = pyqtSignal(str)
+
+class DeviceSettingsDialog(QtWidgets.QDialog):
+    def __init__(self, device=None, parent=None):
+        super(DeviceSettingsDialog, self).__init__(parent)
+        uic.loadUi(resource_path("device_settings_dialog.ui"), self)
+
+        self.detectSignals = DetectSignals()
+        self.detectSignals.apnDetected.connect(self.on_apn_detected)
+        self.detectSignals.gatewayDetected.connect(self.on_gateway_detected)
+        self.detectSignals.detectFailed.connect(self.on_apn_failed)
+
+        self.overlay = QWidget(self)
+        self.overlay.setStyleSheet("background: rgba(255, 255, 255, 0.7);")
+        self.overlay.hide()
+        self.overlay.setGeometry(self.rect())
+        self.overlay.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+
+        self.overlaySpinner = LoadingSpinner(self.overlay)
+        self.overlaySpinner.setFixedSize(80, 80)
+        self.overlaySpinner.setGeometry(self.overlay.width()//2-40, self.overlay.height()//2-40, 80, 80)
+
+        self.gatewaySpinner = LoadingSpinner(self)
+
+        self.detectGatewayButton = QPushButton("Detect")
+        getway_row_layout = QHBoxLayout()
+        getway_row_layout.addWidget(self.gatewayLineEdit)
+        getway_row_layout.addWidget(self.detectGatewayButton)
+        getway_row_layout.addWidget(self.gatewaySpinner)
+
+        self.detectApnButton = QPushButton("Detect")
+        apn_row_layout = QHBoxLayout()
+        apn_row_layout.addWidget(self.apnLineEdit)
+        apn_row_layout.addWidget(self.detectApnButton)
+
+        self.resizeEvent = self.resizeEvento
+        layout: QtWidgets.QVBoxLayout = self.layout()
+        layout.insertLayout(2, getway_row_layout)
+        layout.insertLayout(3, apn_row_layout)
+
+        self.detectApnButton.clicked.connect(self.handle_detect_apn)
+        self.detectGatewayButton.clicked.connect(self.handle_detect_gateway)
+
+        self.device = device
+        if device:
+            self.nameLineEdit.setText(device["name"])
+            self.ipLineEdit.setText(device["ip"])
+            self.gatewayLineEdit.setText(device["gateway"])
+            self.simLineEdit.setText(device["sim"])
+            self.apnLineEdit.setText(device["apn"])
+            self.emailLineEdit.setText(device["email"])
+            if not device.get("has_cellular", True):
+                self.detectApnButton.setEnabled(False)
+                self.detectApnButton.setToolTip("No cellular interface on this router")
+
+        self.saveButton.clicked.connect(self.accept)
         self.cancelButton.clicked.connect(self.reject)
 
-        self.loadData()
+    def resizeEvento(self, event):
+        super().resizeEvent(event)
+        self.overlay.setGeometry(self.rect())
+        self.overlaySpinner.setGeometry(self.overlay.width()//2-40, self.overlay.height()//2-40, 80, 80)
 
-    def loadData(self):
-        try:
-            db_config = get_db_config()
-            conn = mysql.connector.connect(**db_config)
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM email_notification LIMIT 1")
-            row = cursor.fetchone()
-            if row:
-                safe_set_text(self.subjectEdit, row[1])
-                safe_set_text(self.emailEdit, row[2])
-                safe_set_text(self.contentEdit, row[3])
-                # self.subjectEdit.setText(row[1])
-                # self.emailEdit.setPlainText(row[2])
-                # self.contentEdit.setPlainText(row[3])
-            cursor.close()
-            conn.close()
-        except Exception as e:
-            QtWidgets.QMessageBox.warning(self, "Error", str(e))
+    def get_data(self):
+        return {
+            "name": self.nameLineEdit.text(),
+            "ip": self.ipLineEdit.text(),
+            "gateway": self.gatewayLineEdit.text(),
+            "sim": self.simLineEdit.text(),
+            "apn": self.apnLineEdit.text(),
+            "email": self.emailLineEdit.text(),
+        }
 
-    def save_setting(self):
-        subject = safe_get_text(self.subjectEdit) 
-        email = safe_get_text(self.emailEdit) 
-        content = safe_get_text(self.contentEdit) 
-        # email = self.emailEdit.toPlainText()
-        # content = self.contentEdit.toPlainText()
-
-        if not subject or not email or not content:
-            QtWidgets.QMessageBox.warning(self, "Missing Fields", "subject, email and content are required.")
+    def handle_detect_apn(self):
+        ip = self.ipLineEdit.text().strip()
+        if not ip:
+            QtWidgets.QMessageBox.warning(self, "Missing IP", "Please enter the router IP first.")
             return
-        try:
-            db_config = get_db_config()
-            conn = mysql.connector.connect(**db_config)
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM email_notification")  # Replace with UPDATE if per-device later
-            cursor.execute("INSERT INTO email_notification (subject, email, content) VALUES (%s, %s, %s)", (subject, email, content))
-            conn.commit()
-            cursor.close()
-            conn.close()
-            QtWidgets.QMessageBox.information(self, "Saved", "Email Notification Setting updated.")
-            self.accept()
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Error", str(e))
+        self.overlay.show(); self.overlaySpinner.start()
 
+        def run():
+            try:
+                ssh = paramiko.SSHClient()
+                ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                username, password = get_ssh_credentials()
+                if not username or not password:
+                    self.detectSignals.detectFailed.emit("SSH credentials not set.")
+                    return
+
+                ssh.connect(ip, username=username, password=password, look_for_keys=False, allow_agent=False)
+
+                # Always turn off paging then fetch the FULL brief
+                shell = ssh.invoke_shell(); time.sleep(0.5); shell.recv(9999)
+                shell.send("terminal length 0\n"); time.sleep(0.3); shell.recv(9999)
+
+                shell.send("show ip interface brief\n"); time.sleep(0.7)
+                brief = ""
+                while shell.recv_ready():
+                    brief += shell.recv(4096).decode(errors="ignore")
+                    time.sleep(0.1)
+
+                slot = _find_cellular_slot_from_brief(brief)
+                if not slot:
+                    ssh.close()
+                    self.detectSignals.detectFailed.emit("No Cellular interface found in 'show ip interface brief'.")
+                    return
+
+                # Try several platform variants
+                candidates = [
+                    f"show cellular {slot} profile",
+                    f"show cellular {slot} lte profile",
+                    f"show cellular {slot} all",
+                    f"show running-config | section ^cellular {slot}",
+                    "show running-config | include (?i)\\bapn\\b",
+                ]
+
+                output = ""
+                for cmd in candidates:
+                    _stdin, stdout, _stderr = ssh.exec_command(cmd)
+                    text = stdout.read().decode(errors="ignore")
+                    if len(text.strip()) > 0:
+                        output += f"\n--- {cmd} ---\n{text}"
+                    # stop early if we see APN or Profile in this chunk
+                    if re.search(r"(?i)\b(APN|Profile)\b", text):
+                        break
+
+                ssh.close()
+
+                apn = _parse_apn(output)
+                if apn:
+                    self.detectSignals.apnDetected.emit(apn)
+                else:
+                    # Helpful message for troubleshooting
+                    msg = "Could not detect APN. Checked commands:\n" + "\n".join(candidates[:3])
+                    self.detectSignals.detectFailed.emit(msg)
+
+            except Exception as e:
+                try:
+                    ssh.close()
+                except Exception:
+                    pass
+                self.detectSignals.detectFailed.emit(str(e))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def on_apn_detected(self, apn):
+        self.apnLineEdit.setText(apn)
+        self.overlaySpinner.stop(); self.overlay.hide()
+        QtWidgets.QMessageBox.information(self, "APN Detected", f"Detected APN: {apn}")
+
+    def on_gateway_detected(self, gateway):
+        self.gatewayLineEdit.setText(gateway)
+        self.overlaySpinner.stop(); self.overlay.hide()
+        QtWidgets.QMessageBox.information(self, "Gateway Detected", f"Detected Gateway: {gateway}")
+
+    def on_apn_failed(self, message):
+        self.overlaySpinner.stop(); self.overlay.hide()
+        QtWidgets.QMessageBox.warning(self, "Detection Failed", message)
+
+    def handle_detect_gateway(self):
+        ip = self.ipLineEdit.text().strip()
+        if not ip:
+            QtWidgets.QMessageBox.warning(self, "Missing IP", "Please enter the router IP first.")
+            return
+        self.overlay.show(); self.overlaySpinner.start()
+        def run():
+            try:
+                username, password = get_ssh_credentials()
+                if not username or not password:
+                    self.detectSignals.detectFailed.emit("SSH credentials not set.")
+                    return
+                gw, _ = detect_default_gateway(ip, username, password)
+                if gw:
+                    self.detectSignals.gatewayDetected.emit(gw)
+                else:
+                    self.detectSignals.detectFailed.emit("Gateway of last resort is not set.")
+            except Exception as e:
+                self.detectSignals.detectFailed.emit(f"Gateway detect error: {e}")
+        threading.Thread(target=run, daemon=True).start()
+
+# ---------- Main window ----------
 class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-
-        
         ui_file = resource_path("combined_sms_monitor.ui")
         uic.loadUi(ui_file, self)
         self.setWindowIcon(QIcon(resource_path("icons/cisco.png")))
         self.statusBar()
-        # === Filter & Sort toolbar ===
-        toolbar = self.addToolBar("Filter & Sort")
-        toolbar.setMovable(False)
 
-        # Status filter
+        # Devices tab widgets
+        self.deviceSearchLineEdit = self.tabDevices.findChild(QtWidgets.QLineEdit, "searchLineEdit")
+        # SMS Inbox tab
+        self.inboxSearchLineEdit = self.tabSms.findChild(QtWidgets.QLineEdit, "searchLineEdit")
+        self.smsInboxTable = self.tabSms.findChild(QtWidgets.QTableWidget, "smsTable")
+        # Live Capture tab
+        self.smsCaptureTable = self.tabCapture.findChild(QtWidgets.QTableWidget, "smsTable")
+
+        # Toolbar
+        toolbar = self.addToolBar("Filter & Sort"); toolbar.setMovable(False)
         from PyQt5.QtWidgets import QComboBox, QCheckBox
         toolbar.addWidget(QLabel("Status:"))
-        self.statusFilterCombo = QComboBox()
-        self.statusFilterCombo.addItems(["All", "Online", "Offline"])
+        self.statusFilterCombo = QComboBox(); self.statusFilterCombo.addItems(["All", "Online", "Offline"])
         toolbar.addWidget(self.statusFilterCombo)
 
-        # SIM-only filter
-        self.simOnlyCheck = QCheckBox("SIM only")
-        toolbar.addWidget(self.simOnlyCheck)
+        self.simOnlyCheck = QCheckBox("SIM only"); toolbar.addWidget(self.simOnlyCheck)
 
-        # Sort controls
-        toolbar.addSeparator()
-        toolbar.addWidget(QLabel("Sort by:"))
-        self.sortByCombo = QComboBox()
-        self.sortByCombo.addItems(["Device", "IP", "Status", "Gateway"])
+        toolbar.addSeparator(); toolbar.addWidget(QLabel("Sort by:"))
+        self.sortByCombo = QComboBox(); self.sortByCombo.addItems(["Device", "IP", "Status", "Gateway"])
         toolbar.addWidget(self.sortByCombo)
 
-        self.sortOrderButton = QPushButton("Asc")
-        self.sortOrderButton.setCheckable(True)  # checked = Desc
+        self.sortOrderButton = QPushButton("Asc"); self.sortOrderButton.setCheckable(True)
         toolbar.addWidget(self.sortOrderButton)
 
-        # Hook up signals
+        self.hubsOnlyCheck = QCheckBox("Hubs only"); toolbar.addWidget(self.hubsOnlyCheck)
+
+        # Signals
         self.statusFilterCombo.currentIndexChanged.connect(self.apply_filters_and_sort)
         self.simOnlyCheck.toggled.connect(self.apply_filters_and_sort)
         self.sortByCombo.currentIndexChanged.connect(self.apply_filters_and_sort)
+        self.hubsOnlyCheck.toggled.connect(self.apply_filters_and_sort)
+        self.sortOrderButton.clicked.connect(self._toggle_sort_order)
 
-        def toggle_sort_order():
-            if self.sortOrderButton.isChecked():
-                self.sortOrderButton.setText("Desc")
-            else:
-                self.sortOrderButton.setText("Asc")
-            self.apply_filters_and_sort()
-
-        self.sortOrderButton.clicked.connect(toggle_sort_order)
-
-        # Enable interactive sorting by clicking headers too
         self.deviceTable.setSortingEnabled(True)
-        self.deviceTable.horizontalHeader().sortIndicatorChanged.connect(
-            lambda *_: None  # no-op; sorting is handled automatically by the widget
-        )
+        self.deviceTable.horizontalHeader().sortIndicatorChanged.connect(lambda *_: None)
 
-        menu_bar = self.menuBar()
-
-        settings_menu = menu_bar.addMenu("Settings")
-
+        # Menus
+        settings_menu = self.menuBar().addMenu("Settings")
         db_settings_action = QtWidgets.QAction("Database Settings", self)
-        db_settings_action.setIcon(QIcon(resource_path("icons/gear.jpg")))  # Optional: add settings icon
+        db_settings_action.setIcon(QIcon(resource_path("icons/gear.jpg")))
         db_settings_action.triggered.connect(self.open_db_settings)
-
         settings_menu.addAction(db_settings_action)
 
         email_settings_action = QtWidgets.QAction("Email Settings", self)
-        email_settings_action.setIcon(QIcon(resource_path("icons/gear.jpg")))  # Optional: add settings icon
+        email_settings_action.setIcon(QIcon(resource_path("icons/gear.jpg")))
         email_settings_action.triggered.connect(self.open_email_settings_dialog)
-
         settings_menu.addAction(email_settings_action)
 
         ssh_settings_action = QtWidgets.QAction(QIcon("icons/ssh.png"),"Manage SSH Credentials", self)
@@ -1404,147 +1496,176 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         notification_list.triggered.connect(self.open_email_notification)
         settings_menu.addAction(notification_list)
 
+        # App state
         self.just_added_device = False
         self.worker_signals = WorkerSignals(self)
         self.worker_signals.deviceAdded.connect(self.update_devices_and_ui)
         self.worker_signals.smsLogsFetched.connect(self.display_sms_log_dialog_result)
-
         self.worker_signals.refreshCompleted.connect(self.update_devices_after_refresh)
-
 
         self.sms_signal = SMSUpdateSignal()
         self.sms_signal.smsFetched.connect(self.on_sms_fetched)
-        print("Signal connected!")
-        self.spinner = LoadingSpinner(self)
-        self.spinner.setGeometry(self.rect())  # Match full window
-
-        self.resizeEvent = self._resizeEvent 
+        self.spinner = LoadingSpinner(self); self.spinner.setGeometry(self.rect())
+        self.resizeEvent = self._resizeEvent
 
         self.devices = load_devices_from_db()
         self.sms_logs = []
         self.is_paused = False
 
+        # Buttons
         self.addButton.clicked.connect(self.add_device)
         self.refreshButton.clicked.connect(self.refresh_devices_from_db)
         self.refreshButtonSMS.clicked.connect(self.fetch_all_devices)
-        self.searchLineEdit.textChanged.connect(self.filter_devices)
+
+        # Searches
+        if self.deviceSearchLineEdit:
+            self.deviceSearchLineEdit.textChanged.connect(self.filter_devices)
+        if hasattr(self, "smsSearchLineEdit"):
+            self.smsSearchLineEdit.textChanged.connect(self.filter_sms_logs)
+        if self.inboxSearchLineEdit:
+            self.inboxSearchLineEdit.textChanged.connect(self.filter_inbox_table)
+
         self.pauseButton.clicked.connect(self.toggle_pause)
         self.exportButton.clicked.connect(self.export_to_csv)
-        self.smsSearchLineEdit.textChanged.connect(self.filter_sms_logs)
 
+        # Initial loads
         self.load_devices(self.devices)
-
-        self.start_syslog_listener()
-        # Timer untuk fetch SMS tiap 1 menit
-        self.timer = QtCore.QTimer(self)
-        self.timer.timeout.connect(self.fetch_all_devices)  # fungsi yang kamu buat
-        self.timer.start(60 * 5000)  # 60 detik
-
-        # Pertama kali langsung jalan
         self.fetch_all_devices()
 
+        # Syslog listener + timer
+        self.start_syslog_listener()
+        self.timer = QtCore.QTimer(self)
+        self.timer.timeout.connect(self.fetch_all_devices)
+        self.timer.start(60 * 1000)
+
+    # cache so we don't hammer the same IP repeatedly
+    _autohub_checked = set()
+
+    def _auto_detect_and_flag_hub(self, row_index: int, dev: dict):
+        """
+        If a device is online and not marked as hub yet, try once to detect a DMVPN hub.
+        If detected, update DB and refresh the table so the HUB badge appears.
+        """
+        ip = dev.get("ip")
+        if not ip or ip in self._autohub_checked or dev.get("is_hub", False):
+            return
+        self._autohub_checked.add(ip)
+
+        def task():
+            try:
+                ok, reason, facts = detect_dmvpn_hub_over_ssh(ip)
+                print(f"[HUB-AUTO] {ip} -> ok={ok} reason={reason} facts={facts}")
+                if ok:
+                    set_device_hub_flag(dev["id"], True)
+                    QtCore.QTimer.singleShot(0, self.refresh_devices_from_db)
+            except Exception as e:
+                print(f"[HUB-AUTO] {ip} thread error: {e}")
+        threading.Thread(target=task, daemon=True).start()
+
+    # ---------- Inbox table fetch/render ----------
     def fetch_all_devices(self):
         self.devices = load_devices_from_db()
-        print("🔄 Ambil SMS dari semua device...")
-        # panggil fungsi fetch_from_all_devices() yang kita buat sebelumnya
+        print("🔄 Fetching SMS from all devices...")
         smsList = fetch_from_all_devices(self.devices)
-        self.smsTable.setColumnCount(4)
-        self.smsTable.setColumnWidth(0, 150)
-        self.smsTable.setColumnWidth(1, 150)
-        self.smsTable.setColumnWidth(2, 150)
-        self.smsTable.setColumnWidth(3, 350)
-        self.smsTable.setHorizontalHeaderLabels([
-            "Device", "Message Receive", "Message From", "Message Content"
-        ])
-        self.smsTable.setRowCount(len(smsList))
-        for i, d in enumerate(smsList):
-            self.smsTable.setItem(i, 0, QtWidgets.QTableWidgetItem(str(d[0] or "")))
-            self.smsTable.setItem(i, 1, QtWidgets.QTableWidgetItem(str(d[1] or "")))
-            self.smsTable.setItem(i, 2, QtWidgets.QTableWidgetItem(str(d[2] or "")))
-            self.smsTable.setItem(i, 3, QtWidgets.QTableWidgetItem(str(d[3] or "")))
 
+        if not self.smsInboxTable:
+            return
+
+        self.smsInboxTable.setColumnCount(4)
+        self.smsInboxTable.setColumnWidth(0, 150)
+        self.smsInboxTable.setColumnWidth(1, 150)
+        self.smsInboxTable.setColumnWidth(2, 150)
+        self.smsInboxTable.setColumnWidth(3, 350)
+        self.smsInboxTable.setHorizontalHeaderLabels(["Device", "Message Receive", "Message From", "Message Content"])
+        self.smsInboxTable.setRowCount(len(smsList))
+        for i, d in enumerate(smsList):
+            self.smsInboxTable.setItem(i, 0, QtWidgets.QTableWidgetItem(str(d[0] or "")))
+            self.smsInboxTable.setItem(i, 1, QtWidgets.QTableWidgetItem(str(d[1] or "")))
+            self.smsInboxTable.setItem(i, 2, QtWidgets.QTableWidgetItem(str(d[2] or "")))
+            self.smsInboxTable.setItem(i, 3, QtWidgets.QTableWidgetItem(str(d[3] or "")))
+        if self.inboxSearchLineEdit:
+            self.filter_inbox_table(self.inboxSearchLineEdit.text())
+
+    def filter_inbox_table(self, text=None):
+        if not self.smsInboxTable:
+            return
+        q = (text if text is not None else (self.inboxSearchLineEdit.text() if self.inboxSearchLineEdit else "")).strip().lower()
+        rows = self.smsInboxTable.rowCount()
+        for r in range(rows):
+            device  = (self.smsInboxTable.item(r, 0).text() if self.smsInboxTable.item(r, 0) else "").lower()
+            dates   = (self.smsInboxTable.item(r, 1).text() if self.smsInboxTable.item(r, 1) else "").lower()
+            sender  = (self.smsInboxTable.item(r, 2).text() if self.smsInboxTable.item(r, 2) else "").lower()
+            message = (self.smsInboxTable.item(r, 3).text() if self.smsInboxTable.item(r, 3) else "").lower()
+            match = (q in device) or (q in dates) or (q in sender) or (q in message)
+            self.smsInboxTable.setRowHidden(r, not match)
+
+    # ---------- Window housekeeping ----------
     def _resizeEvent(self, event):
-        self.spinner.setGeometry(self.rect())  # Keep full size
+        self.spinner.setGeometry(self.rect())
         super().resizeEvent(event)
 
+    def _toggle_sort_order(self):
+        self.sortOrderButton.setText("Desc" if self.sortOrderButton.isChecked() else "Asc")
+        self.apply_filters_and_sort()
+
+    # ---------- Device filtering/sorting ----------
     def filter_devices(self):
         self.apply_filters_and_sort()
 
-
     def apply_filters_and_sort(self):
-        # --- 1) Start from the full device list ---
         devices = list(self.devices)
 
-        # --- 2) Apply text search (same as your filter_devices) ---
-        query = (self.searchLineEdit.text() or "").lower().strip()
+        qwidget = self.deviceSearchLineEdit
+        query = (qwidget.text() if qwidget else "").lower().strip()
         if query:
-            devices = [
-                d for d in devices
-                if query in d["name"].lower()
-                or query in d["ip"]
-                or query in (d.get("sim") or "")
-            ]
+            devices = [d for d in devices if
+                       query in d["name"].lower() or
+                       query in d["ip"] or
+                       query in (d.get("sim") or "")]
 
-        # --- 3) Apply Status filter ---
         status_sel = self.statusFilterCombo.currentText()
         if status_sel in ("Online", "Offline"):
             devices = [d for d in devices if d["status"] == status_sel]
 
-        # --- 4) Apply SIM-only filter ---
         if self.simOnlyCheck.isChecked():
             devices = [d for d in devices if (d.get("sim") or "").strip()]
 
-        # --- 5) Sort selection ---
-        # Map visible labels to column indices used in the table
-        # 0: Device, 1: IP, 2: Gateway, 8: Status (table indices)
-        sort_map = {
-            "Device": 0,
-            "IP": 1,
-            "Gateway": 2,
-            "Status": 8
-        }
+        if self.hubsOnlyCheck.isChecked():
+            devices = [d for d in devices if d.get("is_hub")]
+
+        sort_map = {"Device": 0, "IP": 1, "Gateway": 2, "Status": 8}
         sort_label = self.sortByCombo.currentText()
         sort_col = sort_map.get(sort_label, 0)
 
-        # (Re)load table with filtered devices
-        # Preserve current header sort indicator if user clicked the header
         header = self.deviceTable.horizontalHeader()
         cur_sort_col = header.sortIndicatorSection()
         cur_sort_order = header.sortIndicatorOrder()
 
         self.load_devices(devices)
 
-        # Programmatic sort: prefer toolbar selection; if header already used, keep it.
         if sort_col is not None:
-            # Use IP-aware sorting via IPItem (we inserted below in load_devices)
-            # Decide order
             order = Qt.AscendingOrder if not self.sortOrderButton.isChecked() else Qt.DescendingOrder
             self.deviceTable.sortItems(sort_col, order)
         else:
-            # If unknown selection, keep prior header sorting
             self.deviceTable.sortItems(cur_sort_col, cur_sort_order)
-
 
     def get_router_name(self, ip):
         for device in self.devices:
             if device["ip"] == ip:
                 return device["name"]
-        return ip  # fallback to IP if name not found
-    
+        return ip
+
+    # ---------- Device actions ----------
     def delete_device(self, row_index):
         device = self.devices[row_index]
         name = device.get("name", "Unknown")
-        print("Device data at row", row_index, "->", device)
         reply = QtWidgets.QMessageBox.question(
-            self,
-            "Confirm Deletion",
-            f"Are you sure you want to delete device '{name}'?",
+            self, "Confirm Deletion", f"Delete device '{name}'?",
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No
         )
-
         if reply == QtWidgets.QMessageBox.Yes:
             try:
-                delete_device_from_db(device["id"])  # Implement this function to delete by ID
+                delete_device_from_db(device["id"])
                 self.devices.pop(row_index)
                 self.apply_filters_and_sort()
                 QtWidgets.QMessageBox.information(self, "Deleted", f"Device '{name}' was deleted.")
@@ -1552,35 +1673,27 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.critical(self, "Error", f"Failed to delete device:\n{e}")
 
     def open_db_settings(self):
-        dialog = DBSettingsDialog(self)
-        dialog.exec_()
+        DBSettingsDialog(self).exec_()
 
     def open_email_settings_dialog(self):
-        dlg = EmailSettingsDialog(self)
-        dlg.exec_()
-        
+        EmailSettingsDialog(self).exec_()
+
     def open_email_notification(self):
-        dlg = EmailNotificationDialog(self)
-        dlg.show()
+        EmailNotificationDialog(self).show()
 
     def open_ssh_credentials_dialog(self):
-        dialog = SSHCredentialsDialog(self)
-        dialog.exec_()
-
+        SSHCredentialsDialog(self).exec_()
 
     def refresh_devices_from_db(self):
+        self._autohub_checked.clear()   # allow re-check after code tweak
         self.spinner.start()
-
         def refresh_task():
             try:
                 devices = load_devices_from_db()
-                # Schedule UI update on the main thread
                 self.worker_signals.refreshCompleted.emit(devices)
             except Exception as e:
                 QTimer.singleShot(0, lambda: QtWidgets.QMessageBox.critical(self, "Error", f"Refresh failed: {e}"))
                 QTimer.singleShot(0, self.spinner.stop)
-
-        # ✅ Start the thread (this was missing)
         threading.Thread(target=refresh_task, daemon=True).start()
 
     @pyqtSlot(list)
@@ -1589,46 +1702,27 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         self.apply_filters_and_sort()
         self.spinner.stop()
 
-    def show_spinner(self):
-        self.addButton.setEnabled(False)
-        self.spinner_label.setVisible(True)
-        self.spinner_movie.start()
-        QtWidgets.QApplication.processEvents()
-
-    def hide_spinner(self):
-        self.spinner_movie.stop()
-        self.spinner_label.setVisible(False)
-        self.addButton.setEnabled(True)
-
-    def device_register(self,index):
+    # ---------- Device register (syslog host) ----------
+    def device_register(self, index):
         ip = self.devices[index]["ip"]
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         username, password = get_ssh_credentials()
         ssh.connect(ip, username=username, password=password, look_for_keys=False, allow_agent=False)
         shell = ssh.invoke_shell()
-        commands = [
-            "conf t",
-            f"logging host {get_ip_address()}",
-            "end",
-            "write memory"
-        ]
-
+        commands = ["conf t", f"logging host {get_ip_address()}", "end", "write memory"]
         for cmd in commands:
-            shell.send(cmd + "\n")
-            import time
-            time.sleep(1)  # kasih jeda supaya Cisco proses command
-        time.sleep(2)  # tunggu output terkumpul
-        output = shell.recv(5000).decode()
+            shell.send(cmd + "\n"); time.sleep(0.8)
+        time.sleep(1.5)
+        _ = shell.recv(5000).decode()
         ssh.close()
-        devices = load_devices_from_db()
-        self.load_devices(devices)
+        self.devices = load_devices_from_db()
+        self.load_devices(self.devices)
 
-    
+    # ---------- Table build ----------
     def load_devices(self, device_list):
         print(f"🔄 Loading {len(device_list)} devices into table")
-        self.deviceTable.setSortingEnabled(False)  # prevent churn while filling
-
+        self.deviceTable.setSortingEnabled(False)
         self.deviceTable.setColumnCount(10)
         self.deviceTable.setHorizontalHeaderLabels([
             "Device", "IP", "Gateway", "SIM", "APN", "Email", "Last SMS", "Signal", "Status", "Actions"
@@ -1636,143 +1730,152 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         self.deviceTable.setRowCount(len(device_list))
 
         for i, d in enumerate(device_list):
-            # Device
-            self.deviceTable.setItem(i, 0, QtWidgets.QTableWidgetItem(d["name"]))
+            if d["status"] == "Online" and not d.get("is_hub", False):
+                self._auto_detect_and_flag_hub(i, d)
 
-            # IP (use IPItem for correct numeric sorting)
+            self.deviceTable.setCellWidget(i, 0, make_device_cell(
+                d["name"], d.get("is_hub", False), d.get("has_cellular", False)
+            ))
             self.deviceTable.setItem(i, 1, IPItem(d["ip"]))
-
-            # Gateway
             self.deviceTable.setItem(i, 2, QtWidgets.QTableWidgetItem(d["gateway"]))
 
-            # SIM / APN / Email
-            self.deviceTable.setItem(i, 3, QtWidgets.QTableWidgetItem(d["sim"]))
-            self.deviceTable.setItem(i, 4, QtWidgets.QTableWidgetItem(d["apn"]))
+            if not d.get("has_cellular", False):
+                self.deviceTable.setCellWidget(i, 3, badge_widget("NO CELL"))
+                self.deviceTable.setCellWidget(i, 4, badge_widget("NO CELL"))
+            else:
+                self.deviceTable.setItem(i, 3, QtWidgets.QTableWidgetItem(d["sim"]))
+                self.deviceTable.setItem(i, 4, QtWidgets.QTableWidgetItem(d["apn"]))
+
             self.deviceTable.setItem(i, 5, QtWidgets.QTableWidgetItem(d["email"]))
-
-            # Last SMS placeholder
             self.deviceTable.setItem(i, 6, QtWidgets.QTableWidgetItem("Loading..."))
-
-            # Signal bars
             self.deviceTable.setItem(i, 7, QtWidgets.QTableWidgetItem("▓" * d.get("signal", 0)))
-
-            # Status (string sort is fine, “Offline” > “Online”; toolbar lets user flip order)
             status_widget = create_status_label(device_list[i]["status"])
             self.deviceTable.setCellWidget(i, 8, status_widget)
 
-           
-            # Create dropdown menu
-            if device_list[i]["status"] == "Not Register":
-                action_button = QToolButton()
-                action_button.setText("Device Register")
-                action_button.setIcon(QIcon(resource_path("icons/gear.jpg")))
-                action_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-                action_button.clicked.connect(lambda _, row=i: self.device_register(row))
-            else:
-                action_button = QToolButton()
-                action_button.setText("Edit")
-                action_button.setIcon(QIcon(resource_path("icons/edit.png")))
-                action_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-                action_button.setPopupMode(QToolButton.MenuButtonPopup)
-            # Actions (menu) — unchanged except the bit we added earlier for SIM check
             action_button = QToolButton()
             action_button.setText("Edit")
             action_button.setIcon(QIcon(resource_path("icons/edit.png")))
             action_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
             action_button.setPopupMode(QToolButton.MenuButtonPopup)
-
             menu = QMenu(action_button)
-            sms_logs_action = QAction(QIcon(resource_path("icons/sms.png")),"SMS Logs", self)
-            send_sms_action = QAction(QIcon(resource_path("icons/send.png")),"Send SMS", self)
-            delete_action = QAction(QIcon(resource_path("icons/delete.png")),"Delete", self)
+
+            # Manual hub detection action (NEW)
+            detect_hub_action = QAction("Detect hub now", self)
+            menu.addAction(detect_hub_action)
+            menu.addSeparator()
+
+            toggle_hub_action = QAction("Mark as Hub" if not d.get("is_hub") else "Mark as Spoke", self)
+            menu.addAction(toggle_hub_action); menu.addSeparator()
+
+            sms_logs_action = QAction(QIcon(resource_path("icons/sms.png")), "SMS Logs", self)
+            send_sms_action = QAction(QIcon(resource_path("icons/send.png")), "Send SMS", self)
+            delete_action   = QAction(QIcon(resource_path("icons/delete.png")), "Delete", self)
+
+            has_cell = bool(d.get("has_cellular"))
+            if not has_cell:
+                sms_logs_action.setEnabled(False)
+                sms_logs_action.setStatusTip("No cellular interface on this device")
 
             menu.addAction(sms_logs_action)
 
             sim_present = bool((d.get("sim") or "").strip())
-            send_sms_action.setEnabled(sim_present)
-            if not sim_present:
-                # status tip shows in your status bar (we enabled it)
+            can_send = sim_present and has_cell
+            send_sms_action.setEnabled(can_send)
+            if not has_cell:
+                send_sms_action.setStatusTip("Send SMS disabled: no cellular interface")
+            elif not sim_present:
                 send_sms_action.setStatusTip("Send SMS disabled: SIM is empty for this device")
-                # optional: put a disabled reason line above it (uncomment if you like)
-                # reason_action = QAction("⚠️ SIM required to send SMS", self)
-                # reason_action.setEnabled(False)
-                # menu.addAction(reason_action)
-
             menu.addAction(send_sms_action)
             menu.addSeparator()
             menu.addAction(delete_action)
 
-
-
             action_button.setMenu(menu)
-
             action_button.clicked.connect(lambda _, row=i: self.open_settings_dialog(row))
             sms_logs_action.triggered.connect(lambda _, row=i: self.show_sms_log_dialog(row))
             send_sms_action.triggered.connect(lambda _, row=i: self.show_send_sms_dialog(row))
             delete_action.triggered.connect(lambda _, row=i: self.delete_device(row))
 
+            def on_toggle_hub(row=i):
+                try:
+                    dev = device_list[row]
+                    set_device_hub_flag(dev["id"], not dev.get("is_hub", False))
+                    self.devices = load_devices_from_db()
+                    self.apply_filters_and_sort()
+                except Exception as e:
+                    QtWidgets.QMessageBox.critical(self, "Error", f"Failed to update Hub flag:\n{e}")
+            toggle_hub_action.triggered.connect(lambda _, row=i: on_toggle_hub(row))
+
+            # Wire manual detect action
+            def on_detect_hub_now(row=i):
+                dev = device_list[row]
+                ip  = dev["ip"]
+                try:
+                    ok, reason, facts = detect_dmvpn_hub_over_ssh(ip)
+                    print(f"[HUB-MANUAL] {ip} -> ok={ok} reason={reason} facts={facts}")
+                    if ok and not dev.get("is_hub", False):
+                        set_device_hub_flag(dev["id"], True)
+                        QtWidgets.QMessageBox.information(self, "Hub detected",
+                                                          f"{dev['name']} marked as HUB\n{reason}")
+                        self.refresh_devices_from_db()
+                    else:
+                        QtWidgets.QMessageBox.information(self, "Detection",
+                            f"Detector says: {'HUB' if ok else 'Not a hub'}\n{reason}")
+                except Exception as e:
+                    QtWidgets.QMessageBox.critical(self, "Detect failed", str(e))
+            detect_hub_action.triggered.connect(lambda _, row=i: on_detect_hub_now(row))
+
             self.deviceTable.setCellWidget(i, 9, action_button)
 
-        # Kick off async “Last SMS” fetches
+        # async fetch last SMS (skip non-cellular to avoid wasted SSH calls)
         for i, d in enumerate(device_list):
-            QTimer.singleShot(100 + i * 100, lambda row=i, ip=d["ip"]: self.update_last_sms(row, ip))
+            if d.get("has_cellular", False):
+                QTimer.singleShot(100 + i*100, lambda row=i, ip=d["ip"]: self.update_last_sms(row, ip))
+            else:
+                self.deviceTable.setItem(i, 6, QtWidgets.QTableWidgetItem("No Cellular"))
 
-        self.deviceTable.setSortingEnabled(True)  # re-enable interactive sorting
+        self.deviceTable.setSortingEnabled(True)
 
     def update_last_sms(self, row, ip):
         def run():
             sms = fetch_last_sms(ip)
             self.sms_signal.smsFetched.emit(row, sms)
-
         threading.Thread(target=run, daemon=True).start()
 
     @pyqtSlot(int, str)
     def on_sms_fetched(self, row, sms):
         self.deviceTable.setItem(row, 6, QtWidgets.QTableWidgetItem(sms))
 
-
     def open_settings_dialog(self, index):
         device = self.devices[index]
         dialog = DeviceSettingsDialog(device=device, parent=self)
         if dialog.exec_() == QtWidgets.QDialog.Accepted:
             updated_data = dialog.get_data()
-
-            # Merge back to current device (keep IP for identification)
             updated_data["ip"] = device["ip"]
             update_device_in_db(updated_data)
-
-            # Reload device list
             self.devices = load_devices_from_db()
             self.apply_filters_and_sort()
             QtWidgets.QMessageBox.information(self, "Success", "Device updated successfully.")
-
 
     def add_device(self):
         dialog = DeviceSettingsDialog(parent=self)
         if dialog.exec_() == QtWidgets.QDialog.Accepted:
             new_device = dialog.get_data()
-            self.spinner.start()
-            self.just_added_device = True  # <-- set flag
-
+            self.spinner.start(); self.just_added_device = True
             def background_task():
                 try:
                     insert_device_to_db(new_device)
-                    username, password = get_ssh_credentials()
-                    configure_sms_applet_on_cisco(
-                        router_ip=new_device["ip"],
-                        username=username,
-                        password=password
-                    )
+                    if has_cellular_interface(new_device["ip"]):
+                        username, password = get_ssh_credentials()
+                        configure_sms_applet_on_cisco(new_device["ip"], username, password)
+                    else:
+                        print(f"⏭️ Skipping EEM config: {new_device['ip']} has no cellular interface")
                     time.sleep(2)
                     updated_devices = load_devices_from_db()
-
-                    # Emit signal on main thread
                     self.worker_signals.deviceAdded.emit(updated_devices)
                 except Exception as e:
                     QTimer.singleShot(0, lambda: QtWidgets.QMessageBox.warning(
                         self, "Error", f"Failed to add device:\n{e}"
                     ))
-
             threading.Thread(target=background_task, daemon=True).start()
 
     @pyqtSlot(list)
@@ -1781,11 +1884,15 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         self.devices = updated_devices
         self.apply_filters_and_sort()
 
+    # ---------- Live SMS logs tab ----------
     def show_sms_log_dialog(self, index):
+        if not self.devices[index].get("has_cellular", False):
+            QtWidgets.QMessageBox.information(self, "No Cellular", "This device has no cellular interface.")
+            return
+
         self.spinner.start()
         name = self.devices[index]["name"]
         ip = self.devices[index]["ip"]
-
         def task():
             try:
                 logs = fetch_all_sms(ip)
@@ -1793,7 +1900,6 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             except Exception as e:
                 QTimer.singleShot(0, lambda: QtWidgets.QMessageBox.critical(self, "Error", str(e)))
                 self.worker_signals.smsLogsFetched.emit(name, [])
-
         threading.Thread(target=task, daemon=True).start()
 
     @pyqtSlot(str, list)
@@ -1802,69 +1908,44 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         dialog = SMSLogDialog(device_name=name, sms_logs=logs, parent=self)
         dialog.exec_()
 
-
-
-    def filter_devices(self):
-        query = self.searchLineEdit.text().lower()
-        filtered = [
-            device for device in self.devices
-            if query in device["name"].lower() or
-               query in device["ip"] or
-               query in device["sim"]
-        ]
-        self.load_devices(filtered)
-
-    def toggle_pause(self):
-        self.is_paused = not self.is_paused
-        self.pauseButton.setText("Resume" if self.is_paused else "Pause")
-        self.statusLabel.setText("⏸️ Paused" if self.is_paused else "🟢 Listening for SMS...")
-
-    def export_to_csv(self):
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export SMS Logs", "", "CSV Files (*.csv)")
-        if not path:
-            return
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("ID,Time,From,Size,Message\n")
-            for log in self.sms_logs:
-                content = log['Content'].replace('"', '""')
-                f.write(f'{log["ID"]},{log["Time"]},{log["From"]},{log["Size"]},"{content}"\n')
-        QtWidgets.QMessageBox.information(self, "Export", "SMS logs exported successfully.")
-
     def filter_sms_logs(self):
+        if not hasattr(self, "smsSearchLineEdit"):
+            return
         keyword = self.smsSearchLineEdit.text().lower()
-        filtered = [sms for sms in self.sms_logs if keyword in sms["Content"].lower() or keyword in sms["From"]]
+        filtered = [sms for sms in self.sms_logs
+                    if keyword in sms.get("Content","").lower()
+                    or keyword in sms.get("From","").lower()
+                    or keyword in sms.get("Router","").lower()]
         self.display_sms_logs(filtered)
 
     def display_sms_logs(self, logs):
-        self.smsTable.setColumnCount(6)
-        self.smsTable.setHorizontalHeaderLabels(["Router", "ID", "Time", "From", "Size", "Message"])
-        self.smsTable.setRowCount(len(logs))
+        if not self.smsCaptureTable:
+            return
+        self.smsCaptureTable.setColumnCount(6)
+        self.smsCaptureTable.setHorizontalHeaderLabels(["Router", "ID", "Time", "From", "Size", "Message"])
+        self.smsCaptureTable.setRowCount(len(logs))
         for i, sms in enumerate(logs):
-            formatted_time = sms["Time"]
+            formatted_time = sms.get("Time", "")
             try:
-                dt_obj = datetime.strptime(sms["Time"], "%y-%m-%d %H:%M:%S")  # e.g. "25-05-28 14:38:06"
+                dt_obj = datetime.strptime(formatted_time, "%y-%m-%d %H:%M:%S")
                 formatted_time = dt_obj.strftime("%d/%m/%Y %H:%M:%S")
-            except Exception as e:
-                print(f"⚠️ Time format error: {e} -> using raw")
-
-            self.smsTable.setItem(i, 0, QtWidgets.QTableWidgetItem(sms.get("Router", "Unknown")))
-            self.smsTable.setItem(i, 1, QtWidgets.QTableWidgetItem(sms["ID"]))
-            self.smsTable.setItem(i, 2, QtWidgets.QTableWidgetItem(formatted_time))
-            self.smsTable.setItem(i, 3, QtWidgets.QTableWidgetItem(sms["From"]))
-            self.smsTable.setItem(i, 4, QtWidgets.QTableWidgetItem(str(sms["Size"])))
-            self.smsTable.setItem(i, 5, QtWidgets.QTableWidgetItem(sms["Content"]))
+            except Exception:
+                pass
+            self.smsCaptureTable.setItem(i, 0, QtWidgets.QTableWidgetItem(sms.get("Router", "Unknown")))
+            self.smsCaptureTable.setItem(i, 1, QtWidgets.QTableWidgetItem(str(sms.get("ID",""))))
+            self.smsCaptureTable.setItem(i, 2, QtWidgets.QTableWidgetItem(formatted_time))
+            self.smsCaptureTable.setItem(i, 3, QtWidgets.QTableWidgetItem(str(sms.get("From",""))))
+            self.smsCaptureTable.setItem(i, 4, QtWidgets.QTableWidgetItem(str(sms.get("Size",""))))
+            self.smsCaptureTable.setItem(i, 5, QtWidgets.QTableWidgetItem(sms.get("Content","")))
 
     def send_sms(self, router_ip, username, password, recipient, message):
         try:
             ssh = paramiko.SSHClient()
             ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             ssh.connect(router_ip, username=username, password=password, look_for_keys=False, allow_agent=False)
-
-            command = f'cellular 0/0/0 lte sms send {recipient} "{message}"'
-            print(f"📤 Sending SMS: {command}")
-            ssh.exec_command(command)
-            ssh.close()
-
+            cmd = f'cellular 0/0/0 lte sms send {recipient} "{message}"'
+            print(f"📤 Sending SMS: {cmd}")
+            ssh.exec_command(cmd); ssh.close()
             QtWidgets.QMessageBox.information(self, "Success", f"SMS sent to {recipient}")
         except Exception as e:
             QtWidgets.QMessageBox.warning(self, "Error", f"Failed to send SMS:\n{e}")
@@ -1876,21 +1957,22 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
     def show_send_sms_dialog(self, index):
         device = self.devices[index]
 
-        # ✅ Guard: block if SIM is empty
-        if not (device.get("sim") or "").strip():
-            QtWidgets.QMessageBox.warning(
-                self,
-                "SIM Missing",
-                f"Cannot send SMS for '{device.get('name','Unknown')}'.\nPlease set the SIM value first."
-            )
+        if not device.get("has_cellular", False):
+            QtWidgets.QMessageBox.information(self, "No Cellular",
+                                              f"'{device.get('name','Unknown')}' has no cellular interface.")
             return
 
+        if not (device.get("sim") or "").strip():
+            QtWidgets.QMessageBox.warning(self, "SIM Missing",
+                                          f"Cannot send SMS for '{device.get('name','Unknown')}'.\nPlease set the SIM value first.")
+            return
         dialog = SendSMSDialog(device_name=device["name"], router_ip=device["ip"], parent=self)
         if dialog.exec_() == QtWidgets.QDialog.Accepted:
             to_number, message = dialog.get_sms_data()
             username, password = get_ssh_credentials()
             self.send_sms(device["ip"], username, password, to_number, message)
 
+    # ---------- Syslog listener ----------
     def start_syslog_listener(self):
         def listen():
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1900,24 +1982,70 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
                 data, addr = sock.recvfrom(1024)
                 if self.is_paused:
                     continue
-                message = data.decode("utf-8")
+                message = data.decode("utf-8", errors="ignore")
                 router_ip = addr[0]
                 print(f"🔔 Syslog from {router_ip}: {message.strip()}")
-                print(f"📩 Syslog from {addr}: {message}")
                 match = re.search(r"SMS Extracted -> ID: (\d+)", message)
                 if match:
                     sms_index = match.group(1)
                     sms = fetch_sms_details(router_ip, sms_index)
-                    last_two_digits = "".join(router_ip.split(".")[-2:])
-                    router_ip = f"192.168.{last_two_digits}"
-                    send_email(sms, get_email_by_router_ip(router_ip))
-                    sms["Router"] = self.get_router_name(router_ip)
+                    last_two = "".join(router_ip.split(".")[-2:])
+                    logical_ip = f"192.168.{last_two}"
+                    email_to = get_email_by_router_ip(logical_ip)
+                    if email_to:
+                        send_email(sms, email_to)
+                    sms["Router"] = self.get_router_name(logical_ip)
                     self.add_sms_log(sms)
                 else:
                     print("⚠️ Pattern not matched.")
         t = threading.Thread(target=listen, daemon=True)
         t.start()
 
+    # ---------- Misc ----------
+    def toggle_pause(self):
+        self.is_paused = not self.is_paused
+        self.pauseButton.setText("Resume" if self.is_paused else "Pause")
+        self.statusLabel.setText("⏸️ Paused" if self.is_paused else "🟢 Listening for SMS...")
+
+    def export_to_csv(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export SMS Logs", "", "CSV Files (*.csv)")
+        if not path: return
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("ID,Time,From,Size,Message\n")
+            for log in self.sms_logs:
+                content = log.get('Content','').replace('"', '""')
+                f.write(f'{log.get("ID","")},{log.get("Time","")},{log.get("From","")},{log.get("Size","")},"{content}"\n')
+        QtWidgets.QMessageBox.information(self, "Export", "SMS logs exported successfully.")
+
+# Simple dialog for sending SMS
+class SendSMSDialog(QtWidgets.QDialog):
+    def __init__(self, device_name, router_ip, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Send SMS via {device_name}")
+        self.setFixedSize(300, 200)
+        layout = QVBoxLayout()
+        self.to_input = QtWidgets.QLineEdit(); self.to_input.setPlaceholderText("Recipient Number")
+        layout.addWidget(QtWidgets.QLabel("To:")); layout.addWidget(self.to_input)
+        self.message_input = QtWidgets.QPlainTextEdit(); self.message_input.setPlaceholderText("Enter your message")
+        layout.addWidget(QtWidgets.QLabel("Message:")); layout.addWidget(self.message_input)
+        send_btn = QPushButton("Send"); send_btn.clicked.connect(self.accept)
+        layout.addWidget(send_btn)
+        self.setLayout(layout)
+        self.router_ip = router_ip
+    def get_sms_data(self):
+        return self.to_input.text(), self.message_input.toPlainText()
+
+# ---------- get email by router ip ----------
+def get_email_by_router_ip(router_ip):
+    db_config = get_db_config()
+    conn = mysql.connector.connect(**db_config)
+    cursor = conn.cursor()
+    cursor.execute("""SELECT email FROM devices WHERE ip = %s""", (router_ip,))
+    result = cursor.fetchone()
+    cursor.close(); conn.close()
+    return result[0] if result else None
+
+# ---------- App entry ----------
 def main():
     try:
         app = QtWidgets.QApplication(sys.argv)
@@ -1929,5 +2057,6 @@ def main():
     except Exception as e:
         print(f"❌ App crashed: {e}")
         traceback.print_exc()
+
 if __name__ == "__main__":
     main()

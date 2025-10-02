@@ -1,189 +1,137 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <ui version="4.0">
-    <class>MainWindow</class>
-    <widget class="QMainWindow" name="MainWindow">
-        <property name="geometry">
-            <rect>
-                <x>0</x>
-                <y>0</y>
-                <width>900</width>
-                <height>600</height>
-            </rect>
-        </property>
-        <property name="windowTitle">
-            <string>Cisco SMS Monitor</string>
-        </property>
-        <widget class="QWidget" name="centralwidget">
-            <layout class="QVBoxLayout" name="mainLayout">
+  <class>MainWindow</class>
+  <widget class="QMainWindow" name="MainWindow">
+    <property name="geometry">
+      <rect>
+        <x>0</x>
+        <y>0</y>
+        <width>900</width>
+        <height>600</height>
+      </rect>
+    </property>
+    <property name="windowTitle">
+      <string>Cisco SMS Monitor</string>
+    </property>
+    <widget class="QWidget" name="centralwidget">
+      <layout class="QVBoxLayout" name="mainLayout">
+        <item>
+          <widget class="QTabWidget" name="tabWidget">
+            <!-- TAB 1: SMS Inbox -->
+            <widget class="QWidget" name="tabSms">
+              <attribute name="title">
+                <string>SMS Inbox</string>
+              </attribute>
+              <layout class="QVBoxLayout" name="smsLayout">
                 <item>
-                    <widget class="QTabWidget" name="tabWidget">
-                        <widget class="QWidget" name="tabSms">
-                            <attribute name="title">
-                                <string>SMS Inbox</string>
-                            </attribute>
-                            <layout class="QVBoxLayout" name="smsLayout">
-                                <item>
-                                    <widget class="QLineEdit" name="searchLineEdit">
-                                        <property name="placeholderText">
-                                            <string>Search by IP or Device Name</string>
-                                        </property>
-                                    </widget>
-                                </item>
-                                <item>
-                                    <widget class="QTableWidget" name="smsTable">
-                                        <column>
-                                            <property name="text">
-                                                <string>Device</string>
-                                            </property>
-                                        </column>
-                                        <column>
-                                            <property name="text">
-                                                <string>dates</string>
-                                            </property>
-                                        </column>
-                                        <column>
-                                            <property name="text">
-                                                <string>sms from</string>
-                                            </property>
-                                        </column>
-                                        <column>
-                                            <property name="text">
-                                                <string>message</string>
-                                            </property>
-                                        </column>
-                                    </widget>
-                                </item>
-                                <item>
-                                    <layout class="QHBoxLayout" name="deviceButtons">
-                                        <item>
-                                            <widget class="QPushButton" name="refreshButtonSMS">
-                                                <property name="text">
-                                                    <string>Refresh</string>
-                                                </property>
-                                            </widget>
-                                        </item>
-                                    </layout>
-                                </item>
-                            </layout>
-                        </widget>
-                        <widget class="QWidget" name="tabDevices">
-                            <attribute name="title">
-                                <string>Devices</string>
-                            </attribute>
-                            <layout class="QVBoxLayout" name="deviceLayout">
-                                <item>
-                                    <widget class="QLineEdit" name="searchLineEdit">
-                                        <property name="placeholderText">
-                                            <string>Search by IP or Device Name</string>
-                                        </property>
-                                    </widget>
-                                </item>
-                                <item>
-                                    <widget class="QTableWidget" name="deviceTable">
-                                        <column>
-                                            <property name="text">
-                                                <string>Device</string>
-                                            </property>
-                                        </column>
-                                        <column>
-                                            <property name="text">
-                                                <string>IP</string>
-                                            </property>
-                                        </column>
-                                        <column>
-                                            <property name="text">
-                                                <string>SIM</string>
-                                            </property>
-                                        </column>
-                                        <column>
-                                            <property name="text">
-                                                <string>APN</string>
-                                            </property>
-                                        </column>
-                                        <column>
-                                            <property name="text">
-                                                <string>Email</string>
-                                            </property>
-                                        </column>
-                                        <column>
-                                            <property name="text">
-                                                <string>Signal</string>
-                                            </property>
-                                        </column>
-                                        <column>
-                                            <property name="text">
-                                                <string>Actions</string>
-                                            </property>
-                                        </column>
-                                    </widget>
-                                </item>
-                                <item>
-                                    <layout class="QHBoxLayout" name="deviceButtons">
-                                        <item>
-                                            <widget class="QPushButton" name="addButton">
-                                                <property name="text">
-                                                    <string>Add Device</string>
-                                                </property>
-                                            </widget>
-                                        </item>
-                                        <item>
-                                            <widget class="QPushButton" name="refreshButton">
-                                                <property name="text">
-                                                    <string>Refresh</string>
-                                                </property>
-                                            </widget>
-                                        </item>
-                                    </layout>
-                                </item>
-                            </layout>
-                        </widget>
-                        <widget class="QWidget" name="tabCapture">
-                            <attribute name="title">
-                                <string>Live SMS Capture</string>
-                            </attribute>
-                            <layout class="QVBoxLayout" name="smsCaptureLayout">
-                                <item>
-                                    <widget class="QLineEdit" name="smsSearchLineEdit">
-                                        <property name="placeholderText">
-                                            <string>Search SMS logs</string>
-                                        </property>
-                                    </widget>
-                                </item>
-                                <item>
-                                    <widget class="QTableWidget" name="smsTable"/>
-                                </item>
-                                <item>
-                                    <layout class="QHBoxLayout" name="smsControlButtons">
-                                        <item>
-                                            <widget class="QPushButton" name="pauseButton">
-                                                <property name="text">
-                                                    <string>Pause</string>
-                                                </property>
-                                            </widget>
-                                        </item>
-                                        <item>
-                                            <widget class="QPushButton" name="exportButton">
-                                                <property name="text">
-                                                    <string>Export to CSV</string>
-                                                </property>
-                                            </widget>
-                                        </item>
-                                    </layout>
-                                </item>
-                                <item>
-                                    <widget class="QLabel" name="statusLabel">
-                                        <property name="text">
-                                            <string>🟢 Listening for SMS...</string>
-                                        </property>
-                                    </widget>
-                                </item>
-                            </layout>
-                        </widget>
-                    </widget>
+                  <widget class="QLineEdit" name="inboxSearchLineEdit">
+                    <property name="placeholderText">
+                      <string>Search Inbox by Device / From / Message</string>
+                    </property>
+                  </widget>
                 </item>
-            </layout>
-        </widget>
+                <item>
+                  <widget class="QTableWidget" name="smsInboxTable"/>
+                </item>
+                <item>
+                  <layout class="QHBoxLayout" name="inboxButtons">
+                    <item>
+                      <widget class="QPushButton" name="refreshButtonSMS">
+                        <property name="text">
+                          <string>Refresh</string>
+                        </property>
+                      </widget>
+                    </item>
+                  </layout>
+                </item>
+              </layout>
+            </widget>
+
+            <!-- TAB 2: Devices -->
+            <widget class="QWidget" name="tabDevices">
+              <attribute name="title">
+                <string>Devices</string>
+              </attribute>
+              <layout class="QVBoxLayout" name="deviceLayout">
+                <item>
+                  <widget class="QLineEdit" name="deviceSearchLineEdit">
+                    <property name="placeholderText">
+                      <string>Search by IP or Device Name</string>
+                    </property>
+                  </widget>
+                </item>
+                <item>
+                  <widget class="QTableWidget" name="deviceTable"/>
+                </item>
+                <item>
+                  <layout class="QHBoxLayout" name="deviceButtons">
+                    <item>
+                      <widget class="QPushButton" name="addButton">
+                        <property name="text">
+                          <string>Add Device</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item>
+                      <widget class="QPushButton" name="refreshButton">
+                        <property name="text">
+                          <string>Refresh</string>
+                        </property>
+                      </widget>
+                    </item>
+                  </layout>
+                </item>
+              </layout>
+            </widget>
+
+            <!-- TAB 3: Live SMS Capture -->
+            <widget class="QWidget" name="tabCapture">
+              <attribute name="title">
+                <string>Live SMS Capture</string>
+              </attribute>
+              <layout class="QVBoxLayout" name="smsCaptureLayout">
+                <item>
+                  <widget class="QLineEdit" name="smsSearchLineEdit">
+                    <property name="placeholderText">
+                      <string>Search SMS logs</string>
+                    </property>
+                  </widget>
+                </item>
+                <item>
+                  <widget class="QTableWidget" name="smsCaptureTable"/>
+                </item>
+                <item>
+                  <layout class="QHBoxLayout" name="smsControlButtons">
+                    <item>
+                      <widget class="QPushButton" name="pauseButton">
+                        <property name="text">
+                          <string>Pause</string>
+                        </property>
+                      </widget>
+                    </item>
+                    <item>
+                      <widget class="QPushButton" name="exportButton">
+                        <property name="text">
+                          <string>Export to CSV</string>
+                        </property>
+                      </widget>
+                    </item>
+                  </layout>
+                </item>
+                <item>
+                  <widget class="QLabel" name="statusLabel">
+                    <property name="text">
+                      <string>🟢 Listening for SMS...</string>
+                    </property>
+                  </widget>
+                </item>
+              </layout>
+            </widget>
+          </widget>
+        </item>
+      </layout>
     </widget>
-    <resources/>
-    <connections/>
+  </widget>
+  <resources/>
+  <connections/>
 </ui>
