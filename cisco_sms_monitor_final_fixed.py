@@ -710,6 +710,116 @@ def detect_default_gateway(ip, username, password, *, vrf=None, timeout=6):
     ssh.close()
     return (m3.group(1) if m3 else None), out
 
+
+def list_cellular_interfaces(ip: str, timeout: int = 8):
+    """
+    Returns a list of cellular interfaces from 'show ip interface brief':
+    [
+      {"name": "Cellular0/0/0", "ip": "10.199.23.43", "status": "up", "protocol": "up"},
+      {"name": "Cellular0/1/0", "ip": "unassigned", "status": "administratively down", "protocol": "down"},
+      ...
+    ]
+    """
+    if not is_device_online(ip):
+        return []
+
+    username, password = get_ssh_credentials()
+    if not username or not password:
+        return []
+
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        ssh.connect(ip, username=username, password=password,
+                    look_for_keys=False, allow_agent=False,
+                    timeout=timeout, banner_timeout=timeout, auth_timeout=timeout)
+        _, stdout, _ = ssh.exec_command("show ip interface brief")
+        out = stdout.read().decode(errors="ignore")
+    except Exception:
+        return []
+    finally:
+        try: ssh.close()
+        except: pass
+
+    results = []
+    for raw in out.splitlines():
+        if not re.match(r"^\s*Cellular[\d/]+", raw, re.I):
+            continue
+        cols = re.split(r"\s+", raw.strip())
+        # Columns: Interface, IP-Address, OK?, Method, Status, Protocol
+        name = cols[0] if len(cols) > 0 else ""
+        ipaddr = cols[1] if len(cols) > 1 else ""
+        status = " ".join(cols[4:-1]) if len(cols) >= 6 else (cols[4] if len(cols) > 4 else "")
+        protocol = cols[-1] if cols else ""
+        results.append({"name": name, "ip": ipaddr, "status": status, "protocol": protocol})
+    return results
+
+
+def parse_ids_from_cellular_all(output: str):
+    imsi = imei = iccid = ""
+    for line in output.splitlines():
+        s = line.strip()
+        if "IMSI" in s.upper():
+            m = re.search(r"IMSI\)?\s*=\s*([0-9]+)", s, re.I)
+            if m: imsi = m.group(1)
+        elif "IMEI" in s.upper():
+            m = re.search(r"IMEI\)?\s*=\s*([0-9]+)", s, re.I)
+            if m: imei = m.group(1)
+        elif "ICCID" in s.upper():
+            m = re.search(r"ICCID\)?\s*=\s*([0-9A-Fa-f]+)", s, re.I)
+            if m: iccid = m.group(1)
+    return imsi, imei, iccid
+
+
+def fetch_cellular_ids_for_interface(ip: str, if_name: str, timeout: int = 8):
+    """
+    Runs 'show cellular <slot> all' for the given Cellular interface (e.g. Cellular0/1/0)
+    and returns dict: {"interface": if_name, "imsi": ..., "imei": ..., "iccid": ...}
+    """
+    m = re.search(r"Cellular(\d+/\d+/\d+)", if_name, re.I)
+    if not m:
+        raise RuntimeError(f"Cannot parse slot from {if_name}")
+    slot = m.group(1)
+
+    username, password = get_ssh_credentials()
+    if not username or not password:
+        raise RuntimeError("SSH credentials not set.")
+
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        ssh.connect(ip, username=username, password=password,
+                    look_for_keys=False, allow_agent=False,
+                    timeout=timeout, banner_timeout=timeout, auth_timeout=timeout)
+        _, stdout, _ = ssh.exec_command(f"show cellular {slot} all")
+        out = stdout.read().decode(errors="ignore")
+    except Exception as e:
+        raise RuntimeError(f"SSH error: {e}")
+    finally:
+        try: ssh.close()
+        except: pass
+
+    imsi, imei, iccid = parse_ids_from_cellular_all(out)
+    return {"interface": if_name, "imsi": imsi, "imei": imei, "iccid": iccid}
+
+
+def fetch_all_active_cellular_details(ip: str, timeout: int = 8):
+    """
+    Active = interface exists AND IP-Address != 'unassigned'.
+    Returns list of dicts with interface, ip, imsi, imei, iccid.
+    """
+    infos = list_cellular_interfaces(ip, timeout=timeout)
+    active = [i for i in infos if i.get("ip", "").lower() != "unassigned" and i.get("ip")]
+    details = []
+    for i in active:
+        try:
+            ids = fetch_cellular_ids_for_interface(ip, i["name"], timeout=timeout)
+        except Exception as e:
+            ids = {"interface": i["name"], "imsi": "", "imei": "", "iccid": f"ERROR: {e}"}
+        ids.update({"ip": i["ip"]})
+        details.append(ids)
+    return details
+
 def extract_sms_content(sms_text: str) -> str:
     lines = sms_text.strip().splitlines()
     for i, line in enumerate(lines):
@@ -969,6 +1079,32 @@ def get_all_sms(ip):
     _, stdout, _ = ssh.exec_command("cellular 0/0/0 lte sms view all")
     out = stdout.read().decode(); ssh.close()
     return out
+
+def on_cellular_detected(self, details):
+    self.overlaySpinner.stop(); self.overlay.hide()
+
+    count = len(details)
+    if count == 0:
+        QtWidgets.QMessageBox.information(self, "Cellular Detection",
+                                            "No ACTIVE cellular interface found (IP is unassigned).")
+        return
+
+    # populate fields with the FIRST active cellular (still show all in the message)
+    first = details[0]
+    if hasattr(self, "imsiLineEdit"):
+        self.imsiLineEdit.setText(first.get("imsi", ""))
+    if hasattr(self, "imeiLineEdit"):
+        self.imeiLineEdit.setText(first.get("imei", ""))
+    if hasattr(self, "iccidLineEdit"):
+        self.iccidLineEdit.setText(first.get("iccid", ""))
+
+    lines = []
+    for d in details:
+        lines.append(f"{d['interface']}  IP {d['ip']}\n  IMSI: {d['imsi']}\n  IMEI: {d['imei']}\n  ICCID: {d['iccid']}")
+    QtWidgets.QMessageBox.information(
+        self, "Cellular Detection",
+        f"Active cellular interfaces: {count}\n\n" + "\n\n".join(lines)
+    )
 
 def parse_sms(raw_output):
     sms_blocks = raw_output.strip().split("--------------------------------------------------------------------------------")
@@ -1327,6 +1463,16 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
         self.detectApnButton.clicked.connect(self.handle_detect_apn)
         self.detectGatewayButton.clicked.connect(self.handle_detect_gateway)
 
+        # --- Detect Cellular button (counts & populates IDs)
+        self.detectCellButton = QPushButton("Detect Cellular")
+        cell_row_layout = QHBoxLayout()
+        cell_row_layout.addStretch(1)
+        cell_row_layout.addWidget(self.detectCellButton)
+        layout.insertLayout(4, cell_row_layout)   # place under APN row
+
+        self.detectCellButton.clicked.connect(self.handle_detect_cellular)
+
+
         self.device = device
         if device:
             self.nameLineEdit.setText(device["name"])
@@ -1356,6 +1502,21 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
             "apn": self.apnLineEdit.text(),
             "email": self.emailLineEdit.text(),
         }
+
+    def handle_detect_cellular(self):
+        ip = self.ipLineEdit.text().strip()
+        if not ip:
+            QtWidgets.QMessageBox.warning(self, "Missing IP", "Please enter the router IP first.")
+            return
+        self.overlay.show(); self.overlaySpinner.start()
+
+        def run():
+            try:
+                details = fetch_all_active_cellular_details(ip)
+                QtCore.QTimer.singleShot(0, lambda: self.on_cellular_detected(details))
+            except Exception as e:
+                self.detectSignals.detectFailed.emit(str(e))
+        threading.Thread(target=run, daemon=True).start()
 
     def handle_detect_apn(self):
         ip = self.ipLineEdit.text().strip()
