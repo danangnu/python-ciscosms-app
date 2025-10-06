@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 import sys
 import socket
@@ -13,12 +14,16 @@ from PyQt5 import QtWidgets, uic, QtCore
 from sms_log_dialog import SMSLogDialog
 from PyQt5.QtGui import QMovie, QIcon
 from PyQt5.QtCore import Qt, QSize, QTimer, QObject, pyqtSignal, pyqtSlot
-from PyQt5.QtWidgets import QWidget, QVBoxLayout, QPushButton, QHBoxLayout, QLabel, QToolButton, QMenu, QAction
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QPushButton, QHBoxLayout, QLabel,
+    QToolButton, QMenu, QAction
+)
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 import mysql.connector
 import sip
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 
 # ---------- Qt/sip safe setup ----------
 sip.setapi('QString', 2)
@@ -118,41 +123,23 @@ def badge_widget(text: str, bg="#6b7280", fg="#fff") -> QWidget:
     return w
 
 def _find_cellular_slot_from_brief(full_text: str) -> str:
-    """
-    Returns the numeric slot-part for the first Cellular interface, e.g. '0/0/0' or '0/0/1'.
-    If none found, returns ''.
-    """
     m = re.search(r"(?mi)^\s*Cellular\s*(\d+(?:/\d+){0,2})\b", full_text)
     if m:
         return m.group(1)
-    # Older/other formatting: 'Cellular0/0/0' without space
     m = re.search(r"(?mi)^\s*Cellular(\d+(?:/\d+){0,2})\b", full_text)
     return m.group(1) if m else ""
 
-
 def _parse_apn(text: str) -> str:
-    """
-    Extract APN from various show outputs.
-    """
-    # Common XE format: "... APN) = telstra.internet"
     m = re.search(r"(?im)\bAPN\)?\s*[:=]\s*([A-Za-z0-9._:-]+)", text)
-    if m:
-        return m.group(1)
-
-    # Some show run / controller/profile formats: "apn telstra.internet"
+    if m: return m.group(1)
     m = re.search(r"(?im)^\s*apn\s+([A-Za-z0-9._:-]+)\b", text)
-    if m:
-        return m.group(1)
-
-    # Another variant: "Profile 1 ... APN: internet"
+    if m: return m.group(1)
     m = re.search(r"(?im)Profile\s*1.*?\bAPN\b.*?([A-Za-z0-9._:-]+)", text)
-    if m:
-        return m.group(1)
-
+    if m: return m.group(1)
     return ""
 
 # ---------- Networking helpers ----------
-def is_device_online(ip: str, port: int = 22, timeout: float = 2.0) -> bool:
+def is_device_online(ip: str, port: int = 22, timeout: float = 0.6) -> bool:
     try:
         with socket.create_connection((ip, port), timeout=timeout):
             return True
@@ -160,11 +147,9 @@ def is_device_online(ip: str, port: int = 22, timeout: float = 2.0) -> bool:
         return False
 
 def _shell_send_and_read(shell, cmd, sleep=0.5, drain_loops=8):
-    """Send a command into an existing invoke_shell() and read all output."""
     shell.send(cmd.rstrip() + "\n")
     time.sleep(sleep)
     out = ""
-    # drain a few times until no more data arrives
     for _ in range(drain_loops):
         chunk = ""
         while shell.recv_ready():
@@ -174,39 +159,6 @@ def _shell_send_and_read(shell, cmd, sleep=0.5, drain_loops=8):
             break
         time.sleep(0.15)
     return out
-
-def _find_cellular_slot_from_brief(full_text: str) -> str:
-    m = re.search(r"(?mi)^\s*Cellular\s*(\d+(?:/\d+){0,2})\b", full_text)
-    if m: return m.group(1)
-    m = re.search(r"(?mi)^\s*Cellular(\d+(?:/\d+){0,2})\b", full_text)
-    return m.group(1) if m else ""
-
-def _parse_apn(text: str) -> str:
-    for rx in [
-        r"(?im)\bAPN\)?\s*[:=]\s*([A-Za-z0-9._:-]+)",
-        r"(?im)^\s*apn\s+([A-Za-z0-9._:-]+)\b",
-        r"(?im)Profile\s*1.*?\bAPN\b.*?([A-Za-z0-9._:-]+)",
-    ]:
-        m = re.search(rx, text)
-        if m:
-            return m.group(1)
-    return ""
-
-def has_cellular_interface(ip: str, timeout: int = 6) -> bool:
-    """
-    Backward-compatible helper used elsewhere.
-    Returns True if any Cellular interface exists on the router, regardless of IP.
-    """
-    state = probe_cellular_state(ip, timeout=timeout)
-    return state["present"]
-
-def get_ip_address() -> str:
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
-    finally:
-        s.close()
 
 _ipv4_re = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 
@@ -229,20 +181,14 @@ def get_email_config_from_db():
         print(f"❌ Error loading email config from DB: {e}")
         return None
 
-def probe_cellular_state(ip: str, timeout: int = 6):
-    """
-    Inspect 'show ip interface brief' and return a dict:
-      present      -> at least one Cellular* interface exists
-      ip_assigned  -> at least one Cellular has an IPv4 (not 'unassigned')
-      admin_up     -> at least one Cellular is not 'administratively down'
-    On any SSH/problem, returns {'present': False, 'ip_assigned': False, 'admin_up': False}.
-    """
+# ---------- Fast single-SSH probe ----------
+def probe_device_fast(ip: str, timeout: int = 6):
     if not is_device_online(ip):
-        return {"present": False, "ip_assigned": False, "admin_up": False}
+        return {"present": False, "has_cell": False, "register": False}
 
     username, password = get_ssh_credentials()
     if not username or not password:
-        return {"present": False, "ip_assigned": False, "admin_up": False}
+        return {"present": False, "has_cell": False, "register": False}
 
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -251,41 +197,51 @@ def probe_cellular_state(ip: str, timeout: int = 6):
                     look_for_keys=False, allow_agent=False,
                     timeout=timeout, banner_timeout=timeout, auth_timeout=timeout)
 
-        # Get the whole table (more robust than piping include)
-        _, stdout, _ = ssh.exec_command("show ip interface brief")
-        out = stdout.read().decode(errors="ignore")
+        sh = ssh.invoke_shell()
+        time.sleep(0.3)
+        if sh.recv_ready():
+            _ = sh.recv(65535)
+
+        def send(cmd):
+            sh.send(cmd + "\n"); time.sleep(0.45)
+            out = ""
+            while sh.recv_ready():
+                out += sh.recv(65535).decode(errors="ignore")
+            return out
+
+        brief = send("show ip interface brief")
+        run = send("show running-config | include ^logging host ")
     except Exception:
-        return {"present": False, "ip_assigned": False, "admin_up": False}
+        try: ssh.close()
+        except: pass
+        return {"present": False, "has_cell": False, "register": False}
     finally:
         try: ssh.close()
         except: pass
 
     present = False
     ip_assigned = False
-    admin_up = False
+    for line in brief.splitlines():
+        if re.search(r"(?i)^\s*Cellular\d+(?:/\d+)*\b", line):
+            present = True
+            cols = re.split(r"\s+", line.strip())
+            ip_col = cols[1] if len(cols) > 1 else ""
+            if ip_col and ip_col.lower() != "unassigned":
+                ip_assigned = True
 
-    # Parse each line that starts with "Cellular"
-    for line in out.splitlines():
-        if not re.search(r"(?i)^\s*Cellular\d+(?:/\d+)*\b", line):
-            continue
+    my_ip = get_ip_address()
+    register = my_ip in re.findall(_ipv4_re, run)
+    return {"present": present, "has_cell": (present and ip_assigned), "register": bool(register)}
 
-        present = True
+def get_ip_address() -> str:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    finally:
+        s.close()
 
-        # Normalize columns; IOS can have variable spacing
-        cols = re.split(r"\s+", line.strip())
-        # Expect columns: Interface, IP-Address, OK?, Method, Status, Protocol
-        # Be defensive on indexes
-        ip_col = cols[1] if len(cols) > 1 else ""
-        status_col = " ".join(cols[4:-1]) if len(cols) >= 6 else (cols[4] if len(cols) > 4 else "")
-
-        if ip_col and ip_col.lower() != "unassigned":
-            ip_assigned = True
-
-        if status_col and "administratively down" not in status_col.lower():
-            admin_up = True
-
-    return {"present": present, "ip_assigned": ip_assigned, "admin_up": admin_up}
-
+# ---------- Email sending ----------
 def send_email(sms_details, emailTo):
     try:
         config = get_email_config_from_db()
@@ -443,44 +399,11 @@ def set_device_hub_flag(device_id: int, is_hub: bool) -> int:
     affected = cur.rowcount
     conn.commit()
     print(f"[HUB-FLAG] set is_hub={1 if is_hub else 0} for id={device_id} (affected={affected})")
-    # Read-back to prove it stuck
     cur.execute("SELECT id, name, IFNULL(is_hub,0) FROM devices WHERE id=%s", (device_id,))
     row = cur.fetchone()
     print(f"[HUB-FLAG] readback -> {row}")
     cur.close(); conn.close()
     return affected
-
-def is_device_register(ip: str, *, timeout: int = 8) -> bool:
-    if not is_device_online(ip):
-        return False
-    username, password = get_ssh_credentials()
-    if not username or not password:
-        print("⚠️ No SSH credentials available.")
-        return False
-    ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    try:
-        ssh.connect(ip, username=username, password=password,
-                    look_for_keys=False, allow_agent=False,
-                    timeout=timeout, banner_timeout=timeout, auth_timeout=timeout)
-        cmd = r"show running-config | include ^logging host "
-        _, stdout, _ = ssh.exec_command(cmd)
-        output = stdout.read().decode(errors="ignore")
-    except Exception as e:
-        print(f"⚠️ is_device_register error for {ip}: {e}")
-        return False
-    finally:
-        try: ssh.close()
-        except: pass
-    hosts = []
-    for line in output.splitlines():
-        line = line.strip()
-        if not line.startswith("logging host"):
-            continue
-        m = _ipv4_re.search(line)
-        if m: hosts.append(m.group(0))
-    my_ip = get_ip_address()
-    return my_ip in hosts
 
 def load_devices_from_db():
     db_config = get_db_config()
@@ -493,19 +416,17 @@ def load_devices_from_db():
     devices = []
     for row in rows:
         ip = row[1]
-
-        # 1) Reachability first
         online = is_device_online(ip)
 
-        # 2) Only bother checking cellular if online
-        cell = has_cellular_interface(ip) if online else False
+        cell = False
+        register = False
+        present = False
+        if online:
+            info = probe_device_fast(ip)
+            present = info["present"]
+            cell = info["has_cell"]
+            register = info["register"] if cell else False
 
-        # 3) Only check "register" (syslog host) if it actually has cellular
-        register = is_device_register(ip) if (online and cell) else False
-
-        # 4) Status rule:
-        #    - NO CELL => never show "Not Register"
-        #    - Only cellular devices can be "Not Register"
         if not online:
             status = "Offline"
         elif cell and not register:
@@ -525,7 +446,7 @@ def load_devices_from_db():
             "status": status,
             "id": row[6],
             "is_hub": bool(row[7]),
-            "has_cellular": bool(cell),
+            "has_cellular": bool(present),  # presence is enough to allow Detect
         })
     return devices
 
@@ -537,7 +458,8 @@ def update_device_in_db(device):
         UPDATE devices
         SET sim = %s, apn = %s, email = %s, name = %s, gateway = %s
         WHERE ip = %s
-    """, (device["sim"], device["apn"], device["email"], device["name"], device["gateway"], device["ip"]))
+    """, (device["sim"], device["apn"], device["email"],
+          device["name"], device["gateway"], device["ip"]))
     conn.commit(); cursor.close(); conn.close()
 
 def delete_device_from_db(device_id):
@@ -568,11 +490,6 @@ def insert_device_to_db(device):
 
 # ---------- Cisco/SSH ops ----------
 def detect_dmvpn_hub_over_ssh(ip: str, timeout: int = 10):
-    """
-    Detects DMVPN hub by reading interface Tunnel sections:
-    HUB if: 'tunnel mode gre multipoint' AND (no 'ip nhrp nhs' present OR 'ip nhrp redirect' present)
-    Runtime checks (show dmvpn/nhrp) are best-effort only and not required to conclude 'hub'.
-    """
     username, password = get_ssh_credentials()
     if not username or not password:
         print(f"[HUB-DETECT] {ip} ERROR: no SSH creds")
@@ -589,70 +506,45 @@ def detect_dmvpn_hub_over_ssh(ip: str, timeout: int = 10):
 
     def run(cmd: str) -> str:
         try:
-            print(f"[HUB-DETECT] run: {cmd}")
             _stdin, stdout, stderr = ssh.exec_command(cmd, timeout=timeout)
             out = stdout.read().decode(errors="ignore")
-            err = stderr.read().decode(errors="ignore")
-            if err.strip():
-                # IOS often writes nothing to stderr; if it does, log it for diagnosis
-                print(f"[HUB-DETECT] WARN stderr for '{cmd}': {err.strip()}")
             return out
         except Exception as e:
             print(f"[HUB-DETECT] CMD ERROR for '{cmd}': {e}")
             return ""
 
     try:
-        print(f"[HUB-DETECT] Connecting to {ip} (timeout={timeout})")
         ssh.connect(
             ip, username=username, password=password,
             look_for_keys=False, allow_agent=False,
             timeout=timeout, banner_timeout=timeout, auth_timeout=timeout
         )
-        print(f"[HUB-DETECT] SSH connected.")
 
-        # --- Get tunnel config (prefer 'section', fall back to 'begin') ---
         tun_cfg = run("show running-config | section ^interface Tunnel")
         if not tun_cfg.strip():
             tun_cfg = run("show running-config | begin ^interface Tunnel")
 
-        # Keep a small head-of-output print for replicability
-        head = "\n".join(tun_cfg.splitlines()[:20])
-        print(f"[HUB-DETECT] tunnel_section out (head):\n{head}\n---")
-
-        # Split into interface sections and evaluate
         sections = re.split(r"(?m)^interface\s+", tun_cfg)
         hub_tunnels = []
         for sec in sections:
             sec = sec.strip()
-            if not sec:
-                continue
-            # Section starts with "Tunnel1", "Tunnel2", etc.
+            if not sec: continue
             m_name = re.match(r"(Tunnel\S+)", sec)
             name = m_name.group(1) if m_name else "Tunnel?"
-
             has_mgre    = re.search(r"(?m)^\s*tunnel mode gre multipoint\b", sec) is not None
             has_nhs     = re.search(r"(?m)^\s*ip nhrp nhs\b", sec) is not None
             has_redirect= re.search(r"(?m)^\s*ip nhrp redirect\b", sec) is not None
-
-            print(f"[HUB-DETECT] {name}: mGRE={has_mgre} NHS={has_nhs} REDIR={has_redirect}")
-
-            # HUB if mGRE and (no NHS)  OR  explicit redirect
             if has_mgre and (not has_nhs or has_redirect):
                 hub_tunnels.append(name)
 
         facts["hub_cfg"] = len(hub_tunnels) > 0
         facts["tunnel_names"] = hub_tunnels
 
-        # If config already proves hub, return early (avoid flaky extra commands)
         if facts["hub_cfg"]:
-            print(f"[HUB-DETECT] {ip} hub_cfg=True via config; tunnels={hub_tunnels}")
-            try:
-                ssh.close()
-            except Exception:
-                pass
+            try: ssh.close()
+            except: pass
             return (True, f"DMVPN hub config on {', '.join(hub_tunnels)}", facts)
 
-        # --- Best-effort runtime checks (not required) ---
         dmvpn_out = run("show dmvpn")
         nhrp_out  = run("show ip nhrp")
 
@@ -664,26 +556,17 @@ def detect_dmvpn_hub_over_ssh(ip: str, timeout: int = 10):
         facts["peer_count"] = peer_count
 
         if dmvpn_out and re.search(r"(?i)\bType:\s*Hub\b", dmvpn_out):
-            print(f"[HUB-DETECT] {ip} runtime indicates Type: Hub")
-            try:
-                ssh.close()
-            except Exception:
-                pass
+            try: ssh.close()
+            except: pass
             return (True, "DMVPN hub (runtime)", facts)
 
-        try:
-            ssh.close()
-        except Exception:
-            pass
-
-        print(f"[HUB-DETECT] {ip} not a hub by config/runtime.")
+        try: ssh.close()
+        except: pass
         return (False, "No DMVPN hub fingerprints found", facts)
 
     except Exception as e:
-        try:
-            ssh.close()
-        except Exception:
-            pass
+        try: ssh.close()
+        except: pass
         print(f"[HUB-DETECT] {ip} ERROR: {e}")
         return (False, f"SSH error: {e}", {})
 
@@ -710,16 +593,7 @@ def detect_default_gateway(ip, username, password, *, vrf=None, timeout=6):
     ssh.close()
     return (m3.group(1) if m3 else None), out
 
-
 def list_cellular_interfaces(ip: str, timeout: int = 8):
-    """
-    Returns a list of cellular interfaces from 'show ip interface brief':
-    [
-      {"name": "Cellular0/0/0", "ip": "10.199.23.43", "status": "up", "protocol": "up"},
-      {"name": "Cellular0/1/0", "ip": "unassigned", "status": "administratively down", "protocol": "down"},
-      ...
-    ]
-    """
     if not is_device_online(ip):
         return []
 
@@ -746,14 +620,12 @@ def list_cellular_interfaces(ip: str, timeout: int = 8):
         if not re.match(r"^\s*Cellular[\d/]+", raw, re.I):
             continue
         cols = re.split(r"\s+", raw.strip())
-        # Columns: Interface, IP-Address, OK?, Method, Status, Protocol
         name = cols[0] if len(cols) > 0 else ""
         ipaddr = cols[1] if len(cols) > 1 else ""
         status = " ".join(cols[4:-1]) if len(cols) >= 6 else (cols[4] if len(cols) > 4 else "")
         protocol = cols[-1] if cols else ""
         results.append({"name": name, "ip": ipaddr, "status": status, "protocol": protocol})
     return results
-
 
 def parse_ids_from_cellular_all(output: str):
     imsi = imei = iccid = ""
@@ -770,12 +642,7 @@ def parse_ids_from_cellular_all(output: str):
             if m: iccid = m.group(1)
     return imsi, imei, iccid
 
-
 def fetch_cellular_ids_for_interface(ip: str, if_name: str, timeout: int = 8):
-    """
-    Runs 'show cellular <slot> all' for the given Cellular interface (e.g. Cellular0/1/0)
-    and returns dict: {"interface": if_name, "imsi": ..., "imei": ..., "iccid": ...}
-    """
     m = re.search(r"Cellular(\d+/\d+/\d+)", if_name, re.I)
     if not m:
         raise RuntimeError(f"Cannot parse slot from {if_name}")
@@ -802,21 +669,18 @@ def fetch_cellular_ids_for_interface(ip: str, if_name: str, timeout: int = 8):
     imsi, imei, iccid = parse_ids_from_cellular_all(out)
     return {"interface": if_name, "imsi": imsi, "imei": imei, "iccid": iccid}
 
-
-def fetch_all_active_cellular_details(ip: str, timeout: int = 8):
+def fetch_all_cellular_details(ip: str, timeout: int = 8):
     """
-    Active = interface exists AND IP-Address != 'unassigned'.
-    Returns list of dicts with interface, ip, imsi, imei, iccid.
+    Return IMSI/IMEI/ICCID for ANY Cellular interface (even if IP is unassigned).
     """
     infos = list_cellular_interfaces(ip, timeout=timeout)
-    active = [i for i in infos if i.get("ip", "").lower() != "unassigned" and i.get("ip")]
     details = []
-    for i in active:
+    for i in infos:
         try:
             ids = fetch_cellular_ids_for_interface(ip, i["name"], timeout=timeout)
         except Exception as e:
             ids = {"interface": i["name"], "imsi": "", "imei": "", "iccid": f"ERROR: {e}"}
-        ids.update({"ip": i["ip"]})
+        ids.update({"ip": i.get("ip", "")})
         details.append(ids)
     return details
 
@@ -830,7 +694,7 @@ def extract_sms_content(sms_text: str) -> str:
 
 def fetch_last_sms(ip):
     try:
-        if not has_cellular_interface(ip):
+        if not list_cellular_interfaces(ip):
             return "No Cellular"
 
         ssh = paramiko.SSHClient()
@@ -884,41 +748,6 @@ def fetch_sms_details(router_ip, sms_index):
         "Size": sms_size.group(1),
         "Content": sms_content_match.group(1).strip(),
     }
-
-def fetch_all_sms(router_ip):
-    ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    username, password = get_ssh_credentials()
-    ssh.connect(router_ip, username=username, password=password, look_for_keys=False, allow_agent=False)
-    shell = ssh.invoke_shell(); time.sleep(1); shell.recv(1000)
-    shell.send("terminal length 0\n"); time.sleep(0.5); shell.recv(1000)
-    shell.send("cellular 0/0/0 lte sms view all\n"); time.sleep(1)
-    output = ""
-    while True:
-        if shell.recv_ready():
-            output += shell.recv(4096).decode(errors="ignore")
-            time.sleep(0.2)
-        else:
-            break
-    ssh.close()
-    sms_blocks = re.split(r"\n(?=SMS ID:)", output.strip())
-    all_sms = []
-    for block in sms_blocks:
-        sms_id = re.search(r"SMS ID: (\d+)", block)
-        sms_time = re.search(r"TIME: ([\d-]+ [\d:]+)", block)
-        sms_from = re.search(r"FROM: (\d+)", block)
-        sms_size = re.search(r"SIZE: (\d+)", block)
-        sms_content_match = re.search(r"SIZE: \d+\s*\n(.+)", block)
-        if not all([sms_id, sms_time, sms_from, sms_content_match]):
-            continue
-        all_sms.append({
-            "ID": sms_id.group(1),
-            "Time": sms_time.group(1),
-            "From": sms_from.group(1),
-            "Size": sms_size.group(1) if sms_size else "0",
-            "Content": sms_content_match.group(1).strip(),
-        })
-    return all_sms
 
 # ---------- Email notification settings ----------
 def safe_set_text(widget, value):
@@ -981,7 +810,7 @@ class EmailNotificationDialog(QtWidgets.QDialog):
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Error", str(e))
 
-# ---------- Email profiles (not shown in UI here, but retained) ----------
+# ---------- Email profiles (kept) ----------
 def get_email_profiles():
     db_config = get_db_config()
     conn = mysql.connector.connect(**db_config)
@@ -1069,7 +898,7 @@ write memory
 # ---------- SMS DB ingest ----------
 def get_all_sms(ip):
     username, password = get_ssh_credentials()
-    if not username or not password or not is_device_online(ip) or not has_cellular_interface(ip):
+    if not username or not password or not is_device_online(ip) or not list_cellular_interfaces(ip):
         return ""
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -1086,10 +915,9 @@ def on_cellular_detected(self, details):
     count = len(details)
     if count == 0:
         QtWidgets.QMessageBox.information(self, "Cellular Detection",
-                                            "No ACTIVE cellular interface found (IP is unassigned).")
+                                          "No Cellular interface found.")
         return
 
-    # populate fields with the FIRST active cellular (still show all in the message)
     first = details[0]
     if hasattr(self, "imsiLineEdit"):
         self.imsiLineEdit.setText(first.get("imsi", ""))
@@ -1100,10 +928,10 @@ def on_cellular_detected(self, details):
 
     lines = []
     for d in details:
-        lines.append(f"{d['interface']}  IP {d['ip']}\n  IMSI: {d['imsi']}\n  IMEI: {d['imei']}\n  ICCID: {d['iccid']}")
+        lines.append(f"{d['interface']}  IP {d.get('ip','')}\n  IMSI: {d['imsi']}\n  IMEI: {d['imei']}\n  ICCID: {d['iccid']}")
     QtWidgets.QMessageBox.information(
         self, "Cellular Detection",
-        f"Active cellular interfaces: {count}\n\n" + "\n\n".join(lines)
+        f"Cellular interfaces: {count}\n\n" + "\n\n".join(lines)
     )
 
 def parse_sms(raw_output):
@@ -1154,7 +982,6 @@ def save_sms_to_db(sms_list, device):
                              sms["Message"], device["id"]))
     conn.commit(); cursor.close()
 
-    # Email template (subject/email/content) from email_notification table
     conn = mysql.connector.connect(**db_config)
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM email_notification LIMIT 1")
@@ -1165,7 +992,6 @@ def save_sms_to_db(sms_list, device):
         subject = email = content = None
     cursor.close(); conn.close()
 
-    # Queue to TrackIT DB
     db_config_ti = get_db_config_ti()
     if not db_config_ti: return
     conn = mysql.connector.connect(**db_config_ti)
@@ -1206,7 +1032,6 @@ def fetch_from_all_devices(devices):
         ip = device.get("ip"); dev_id = device.get("id")
         if not ip or not is_device_online(ip):
             continue
-        # Skip routers without cellular entirely
         if not device.get("has_cellular", False):
             continue
 
@@ -1246,7 +1071,7 @@ def fetch_from_all_devices(devices):
         print(f"❌ Failed to build SMS list for UI: {e}")
         return []
 
-# ---------- Credentials/DB settings dialogs ----------
+# ---------- Credentials dialogs ----------
 class SSHCredentialsDialog(QtWidgets.QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1416,62 +1241,72 @@ class IPItem(QtWidgets.QTableWidgetItem):
                 return (999, 999, 999, 999)
         return ip_key(self.text()) < ip_key(other.text())
 
-# ---------- Device settings dialog (with Detect buttons) ----------
+# ---------- Device settings dialog ----------
 class DetectSignals(QObject):
     apnDetected = pyqtSignal(str)
     gatewayDetected = pyqtSignal(str)
     detectFailed = pyqtSignal(str)
+    cellularDetected = pyqtSignal(list)
+    prefillDetected = pyqtSignal(list)
 
 class DeviceSettingsDialog(QtWidgets.QDialog):
     def __init__(self, device=None, parent=None):
         super(DeviceSettingsDialog, self).__init__(parent)
         uic.loadUi(resource_path("device_settings_dialog.ui"), self)
 
+        # signals
         self.detectSignals = DetectSignals()
         self.detectSignals.apnDetected.connect(self.on_apn_detected)
         self.detectSignals.gatewayDetected.connect(self.on_gateway_detected)
         self.detectSignals.detectFailed.connect(self.on_apn_failed)
+        self.detectSignals.cellularDetected.connect(self._finish_cellular_detect)
+        self.detectSignals.prefillDetected.connect(self._apply_cellular_ids_silent)
+        self._prefill_started = False
 
+        # overlay
         self.overlay = QWidget(self)
         self.overlay.setStyleSheet("background: rgba(255, 255, 255, 0.7);")
         self.overlay.hide()
         self.overlay.setGeometry(self.rect())
         self.overlay.setAttribute(Qt.WA_TransparentForMouseEvents, False)
-
         self.overlaySpinner = LoadingSpinner(self.overlay)
         self.overlaySpinner.setFixedSize(80, 80)
         self.overlaySpinner.setGeometry(self.overlay.width()//2-40, self.overlay.height()//2-40, 80, 80)
 
         self.gatewaySpinner = LoadingSpinner(self)
 
+        # Gateway row
         self.detectGatewayButton = QPushButton("Detect")
         getway_row_layout = QHBoxLayout()
         getway_row_layout.addWidget(self.gatewayLineEdit)
         getway_row_layout.addWidget(self.detectGatewayButton)
         getway_row_layout.addWidget(self.gatewaySpinner)
 
+        # APN row
         self.detectApnButton = QPushButton("Detect")
         apn_row_layout = QHBoxLayout()
         apn_row_layout.addWidget(self.apnLineEdit)
         apn_row_layout.addWidget(self.detectApnButton)
 
-        self.resizeEvent = self.resizeEvento
-        layout: QtWidgets.QVBoxLayout = self.layout()
-        layout.insertLayout(2, getway_row_layout)
-        layout.insertLayout(3, apn_row_layout)
-
-        self.detectApnButton.clicked.connect(self.handle_detect_apn)
-        self.detectGatewayButton.clicked.connect(self.handle_detect_gateway)
-
-        # --- Detect Cellular button (counts & populates IDs)
+        # Detect Cellular row
         self.detectCellButton = QPushButton("Detect Cellular")
         cell_row_layout = QHBoxLayout()
         cell_row_layout.addStretch(1)
         cell_row_layout.addWidget(self.detectCellButton)
-        layout.insertLayout(4, cell_row_layout)   # place under APN row
 
+        # attach to main layout
+        layout: QtWidgets.QVBoxLayout = self.layout()
+        layout.insertLayout(2, getway_row_layout)
+        layout.insertLayout(3, apn_row_layout)
+        layout.insertLayout(4, cell_row_layout)
+
+        # ensure IMSI/IMEI/ICCID fields exist
+        self._ensure_id_fields(layout)
+
+        # clicks
+        self.detectApnButton.clicked.connect(self.handle_detect_apn)
+        self.detectGatewayButton.clicked.connect(self.handle_detect_gateway)
         self.detectCellButton.clicked.connect(self.handle_detect_cellular)
-
 
         self.device = device
         if device:
@@ -1481,28 +1316,100 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
             self.simLineEdit.setText(device["sim"])
             self.apnLineEdit.setText(device["apn"])
             self.emailLineEdit.setText(device["email"])
-            if not device.get("has_cellular", True):
-                self.detectApnButton.setEnabled(False)
+            # button enablement correct
+            has_cell = bool(device.get("has_cellular", True))
+            self.detectApnButton.setEnabled(has_cell)
+            if not has_cell:
                 self.detectApnButton.setToolTip("No cellular interface on this router")
 
         self.saveButton.clicked.connect(self.accept)
         self.cancelButton.clicked.connect(self.reject)
 
-    def resizeEvento(self, event):
+        self.resizeEvent = self._resize_event_forward
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._prefill_started:
+            self._prefill_started = True
+            ip = self.ipLineEdit.text().strip()
+            if ip:
+                # Prefill silently after the dialog is visible
+                QtCore.QTimer.singleShot(0, self._prefill_cellular_ids_silent)
+
+    def _prefill_cellular_ids_silent(self):
+        ip = self.ipLineEdit.text().strip()
+        if not ip:
+            return
+        def run():
+            try:
+                details = fetch_all_cellular_details(ip)
+                self.detectSignals.prefillDetected.emit(details)
+            except Exception:
+                pass
+        threading.Thread(target=run, daemon=True).start()
+
+    @pyqtSlot(list)
+    def _apply_cellular_ids_silent(self, details):
+        if not details:
+            return
+        first = details[0]
+        if hasattr(self, "imsiLineEdit"):
+            self.imsiLineEdit.setText(first.get("imsi", ""))
+        if hasattr(self, "imeiLineEdit"):
+            self.imeiLineEdit.setText(first.get("imei", ""))
+        if hasattr(self, "iccidLineEdit"):
+            self.iccidLineEdit.setText(first.get("iccid", ""))
+
+    # ---------- create IMSI/IMEI/ICCID rows ----------
+    def _ensure_id_fields(self, main_vbox: QtWidgets.QVBoxLayout):
+        self.imsiLineEdit  = getattr(self, "imsiLineEdit",  None) or QtWidgets.QLineEdit()
+        self.imeiLineEdit  = getattr(self, "imeiLineEdit",  None) or QtWidgets.QLineEdit()
+        self.iccidLineEdit = getattr(self, "iccidLineEdit", None) or QtWidgets.QLineEdit()
+
+        for w in (self.imsiLineEdit, self.imeiLineEdit, self.iccidLineEdit):
+            w.setReadOnly(True)
+            w.setPlaceholderText("— detected after clicking ‘Detect Cellular’ —")
+
+        self.imsiLineEdit.setObjectName("imsiLineEdit")
+        self.imeiLineEdit.setObjectName("imeiLineEdit")
+        self.iccidLineEdit.setObjectName("iccidLineEdit")
+
+        grid = QtWidgets.QGridLayout()
+        grid.setVerticalSpacing(6)
+        grid.setHorizontalSpacing(8)
+        grid.addWidget(QtWidgets.QLabel("IMSI"),  0, 0); grid.addWidget(self.imsiLineEdit,  0, 1)
+        grid.addWidget(QtWidgets.QLabel("IMEI"),  1, 0); grid.addWidget(self.imeiLineEdit,  1, 1)
+        grid.addWidget(QtWidgets.QLabel("ICCID"), 2, 0); grid.addWidget(self.iccidLineEdit, 2, 1)
+
+        main_vbox.insertLayout(5, grid)
+
+    def get_data(self):
+        def val(widget_name):
+            w = getattr(self, widget_name, None)
+            return w.text().strip() if w and hasattr(w, "text") else ""
+        return {
+            "name":   val("nameLineEdit"),
+            "ip":     val("ipLineEdit"),
+            "gateway":val("gatewayLineEdit"),
+            "sim":    val("simLineEdit"),
+            "apn":    val("apnLineEdit"),
+            "email":  val("emailLineEdit"),
+        }
+
+    @pyqtSlot(list)
+    def _finish_cellular_detect(self, details):
+        try:
+            on_cellular_detected(self, details)
+        finally:
+            self.overlaySpinner.stop()
+            self.overlay.hide()
+
+    def _resize_event_forward(self, event):
         super().resizeEvent(event)
         self.overlay.setGeometry(self.rect())
         self.overlaySpinner.setGeometry(self.overlay.width()//2-40, self.overlay.height()//2-40, 80, 80)
 
-    def get_data(self):
-        return {
-            "name": self.nameLineEdit.text(),
-            "ip": self.ipLineEdit.text(),
-            "gateway": self.gatewayLineEdit.text(),
-            "sim": self.simLineEdit.text(),
-            "apn": self.apnLineEdit.text(),
-            "email": self.emailLineEdit.text(),
-        }
-
+    # -------------- Detect actions --------------
     def handle_detect_cellular(self):
         ip = self.ipLineEdit.text().strip()
         if not ip:
@@ -1512,10 +1419,11 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
 
         def run():
             try:
-                details = fetch_all_active_cellular_details(ip)
-                QtCore.QTimer.singleShot(0, lambda: self.on_cellular_detected(details))
+                details = fetch_all_cellular_details(ip)
+                self.detectSignals.cellularDetected.emit(details)
             except Exception as e:
                 self.detectSignals.detectFailed.emit(str(e))
+
         threading.Thread(target=run, daemon=True).start()
 
     def handle_detect_apn(self):
@@ -1539,11 +1447,10 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
                 ssh.connect(ip, username=username, password=password,
                             look_for_keys=False, allow_agent=False)
 
-                # ONE channel only: interactive shell
                 sh = ssh.invoke_shell()
                 time.sleep(0.4)
                 if sh.recv_ready():
-                    _ = sh.recv(65535)  # clear banner
+                    _ = sh.recv(65535)
 
                 _shell_send_and_read(sh, "terminal length 0")
                 brief = _shell_send_and_read(sh, "show ip interface brief")
@@ -1556,7 +1463,6 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
                     self.detectSignals.detectFailed.emit("No Cellular interface found in 'show ip interface brief'.")
                     return
 
-                # Try multiple show variants through the SAME shell
                 outputs = []
                 for cmd in [
                     f"show cellular {slot} profile",
@@ -1609,6 +1515,7 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(self, "Missing IP", "Please enter the router IP first.")
             return
         self.overlay.show(); self.overlaySpinner.start()
+
         def run():
             try:
                 username, password = get_ssh_credentials()
@@ -1622,6 +1529,7 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
                     self.detectSignals.detectFailed.emit("Gateway of last resort is not set.")
             except Exception as e:
                 self.detectSignals.detectFailed.emit(f"Gateway detect error: {e}")
+
         threading.Thread(target=run, daemon=True).start()
 
 # ---------- Main window ----------
@@ -1632,6 +1540,7 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         uic.loadUi(ui_file, self)
         self.setWindowIcon(QIcon(resource_path("icons/cisco.png")))
         self.statusBar()
+        self._view_devices = []
 
         # Devices tab widgets
         self.deviceSearchLineEdit = self.tabDevices.findChild(QtWidgets.QLineEdit, "searchLineEdit")
@@ -1685,7 +1594,7 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         ssh_settings_action.triggered.connect(self.open_ssh_credentials_dialog)
         settings_menu.addAction(ssh_settings_action)
 
-        notification_list = QtWidgets.QAction(QIcon("icons/gear.jpg"),"Email Notification", self)
+        notification_list = QtWidgets.QAction(QIcon(resource_path("icons/gear.jpg")),"Email Notification", self)
         notification_list.triggered.connect(self.open_email_notification)
         settings_menu.addAction(notification_list)
 
@@ -1701,6 +1610,9 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         self.spinner = LoadingSpinner(self); self.spinner.setGeometry(self.rect())
         self.resizeEvent = self._resizeEvent
 
+        self._sms_pool = ThreadPoolExecutor(max_workers=4)
+
+        # Initial data
         self.devices = load_devices_from_db()
         self.sms_logs = []
         self.is_paused = False
@@ -1721,24 +1633,21 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         self.pauseButton.clicked.connect(self.toggle_pause)
         self.exportButton.clicked.connect(self.export_to_csv)
 
-        # Initial loads
+        # Build device table quickly
         self.load_devices(self.devices)
+
+        # Start inbox fill on BG thread
         self.fetch_all_devices()
 
         # Syslog listener + timer
         self.start_syslog_listener()
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.fetch_all_devices)
-        self.timer.start(60 * 1000)
+        self.timer.start(5 * 60 * 1000)
 
-    # cache so we don't hammer the same IP repeatedly
     _autohub_checked = set()
 
     def _auto_detect_and_flag_hub(self, row_index: int, dev: dict):
-        """
-        If a device is online and not marked as hub yet, try once to detect a DMVPN hub.
-        If detected, update DB and refresh the table so the HUB badge appears.
-        """
         ip = dev.get("ip")
         if not ip or ip in self._autohub_checked or dev.get("is_hub", False):
             return
@@ -1755,15 +1664,121 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
                 print(f"[HUB-AUTO] {ip} thread error: {e}")
         threading.Thread(target=task, daemon=True).start()
 
-    # ---------- Inbox table fetch/render ----------
-    def fetch_all_devices(self):
-        self.devices = load_devices_from_db()
-        print("🔄 Fetching SMS from all devices...")
-        smsList = fetch_from_all_devices(self.devices)
+    def _find_device_by_id(self, dev_id: int):
+        return next((d for d in self.devices if d.get("id") == dev_id), None)
 
-        if not self.smsInboxTable:
+    def open_settings_dialog_by_id(self, dev_id: int):
+        device = self._find_device_by_id(dev_id)
+        if not device:
+            QtWidgets.QMessageBox.warning(self, "Not found", "Device could not be found.")
+            return
+        dialog = DeviceSettingsDialog(device=device, parent=self)
+        if dialog.exec_() == QtWidgets.QDialog.Accepted:
+            updated_data = dialog.get_data()
+            updated_data["ip"] = device["ip"]
+            update_device_in_db(updated_data)
+            self.refresh_devices_from_db()
+            QtWidgets.QMessageBox.information(self, "Success", "Device updated successfully.")
+
+    # Inside class CiscoSMSMonitorApp
+
+    def add_device(self):
+        """Open the Add Device dialog, insert to DB, and refresh UI."""
+        dialog = DeviceSettingsDialog(parent=self)
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
             return
 
+        new_device = dialog.get_data()
+        self.spinner.start()
+
+        def background_task():
+            try:
+                # Save to DB
+                insert_device_to_db(new_device)
+
+                # If the device has cellular, configure the EEM applet for SMS extraction
+                try:
+                    if list_cellular_interfaces(new_device.get("ip", "")):
+                        username, password = get_ssh_credentials()
+                        if username and password:
+                            configure_sms_applet_on_cisco(new_device["ip"], username, password)
+                except Exception as sub_e:
+                    # Non-fatal; just log
+                    print(f"⏭️ Skipping/failed EEM config for {new_device.get('ip','?')}: {sub_e}")
+
+                # Reload devices and push back to UI thread
+                updated_devices = load_devices_from_db()
+                self.worker_signals.deviceAdded.emit(updated_devices)
+
+            except Exception as e:
+                QtCore.QTimer.singleShot(
+                    0,
+                    lambda: QtWidgets.QMessageBox.warning(
+                        self, "Error", f"Failed to add device:\n{e}"
+                    ),
+                )
+
+        threading.Thread(target=background_task, daemon=True).start()
+
+    def delete_device_by_id(self, dev_id: int):
+        device = self._find_device_by_id(dev_id)
+        if not device:
+            QtWidgets.QMessageBox.warning(self, "Not found", "Device could not be found.")
+            return
+        name = device.get("name", "Unknown")
+        if QtWidgets.QMessageBox.question(
+            self, "Confirm Deletion", f"Delete device '{name}'?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No
+        ) == QtWidgets.QMessageBox.Yes:
+            try:
+                delete_device_from_db(device["id"])
+                self.refresh_devices_from_db()
+                QtWidgets.QMessageBox.information(self, "Deleted", f"Device '{name}' was deleted.")
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "Error", f"Failed to delete device:\n{e}")
+
+    def show_sms_log_dialog_by_id(self, dev_id: int):
+        device = self._find_device_by_id(dev_id)
+        if not device:
+            QtWidgets.QMessageBox.warning(self, "Not found", "Device could not be found.")
+            return
+        if not device.get("has_cellular", False):
+            QtWidgets.QMessageBox.information(self, "No Cellular", "This device has no cellular interface.")
+            return
+        self.spinner.start()
+        name, ip = device["name"], device["ip"]
+        def task():
+            try:
+                logs = get_all_sms(ip)
+                self.worker_signals.smsLogsFetched.emit(name, logs)
+            except Exception as e:
+                QTimer.singleShot(0, lambda: QtWidgets.QMessageBox.critical(self, "Error", str(e)))
+                self.worker_signals.smsLogsFetched.emit(name, [])
+        threading.Thread(target=task, daemon=True).start()
+
+    def show_send_sms_dialog_by_id(self, dev_id: int):
+        device = self._find_device_by_id(dev_id)
+        if not device:
+            QtWidgets.QMessageBox.warning(self, "Not found", "Device could not be found.")
+            return
+        if not device.get("has_cellular", False):
+            QtWidgets.QMessageBox.information(self, "No Cellular",
+                                              f"'{device.get('name','Unknown')}' has no cellular interface.")
+            return
+        if not (device.get("sim") or "").strip():
+            QtWidgets.QMessageBox.warning(self, "SIM Missing",
+                                          f"Cannot send SMS for '{device.get('name','Unknown')}'.\nPlease set the SIM value first.")
+            return
+        dialog = SendSMSDialog(device_name=device["name"], router_ip=device["ip"], parent=self)
+        if dialog.exec_() == QtWidgets.QDialog.Accepted:
+            to_number, message = dialog.get_sms_data()
+            username, password = get_ssh_credentials()
+            self.send_sms(device["ip"], username, password, to_number, message)
+
+    # ---------- Inbox table fetch/render ----------
+    def _populate_inbox_table(self, smsList):
+        if not self.smsInboxTable:
+            return
         self.smsInboxTable.setColumnCount(4)
         self.smsInboxTable.setColumnWidth(0, 150)
         self.smsInboxTable.setColumnWidth(1, 150)
@@ -1778,6 +1793,13 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             self.smsInboxTable.setItem(i, 3, QtWidgets.QTableWidgetItem(str(d[3] or "")))
         if self.inboxSearchLineEdit:
             self.filter_inbox_table(self.inboxSearchLineEdit.text())
+
+    def fetch_all_devices(self):
+        def task():
+            devices = load_devices_from_db()
+            smsList = fetch_from_all_devices(devices)
+            QtCore.QTimer.singleShot(0, lambda lst=smsList: self._populate_inbox_table(lst))
+        threading.Thread(target=task, daemon=True).start()
 
     def filter_inbox_table(self, text=None):
         if not self.smsInboxTable:
@@ -1849,22 +1871,6 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         return ip
 
     # ---------- Device actions ----------
-    def delete_device(self, row_index):
-        device = self.devices[row_index]
-        name = device.get("name", "Unknown")
-        reply = QtWidgets.QMessageBox.question(
-            self, "Confirm Deletion", f"Delete device '{name}'?",
-            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No
-        )
-        if reply == QtWidgets.QMessageBox.Yes:
-            try:
-                delete_device_from_db(device["id"])
-                self.devices.pop(row_index)
-                self.apply_filters_and_sort()
-                QtWidgets.QMessageBox.information(self, "Deleted", f"Device '{name}' was deleted.")
-            except Exception as e:
-                QtWidgets.QMessageBox.critical(self, "Error", f"Failed to delete device:\n{e}")
-
     def open_db_settings(self):
         DBSettingsDialog(self).exec_()
 
@@ -1878,7 +1884,7 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         SSHCredentialsDialog(self).exec_()
 
     def refresh_devices_from_db(self):
-        self._autohub_checked.clear()   # allow re-check after code tweak
+        self._autohub_checked.clear()
         self.spinner.start()
         def refresh_task():
             try:
@@ -1894,6 +1900,14 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         self.devices = devices
         self.apply_filters_and_sort()
         self.spinner.stop()
+
+    # Add to class CiscoSMSMonitorApp
+    @pyqtSlot(list)
+    def update_devices_and_ui(self, updated_devices):
+        """Handle deviceAdded signal after Add Device completes."""
+        self.spinner.stop()
+        self.devices = updated_devices
+        self.apply_filters_and_sort()
 
     # ---------- Device register (syslog host) ----------
     def device_register(self, index):
@@ -1915,6 +1929,8 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
     # ---------- Table build ----------
     def load_devices(self, device_list):
         print(f"🔄 Loading {len(device_list)} devices into table")
+        self._view_devices = list(device_list)
+
         self.deviceTable.setSortingEnabled(False)
         self.deviceTable.setColumnCount(10)
         self.deviceTable.setHorizontalHeaderLabels([
@@ -1923,6 +1939,8 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         self.deviceTable.setRowCount(len(device_list))
 
         for i, d in enumerate(device_list):
+            dev_id = d["id"]
+
             if d["status"] == "Online" and not d.get("is_hub", False):
                 self._auto_detect_and_flag_hub(i, d)
 
@@ -1945,6 +1963,7 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             status_widget = create_status_label(device_list[i]["status"])
             self.deviceTable.setCellWidget(i, 8, status_widget)
 
+            # Actions
             action_button = QToolButton()
             action_button.setText("Edit")
             action_button.setIcon(QIcon(resource_path("icons/edit.png")))
@@ -1952,10 +1971,8 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             action_button.setPopupMode(QToolButton.MenuButtonPopup)
             menu = QMenu(action_button)
 
-            # Manual hub detection action (NEW)
             detect_hub_action = QAction("Detect hub now", self)
-            menu.addAction(detect_hub_action)
-            menu.addSeparator()
+            menu.addAction(detect_hub_action); menu.addSeparator()
 
             toggle_hub_action = QAction("Mark as Hub" if not d.get("is_hub") else "Mark as Spoke", self)
             menu.addAction(toggle_hub_action); menu.addSeparator()
@@ -1968,7 +1985,6 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             if not has_cell:
                 sms_logs_action.setEnabled(False)
                 sms_logs_action.setStatusTip("No cellular interface on this device")
-
             menu.addAction(sms_logs_action)
 
             sim_present = bool((d.get("sim") or "").strip())
@@ -1983,28 +1999,28 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             menu.addAction(delete_action)
 
             action_button.setMenu(menu)
-            action_button.clicked.connect(lambda _, row=i: self.open_settings_dialog(row))
-            sms_logs_action.triggered.connect(lambda _, row=i: self.show_sms_log_dialog(row))
-            send_sms_action.triggered.connect(lambda _, row=i: self.show_send_sms_dialog(row))
-            delete_action.triggered.connect(lambda _, row=i: self.delete_device(row))
+            self.deviceTable.setCellWidget(i, 9, action_button)
 
-            def on_toggle_hub(row=i):
+            # Connect actions (by device id)
+            action_button.clicked.connect(lambda _, id=dev_id: self.open_settings_dialog_by_id(id))
+            sms_logs_action.triggered.connect(lambda _, id=dev_id: self.show_sms_log_dialog_by_id(id))
+            send_sms_action.triggered.connect(lambda _, id=dev_id: self.show_send_sms_dialog_by_id(id))
+            delete_action.triggered.connect(lambda _, id=dev_id: self.delete_device_by_id(id))
+
+            def on_toggle_hub(id=dev_id):
                 try:
-                    dev = device_list[row]
+                    dev = self._find_device_by_id(id)
                     set_device_hub_flag(dev["id"], not dev.get("is_hub", False))
-                    self.devices = load_devices_from_db()
-                    self.apply_filters_and_sort()
+                    self.refresh_devices_from_db()
                 except Exception as e:
                     QtWidgets.QMessageBox.critical(self, "Error", f"Failed to update Hub flag:\n{e}")
-            toggle_hub_action.triggered.connect(lambda _, row=i: on_toggle_hub(row))
+            toggle_hub_action.triggered.connect(on_toggle_hub)
 
-            # Wire manual detect action
-            def on_detect_hub_now(row=i):
-                dev = device_list[row]
+            def on_detect_hub_now(id=dev_id):
+                dev = self._find_device_by_id(id)
                 ip  = dev["ip"]
                 try:
                     ok, reason, facts = detect_dmvpn_hub_over_ssh(ip)
-                    print(f"[HUB-MANUAL] {ip} -> ok={ok} reason={reason} facts={facts}")
                     if ok and not dev.get("is_hub", False):
                         set_device_hub_flag(dev["id"], True)
                         QtWidgets.QMessageBox.information(self, "Hub detected",
@@ -2015,86 +2031,28 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
                             f"Detector says: {'HUB' if ok else 'Not a hub'}\n{reason}")
                 except Exception as e:
                     QtWidgets.QMessageBox.critical(self, "Detect failed", str(e))
-            detect_hub_action.triggered.connect(lambda _, row=i: on_detect_hub_now(row))
+            detect_hub_action.triggered.connect(on_detect_hub_now)
 
-            self.deviceTable.setCellWidget(i, 9, action_button)
-
-        # async fetch last SMS (skip non-cellular to avoid wasted SSH calls)
+        # throttle last-SMS fetches via pool
         for i, d in enumerate(device_list):
             if d.get("has_cellular", False):
-                QTimer.singleShot(100 + i*100, lambda row=i, ip=d["ip"]: self.update_last_sms(row, ip))
+                self.update_last_sms(i, d["ip"])
             else:
                 self.deviceTable.setItem(i, 6, QtWidgets.QTableWidgetItem("No Cellular"))
 
         self.deviceTable.setSortingEnabled(True)
 
     def update_last_sms(self, row, ip):
-        def run():
+        def work():
             sms = fetch_last_sms(ip)
             self.sms_signal.smsFetched.emit(row, sms)
-        threading.Thread(target=run, daemon=True).start()
+        self._sms_pool.submit(work)
 
     @pyqtSlot(int, str)
     def on_sms_fetched(self, row, sms):
         self.deviceTable.setItem(row, 6, QtWidgets.QTableWidgetItem(sms))
 
-    def open_settings_dialog(self, index):
-        device = self.devices[index]
-        dialog = DeviceSettingsDialog(device=device, parent=self)
-        if dialog.exec_() == QtWidgets.QDialog.Accepted:
-            updated_data = dialog.get_data()
-            updated_data["ip"] = device["ip"]
-            update_device_in_db(updated_data)
-            self.devices = load_devices_from_db()
-            self.apply_filters_and_sort()
-            QtWidgets.QMessageBox.information(self, "Success", "Device updated successfully.")
-
-    def add_device(self):
-        dialog = DeviceSettingsDialog(parent=self)
-        if dialog.exec_() == QtWidgets.QDialog.Accepted:
-            new_device = dialog.get_data()
-            self.spinner.start(); self.just_added_device = True
-            def background_task():
-                try:
-                    insert_device_to_db(new_device)
-                    if has_cellular_interface(new_device["ip"]):
-                        username, password = get_ssh_credentials()
-                        configure_sms_applet_on_cisco(new_device["ip"], username, password)
-                    else:
-                        print(f"⏭️ Skipping EEM config: {new_device['ip']} has no cellular interface")
-                    time.sleep(2)
-                    updated_devices = load_devices_from_db()
-                    self.worker_signals.deviceAdded.emit(updated_devices)
-                except Exception as e:
-                    QTimer.singleShot(0, lambda: QtWidgets.QMessageBox.warning(
-                        self, "Error", f"Failed to add device:\n{e}"
-                    ))
-            threading.Thread(target=background_task, daemon=True).start()
-
-    @pyqtSlot(list)
-    def update_devices_and_ui(self, updated_devices):
-        self.spinner.stop()
-        self.devices = updated_devices
-        self.apply_filters_and_sort()
-
     # ---------- Live SMS logs tab ----------
-    def show_sms_log_dialog(self, index):
-        if not self.devices[index].get("has_cellular", False):
-            QtWidgets.QMessageBox.information(self, "No Cellular", "This device has no cellular interface.")
-            return
-
-        self.spinner.start()
-        name = self.devices[index]["name"]
-        ip = self.devices[index]["ip"]
-        def task():
-            try:
-                logs = fetch_all_sms(ip)
-                self.worker_signals.smsLogsFetched.emit(name, logs)
-            except Exception as e:
-                QTimer.singleShot(0, lambda: QtWidgets.QMessageBox.critical(self, "Error", str(e)))
-                self.worker_signals.smsLogsFetched.emit(name, [])
-        threading.Thread(target=task, daemon=True).start()
-
     @pyqtSlot(str, list)
     def display_sms_log_dialog_result(self, name, logs):
         self.spinner.stop()
@@ -2146,24 +2104,6 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
     def add_sms_log(self, sms):
         self.sms_logs.insert(0, sms)
         self.display_sms_logs(self.sms_logs[:100])
-
-    def show_send_sms_dialog(self, index):
-        device = self.devices[index]
-
-        if not device.get("has_cellular", False):
-            QtWidgets.QMessageBox.information(self, "No Cellular",
-                                              f"'{device.get('name','Unknown')}' has no cellular interface.")
-            return
-
-        if not (device.get("sim") or "").strip():
-            QtWidgets.QMessageBox.warning(self, "SIM Missing",
-                                          f"Cannot send SMS for '{device.get('name','Unknown')}'.\nPlease set the SIM value first.")
-            return
-        dialog = SendSMSDialog(device_name=device["name"], router_ip=device["ip"], parent=self)
-        if dialog.exec_() == QtWidgets.QDialog.Accepted:
-            to_number, message = dialog.get_sms_data()
-            username, password = get_ssh_credentials()
-            self.send_sms(device["ip"], username, password, to_number, message)
 
     # ---------- Syslog listener ----------
     def start_syslog_listener(self):

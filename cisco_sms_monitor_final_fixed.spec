@@ -6,7 +6,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[('combined_sms_monitor.ui', '.'), ('device_settings_dialog.ui', '.'), ('sms_log_dialog.ui', '.'), ('ssh_credentials_dialog.ui', '.'), ('db_settings_dialog.ui', '.'), ('spinner.gif', '.'), ('icons', 'icons'), ('C:\\\\Users\\\\dnurdiansyah\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python313\\\\Lib\\\\site-packages\\\\mysql\\\\connector\\\\locales', 'mysql\\\\connector\\\\locales')],
-    hiddenimports=['mysql.connector.plugins.mysql_native_password'],
+    hiddenimports=[],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -35,5 +35,4 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['cisco.ico'],
 )
