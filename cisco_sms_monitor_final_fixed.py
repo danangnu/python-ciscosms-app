@@ -16,24 +16,37 @@ from PyQt5.QtGui import QMovie, QIcon
 from PyQt5.QtCore import Qt, QSize, QTimer, QObject, pyqtSignal, pyqtSlot
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QPushButton, QHBoxLayout, QLabel,
-    QToolButton, QMenu, QAction
+    QToolButton, QMenu, QAction, QTabWidget, QComboBox, QTableWidget,
+    QTableWidgetItem
 )
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 import mysql.connector
-import sip
 import traceback
 from concurrent.futures import ThreadPoolExecutor
-
-# ---------- Qt/sip safe setup ----------
-sip.setapi('QString', 2)
-sip.setapi('QVariant', 2)
 
 # ---------- Helpers / resources ----------
 def resource_path(relative_path):
     if hasattr(sys, '_MEIPASS'):
         return os.path.join(sys._MEIPASS, relative_path)
     return os.path.join(os.path.abspath("."), relative_path)
+
+def _is_qualified_cell_row(d: dict) -> bool:
+    """
+    Keep only real cellular rows:
+      - interface starts with 'Cellular'
+      - IP is assigned (not 'unassigned' / empty)
+      - link is up (status == 'up' AND protocol contains 'up')
+    """
+    name = (d.get("interface") or d.get("name") or "").lower()
+    if not name.startswith("cellular"):
+        return False
+    ip = (d.get("ip") or d.get("ip_addr") or "").strip().lower()
+    if not ip or ip == "unassigned":
+        return False
+    status   = (d.get("status") or "").strip().lower()
+    protocol = (d.get("protocol") or "").strip().lower()
+    return status == "up" and "up" in protocol
 
 # ---------- Crypto for SSH password ----------
 FERNET_KEY = b"hZtFdYoCGy2E68Fz46zqFbW4NHnSLmP4F78w_BV9mN4="
@@ -52,6 +65,261 @@ def decrypt_password(encrypted):
     elif isinstance(encrypted, str):
         encrypted = encrypted.encode("utf-8")
     return fernet.decrypt(encrypted).decode("utf-8")
+
+# ---------- Fast helpers your loader uses ----------
+
+# (Optional but recommended) tiny TTL cache to avoid hammering devices
+_CELLULAR_CACHE = {}   # ip -> (ts, present_bool)
+_REGISTER_CACHE = {}   # ip -> (ts, registered_bool)
+_CACHE_TTL_SEC = 120   # 2 minutes
+
+def has_cellular_interface(ip: str, timeout: int = 6) -> bool:
+    """
+    True only if at least one Cellular interface is UP and has a real IP.
+    """
+    import time, re, paramiko
+    now = time.time()
+    hit = _CELLULAR_CACHE.get(ip)
+    if hit and (now - hit[0] <= _CACHE_TTL_SEC):
+        return hit[1]
+
+    if not is_device_online(ip):
+        _CELLULAR_CACHE[ip] = (now, False); return False
+
+    username, password = get_ssh_credentials()
+    if not username or not password:
+        _CELLULAR_CACHE[ip] = (now, False); return False
+
+    ssh = paramiko.SSHClient(); ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        ssh.connect(ip, username=username, password=password,
+                    look_for_keys=False, allow_agent=False,
+                    timeout=timeout, banner_timeout=timeout, auth_timeout=timeout)
+        _, stdout, _ = ssh.exec_command("show ip interface brief")
+        out = stdout.read().decode(errors="ignore")
+    except Exception:
+        _CELLULAR_CACHE[ip] = (now, False); return False
+    finally:
+        try: ssh.close()
+        except: pass
+
+    ok = False
+    for line in out.splitlines():
+        if not re.match(r"^\s*Cellular[\d/]+\b", line, re.I):
+            continue
+        cols = re.split(r"\s+", line.strip())
+        name     = cols[0] if len(cols) > 0 else ""
+        ipaddr   = cols[1] if len(cols) > 1 else ""
+        status   = cols[4].lower() if len(cols) > 4 else ""
+        protocol = cols[-1].lower() if cols else ""
+        ip_good  = ipaddr and ipaddr.lower() != "unassigned"
+        link_up  = (status == "up") and ("up" in protocol)
+        if name.lower().startswith("cellular") and ip_good and link_up:
+            ok = True; break
+
+    _CELLULAR_CACHE[ip] = (now, ok)
+    return ok
+
+_ipv4_re = re.compile(
+    r"\b(?:25[0-5]|2[0-4]\d|1?\d?\d)"
+    r"(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}\b"
+)
+# Robust IPv4 matcher (0–255 in each octet)
+_IPV4_PATTERN = r"\b(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}\b"
+
+# Define _ipv4_re if it doesn't exist yet (safe even if you already had one)
+try:
+    _ipv4_re
+except NameError:
+    _ipv4_re = re.compile(_IPV4_PATTERN)
+
+def is_device_register(ip: str, *, timeout: int = 8) -> bool:
+    """
+    True if this router has our machine set as a 'logging host' (syslog destination).
+    Uses a short cache to keep UI snappy.
+    """
+    import time
+    now = time.time()
+    hit = _REGISTER_CACHE.get(ip)
+    if hit and (now - hit[0] <= _CACHE_TTL_SEC):
+        return hit[1]
+
+    if not is_device_online(ip):
+        _REGISTER_CACHE[ip] = (now, False)
+        return False
+
+    username, password = get_ssh_credentials()
+    if not username or not password:
+        _REGISTER_CACHE[ip] = (now, False)
+        return False
+
+    import paramiko
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        ssh.connect(ip, username=username, password=password,
+                    look_for_keys=False, allow_agent=False,
+                    timeout=timeout, banner_timeout=timeout, auth_timeout=timeout)
+        # Check only the lines we care about; fast and safe
+        cmd = r"show running-config | include ^logging host "
+        _, stdout, _ = ssh.exec_command(cmd)
+        output = stdout.read().decode(errors="ignore")
+    except Exception:
+        _REGISTER_CACHE[ip] = (now, False)
+        return False
+    finally:
+        try: ssh.close()
+        except: pass
+
+    # Parse configured syslog hosts
+    hosts = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line.startswith("logging host"):
+            continue
+        m = _ipv4_re.search(line)
+        if m:
+            hosts.append(m.group(0))
+
+    # our PC's IP as seen by the routers (used elsewhere in your app)
+    my_ip = get_ip_address()
+    registered = my_ip in hosts
+    _REGISTER_CACHE[ip] = (now, registered)
+    return registered
+
+def run_cmd_fresh(ip: str, username: str, password: str, cmd: str,
+                  timeout: int = 12, prompt_end=(b'#', b'>')) -> str:
+    """
+    Opens a brand-new SSH connection, starts an interactive shell,
+    disables paging, runs `cmd`, collects output until a prompt is seen,
+    then closes the connection. Handles --More-- paging, too.
+    """
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    ssh.connect(
+        ip, username=username, password=password,
+        look_for_keys=False, allow_agent=False,
+        timeout=timeout, banner_timeout=timeout, auth_timeout=timeout
+    )
+    chan = ssh.invoke_shell(width=200, height=50)
+    chan.settimeout(timeout)
+
+    def _drain_once():
+        data = b''
+        try:
+            while chan.recv_ready():
+                data += chan.recv(65535)
+        except Exception:
+            pass
+        return data
+
+    def _send(line: str):
+        chan.send(line + '\r')
+
+    # settle banner
+    time.sleep(0.3)
+    _ = _drain_once()
+
+    # disable paging
+    _send('terminal length 0')
+    time.sleep(0.1)
+    _ = _drain_once()
+
+    # run command
+    _send(cmd)
+
+    buf = bytearray()
+    last = time.time()
+    more_pat = re.compile(br'--More--|\(q\)uit', re.I)
+
+    try:
+        while True:
+            if chan.recv_ready():
+                chunk = chan.recv(65535)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                last = time.time()
+
+                tail = bytes(buf[-256:])
+                # handle pager
+                if more_pat.search(tail):
+                    chan.send(' ')  # advance page
+                    continue
+
+                # stop when prompt appears at end of a line
+                tail_stripped = tail.rstrip()
+                if any(tail_stripped.endswith(pe) for pe in prompt_end):
+                    break
+            else:
+                if time.time() - last > timeout:
+                    break
+                time.sleep(0.05)
+    finally:
+        try:
+            chan.close()
+        except Exception:
+            pass
+        try:
+            ssh.close()
+        except Exception:
+            pass
+
+    # clean echoes & prompt
+    out = buf.decode(errors='ignore')
+    cleaned = []
+    for ln in out.splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        if s.startswith('terminal length 0') or s.startswith(cmd):
+            continue
+        if (s.endswith('#') or s.endswith('>')) and ' ' not in s and len(s) <= 80:
+            continue
+        cleaned.append(ln)
+    return '\n'.join(cleaned).strip()
+
+def _merge_cell_details(old_list, new_list):
+    """
+    Merge by interface; prefer new IMEI/IMSI/ICCID if provided.
+    Later runtime fields (ip/status/protocol/apn) always overwritten.
+    """
+    by_if = {d.get("interface",""): dict(d) for d in (old_list or [])}
+    for nd in (new_list or []):
+        key = nd.get("interface","")
+        cur = by_if.get(key, {})
+        # always refresh runtime fields
+        for k in ("ip","status","protocol","apn","sim"):
+            cur[k] = nd.get(k, "")
+        # keep non-empty IDs
+        for k in ("imsi","imei","iccid"):
+            if nd.get(k):
+                cur[k] = nd[k]
+        by_if[key] = cur
+    # filter to qualified rows only
+    return [d for d in by_if.values() if _is_qualified_cell_row(d)]
+
+def cleanup_ineligible_cellular_rows():
+    db = get_db_config()
+    conn = mysql.connector.connect(**db)
+    cur = conn.cursor(dictionary=True)
+    cur.execute("SELECT DISTINCT device_id FROM device_cellular")
+    device_ids = [r["device_id"] for r in cur.fetchall()]
+    cur.close(); conn.close()
+
+    for dev_id in device_ids:
+        rows = get_device_cellular(dev_id)
+        keep = []
+        for r in rows:
+            d = {
+                "interface": r["interface"], "ip": r["ip_addr"],
+                "status": r["status"], "protocol": r["protocol"],
+                "imsi": r["imsi"], "imei": r["imei"], "iccid": r["iccid"],
+                "apn": r["apn"], "sim": r.get("sim") or ""
+            }
+            if _eligible_detail(d):
+                keep.append(d)
+        replace_device_cellular(dev_id, keep)
 
 # ---------- DB config ----------
 def get_db_config():
@@ -111,6 +379,42 @@ def get_ssh_credentials():
         print(f"⚠️ Failed to load SSH credentials: {e}")
         return None, None
 
+def _score_iface(d: dict) -> tuple:
+    ip = (d.get("ip") or "").strip().lower()
+    has_ip = bool(ip and ip != "unassigned")
+    status = (d.get("status") or "").lower()
+    proto  = (d.get("protocol") or "").lower()
+    link_up = ("up" in proto) or (status == "up")
+    return (1 if has_ip else 0, 1 if link_up else 0, d.get("interface",""))
+
+def _is_eligible_cellular(d: dict) -> bool:
+    """
+    Only keep real/usable cellular rows:
+      1) interface name starts with 'Cellular'
+      2) has an IP (not 'unassigned' / empty)
+      3) link is up (Status == 'up' OR Protocol contains 'up')
+    """
+    if not (d.get("interface","").lower().startswith("cellular")):
+        return False
+    ip = (d.get("ip") or "").strip().lower()
+    if not ip or ip == "unassigned":
+        return False
+    status = (d.get("status") or "").strip().lower()
+    proto  = (d.get("protocol") or "").strip().lower()
+    link_up = (status == "up") or ("up" in proto)
+    return link_up
+
+def update_device_primary_cellular(device_id: int, best: dict, apn: str = ""):
+    db = get_db_config()
+    conn = mysql.connector.connect(**db)
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE devices
+           SET apn=%s     -- no more sim/imsi/imei/iccid here
+         WHERE id=%s
+    """, ((apn or best.get("apn") or None), device_id))
+    conn.commit(); cur.close(); conn.close()
+
 def badge_widget(text: str, bg="#6b7280", fg="#fff") -> QWidget:
     w = QWidget()
     l = QHBoxLayout(w); l.setContentsMargins(0, 0, 0, 0)
@@ -121,6 +425,60 @@ def badge_widget(text: str, bg="#6b7280", fg="#fff") -> QWidget:
     )
     l.addWidget(lbl); l.addStretch(1)
     return w
+
+def get_device_cellular(device_id: int):
+    db = get_db_config()
+    conn = mysql.connector.connect(**db)
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT id, interface, ip_addr, status, protocol,
+               imsi, imei, iccid, apn, sim, last_seen          -- ← sim
+        FROM device_cellular
+        WHERE device_id=%s
+        ORDER BY interface
+    """, (device_id,))
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+    return rows
+
+def upsert_device_cellular(device_id: int, details: list):
+    if not details:
+        return
+    db = get_db_config()
+    conn = mysql.connector.connect(**db)
+    cur = conn.cursor()
+    sql = """
+    INSERT INTO device_cellular
+      (device_id, interface, ip_addr, status, protocol,
+       imsi, imei, iccid, apn, sim, last_seen)                -- ← sim
+    VALUES
+      (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+    ON DUPLICATE KEY UPDATE
+      ip_addr=VALUES(ip_addr),
+      status=VALUES(status),
+      protocol=VALUES(protocol),
+      imsi=VALUES(imsi),
+      imei=VALUES(imei),
+      iccid=VALUES(iccid),
+      apn=VALUES(apn),
+      sim=VALUES(sim),                                        -- ← sim
+      last_seen=NOW();
+    """
+    for d in details:
+        cur.execute(sql, (
+            device_id,
+            d.get("interface",""),
+            d.get("ip") or None,
+            d.get("status") or None,
+            d.get("protocol") or None,
+            d.get("imsi") or None,
+            d.get("imei") or None,
+            d.get("iccid") or None,
+            d.get("apn") or None,
+            d.get("sim") or None,                              # ← sim
+        ))
+    conn.commit()
+    cur.close(); conn.close()
 
 def _find_cellular_slot_from_brief(full_text: str) -> str:
     m = re.search(r"(?mi)^\s*Cellular\s*(\d+(?:/\d+){0,2})\b", full_text)
@@ -180,6 +538,32 @@ def get_email_config_from_db():
     except Exception as e:
         print(f"❌ Error loading email config from DB: {e}")
         return None
+
+def _is_real_ip(ip: str) -> bool:
+    ip = (ip or "").strip().lower()
+    return bool(ip) and ip != "unassigned"
+
+def _eligible_detail(d: dict) -> bool:
+    name = (d.get("interface") or d.get("name") or "").lower()
+    stat = (d.get("status") or "").lower()
+    proto = (d.get("protocol") or "").lower()
+    return (
+        name.startswith("cellular") and
+        _is_real_ip(d.get("ip")) and
+        ("up" in proto or stat == "up")
+    )
+
+def replace_device_cellular(device_id: int, details: list):
+    """Purge then insert only qualified rows."""
+    details = [d for d in (details or []) if _is_qualified_cell_row(d)]
+    db = get_db_config()
+    conn = mysql.connector.connect(**db)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM device_cellular WHERE device_id=%s", (device_id,))
+    conn.commit()
+    cur.close(); conn.close()
+    if details:
+        upsert_device_cellular(device_id, details)
 
 # ---------- Fast single-SSH probe ----------
 def probe_device_fast(ip: str, timeout: int = 6):
@@ -405,48 +789,67 @@ def set_device_hub_flag(device_id: int, is_hub: bool) -> int:
     cur.close(); conn.close()
     return affected
 
+def _parse_msisdn(text: str) -> str:
+    # MSISDN, MDN, Phone number, Line number: accept + and digits
+    m = re.search(r"(?im)^\s*(?:MSISDN|MDN|Phone\s*Number|Line\s*Number)\s*[:=]\s*([+\d]{6,20})\b", text)
+    return m.group(1) if m else ""
+
 def load_devices_from_db():
     db_config = get_db_config()
     conn = mysql.connector.connect(**db_config)
     cursor = conn.cursor()
-    cursor.execute("SELECT name, ip, gateway, sim, apn, email, id, IFNULL(is_hub,0) FROM devices")
+    cursor.execute("""
+        SELECT d.name, d.ip, d.gateway, d.apn, d.email, d.id, IFNULL(d.is_hub,0)
+        FROM devices d
+    """)
     rows = cursor.fetchall()
     conn.close()
 
     devices = []
     for row in rows:
-        ip = row[1]
+        name, ip, gateway, apn, email, dev_id, is_hub = row
+
         online = is_device_online(ip)
 
-        cell = False
-        register = False
-        present = False
-        if online:
-            info = probe_device_fast(ip)
-            present = info["present"]
-            cell = info["has_cell"]
-            register = info["register"] if cell else False
+        # read cellular rows & choose eligible “best” one for UI
+        try:
+            cells = get_device_cellular(dev_id)  # now returns sim field too
+        except Exception:
+            cells = []
 
-        if not online:
-            status = "Offline"
-        elif cell and not register:
-            status = "Not Register"
-        else:
-            status = "Online"
+        eligible = []
+        for r in cells:
+            d = {
+                "interface": r["interface"],
+                "ip": r["ip_addr"],
+                "status": r["status"],
+                "protocol": r["protocol"],
+                "imsi": r["imsi"],
+                "imei": r["imei"],
+                "iccid": r["iccid"],
+                "apn": r["apn"],
+                "sim": r.get("sim") or "",
+            }
+            if _is_qualified_cell_row(d):
+                eligible.append(d)
+
+        has_cell = bool(eligible)
+        best = max(eligible, key=_score_iface) if eligible else {}
+        sim_for_ui = best.get("sim", "")
+        # keep APN on devices; (display stays the device column value)
+        register = is_device_register(ip) if (online and has_cell) else False
+
+        status = "Offline"
+        if online:
+            status = "Online" if register or not has_cell else "Not Register"
 
         devices.append({
-            "name": row[0],
-            "ip": ip,
-            "gateway": row[2] or "",
-            "sim": row[3] or "",
-            "apn": row[4] or "",
-            "email": row[5] or "",
-            "lastSMS": "",
-            "signal": 0,
-            "status": status,
-            "id": row[6],
-            "is_hub": bool(row[7]),
-            "has_cellular": bool(present),  # presence is enough to allow Detect
+            "name": name, "ip": ip, "gateway": gateway,
+            "sim": sim_for_ui,        # <— for UI & filters
+            "apn": apn,
+            "imsi": "", "imei": "", "iccid": "",  # no longer used at device level
+            "email": email, "lastSMS": "", "signal": 0, "status": status,
+            "id": dev_id, "is_hub": bool(is_hub), "has_cellular": has_cell,
         })
     return devices
 
@@ -456,11 +859,20 @@ def update_device_in_db(device):
     cursor = conn.cursor()
     cursor.execute("""
         UPDATE devices
-        SET sim = %s, apn = %s, email = %s, name = %s, gateway = %s
-        WHERE ip = %s
-    """, (device["sim"], device["apn"], device["email"],
-          device["name"], device["gateway"], device["ip"]))
-    conn.commit(); cursor.close(); conn.close()
+        SET apn=%s,
+            email=%s,
+            name=%s,
+            gateway=%s
+        WHERE ip=%s
+    """, (device["apn"], device["email"], device["name"], device["gateway"], device["ip"]))
+    conn.commit()
+    cursor.close(); conn.close()
+
+    if device.get("id"):
+        try:
+            replace_device_cellular(device["id"], device.get("cellular_details", []))
+        except Exception as e:
+            print(f"⚠️ replace_device_cellular failed: {e}")
 
 def delete_device_from_db(device_id):
     db_config = get_db_config()
@@ -475,18 +887,25 @@ def insert_device_to_db(device):
     cur = conn.cursor()
     is_hub = 0
     try:
-        ok, reason, _ = detect_dmvpn_hub_over_ssh(device["ip"])
-        if ok:
-            is_hub = 1
-            print(f"[Auto] {device['ip']} detected as DMVPN hub: {reason}")
+        ok, _, _ = detect_dmvpn_hub_over_ssh(device["ip"])
+        if ok: is_hub = 1
     except Exception:
         pass
+
     cur.execute("""
-        INSERT INTO devices (name, ip, gateway, sim, apn, email, is_hub)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-    """, (device["name"], device["ip"], device["gateway"], device["sim"],
-          device["apn"], device["email"], is_hub))
-    conn.commit(); cur.close(); conn.close()
+        INSERT INTO devices (name, ip, gateway, apn, email, is_hub)
+        VALUES (%s,%s,%s,%s,%s,%s)
+    """, (device["name"], device["ip"], device["gateway"], device["apn"],
+        device["email"], is_hub))
+    conn.commit()
+    device_id = cur.lastrowid
+    cur.close(); conn.close()
+
+    # Save qualified cellular rows only
+    try:
+        replace_device_cellular(device_id, device.get("cellular_details", []))
+    except Exception as e:
+        print(f"⚠️ saving device_cellular failed: {e}")
 
 # ---------- Cisco/SSH ops ----------
 def detect_dmvpn_hub_over_ssh(ip: str, timeout: int = 10):
@@ -625,21 +1044,29 @@ def list_cellular_interfaces(ip: str, timeout: int = 8):
         status = " ".join(cols[4:-1]) if len(cols) >= 6 else (cols[4] if len(cols) > 4 else "")
         protocol = cols[-1] if cols else ""
         results.append({"name": name, "ip": ipaddr, "status": status, "protocol": protocol})
+
+    print("[DBG] show ip int brief parsed:", results)
     return results
 
-def parse_ids_from_cellular_all(output: str):
+def parse_ids_from_cellular_text(text: str):
+    """
+    Parse one slot's text. Supports multiple IOS XE phrasings.
+    Returns (imsi, imei, iccid).
+    """
     imsi = imei = iccid = ""
-    for line in output.splitlines():
-        s = line.strip()
-        if "IMSI" in s.upper():
-            m = re.search(r"IMSI\)?\s*=\s*([0-9]+)", s, re.I)
-            if m: imsi = m.group(1)
-        elif "IMEI" in s.upper():
-            m = re.search(r"IMEI\)?\s*=\s*([0-9]+)", s, re.I)
-            if m: imei = m.group(1)
-        elif "ICCID" in s.upper():
-            m = re.search(r"ICCID\)?\s*=\s*([0-9A-Fa-f]+)", s, re.I)
-            if m: iccid = m.group(1)
+
+    # IMSI (SIM x IMSI:, IMSI =, IMSI:)
+    m = re.search(r"(?im)^\s*(?:SIM\s*\d+\s*)?IMSI\s*[:=]\s*([0-9]{6,20})\b", text)
+    if m: imsi = m.group(1)
+
+    # IMEI (International Mobile Equipment Identity (IMEI) = NNN…)
+    m = re.search(r"(?im)^\s*(?:International\s+Mobile\s+Equipment\s+Identity\s*\(IMEI\)\s*|IMEI)\s*[:=]\s*([0-9]{8,20})\b", text)
+    if m: imei = m.group(1)
+
+    # ICCID (ICCID:, ICCID (SIM x):, Integrated Circuit Card ID)
+    m = re.search(r"(?im)^\s*(?:ICCID|Integrated\s+Circuit\s+Card\s+ID)\s*(?:\(\s*SIM\s*\d+\s*\))?\s*[:=]\s*([0-9A-F]{10,30})\b", text)
+    if m: iccid = m.group(1)
+
     return imsi, imei, iccid
 
 def fetch_cellular_ids_for_interface(ip: str, if_name: str, timeout: int = 8):
@@ -658,29 +1085,59 @@ def fetch_cellular_ids_for_interface(ip: str, if_name: str, timeout: int = 8):
         ssh.connect(ip, username=username, password=password,
                     look_for_keys=False, allow_agent=False,
                     timeout=timeout, banner_timeout=timeout, auth_timeout=timeout)
-        _, stdout, _ = ssh.exec_command(f"show cellular {slot} all")
-        out = stdout.read().decode(errors="ignore")
-    except Exception as e:
-        raise RuntimeError(f"SSH error: {e}")
+
+        # Prefer commands that scope to *this* slot only.
+        candidates = [
+            f"show cellular {slot} hardware",
+            f"show cellular {slot} security sim",
+            f"show cellular {slot} sim info",
+            f"show cellular {slot} sim detail",
+            f"show cellular {slot} profile",
+            f"show cellular {slot} lte profile",
+            f"show cellular {slot} all",  # last resort
+        ]
+
+
+        combined = ""
+        for cmd in candidates:
+            try:
+                _stdin, stdout, _stderr = ssh.exec_command(cmd, timeout=timeout)
+                out = stdout.read().decode(errors="ignore")
+                combined += f"\n--- {cmd} ---\n{out}"
+            except Exception:
+                # keep going; some commands won’t exist on some platforms
+                pass
+
     finally:
         try: ssh.close()
         except: pass
 
-    imsi, imei, iccid = parse_ids_from_cellular_all(out)
-    return {"interface": if_name, "imsi": imsi, "imei": imei, "iccid": iccid}
+    # Parse only from the collected, slot-scoped text
+    imsi, imei, iccid = parse_ids_from_cellular_text(combined)
+    msisdn = _parse_msisdn(combined)
+    return {"interface": if_name, "imsi": imsi, "imei": imei, "iccid": iccid, "sim": msisdn}
+
 
 def fetch_all_cellular_details(ip: str, timeout: int = 8):
-    """
-    Return IMSI/IMEI/ICCID for ANY Cellular interface (even if IP is unassigned).
-    """
     infos = list_cellular_interfaces(ip, timeout=timeout)
     details = []
     for i in infos:
+        ids = {"interface": i["name"], "imsi": "", "imei": "", "iccid": "", "sim": ""}
         try:
-            ids = fetch_cellular_ids_for_interface(ip, i["name"], timeout=timeout)
+            fetched = fetch_cellular_ids_for_interface(ip, i["name"], timeout=timeout)
+            # Only set if non-empty (keeps per-slot independence)
+            if fetched.get("imsi"):  ids["imsi"]  = fetched["imsi"]
+            if fetched.get("imei"):  ids["imei"]  = fetched["imei"]
+            if fetched.get("iccid"): ids["iccid"] = fetched["iccid"]
+            if fetched.get("sim"):   ids["sim"]   = fetched["sim"]
         except Exception as e:
-            ids = {"interface": i["name"], "imsi": "", "imei": "", "iccid": f"ERROR: {e}"}
-        ids.update({"ip": i.get("ip", "")})
+            ids["iccid"] = f"ERROR: {e}"
+
+        ids.update({
+            "ip": i.get("ip", ""),
+            "status": i.get("status", ""),
+            "protocol": i.get("protocol", ""),
+        })
         details.append(ids)
     return details
 
@@ -908,31 +1365,6 @@ def get_all_sms(ip):
     _, stdout, _ = ssh.exec_command("cellular 0/0/0 lte sms view all")
     out = stdout.read().decode(); ssh.close()
     return out
-
-def on_cellular_detected(self, details):
-    self.overlaySpinner.stop(); self.overlay.hide()
-
-    count = len(details)
-    if count == 0:
-        QtWidgets.QMessageBox.information(self, "Cellular Detection",
-                                          "No Cellular interface found.")
-        return
-
-    first = details[0]
-    if hasattr(self, "imsiLineEdit"):
-        self.imsiLineEdit.setText(first.get("imsi", ""))
-    if hasattr(self, "imeiLineEdit"):
-        self.imeiLineEdit.setText(first.get("imei", ""))
-    if hasattr(self, "iccidLineEdit"):
-        self.iccidLineEdit.setText(first.get("iccid", ""))
-
-    lines = []
-    for d in details:
-        lines.append(f"{d['interface']}  IP {d.get('ip','')}\n  IMSI: {d['imsi']}\n  IMEI: {d['imei']}\n  ICCID: {d['iccid']}")
-    QtWidgets.QMessageBox.information(
-        self, "Cellular Detection",
-        f"Cellular interfaces: {count}\n\n" + "\n\n".join(lines)
-    )
 
 def parse_sms(raw_output):
     sms_blocks = raw_output.strip().split("--------------------------------------------------------------------------------")
@@ -1241,6 +1673,60 @@ class IPItem(QtWidgets.QTableWidgetItem):
                 return (999, 999, 999, 999)
         return ip_key(self.text()) < ip_key(other.text())
 
+class CellularPickerDialog(QtWidgets.QDialog):
+    """
+    Lets the user pick which Cellular interface to use when >1 are found.
+    Expects a list of dicts: {"interface","ip","imsi","imei","iccid"}.
+    """
+    def __init__(self, details, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select Cellular Interface")
+        self.setModal(True)
+        self._details = details
+        v = QVBoxLayout(self)
+
+        self.table = QtWidgets.QTableWidget(len(details), 5, self)
+        self.table.setHorizontalHeaderLabels(["Interface", "IP", "IMSI", "IMEI", "ICCID"])
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.verticalHeader().setVisible(False)
+
+        for r, d in enumerate(details):
+            self.table.setItem(r, 0, QtWidgets.QTableWidgetItem(d.get("interface","")))
+            self.table.setItem(r, 1, QtWidgets.QTableWidgetItem(d.get("ip","")))
+            self.table.setItem(r, 2, QtWidgets.QTableWidgetItem(d.get("imsi","")))
+            self.table.setItem(r, 3, QtWidgets.QTableWidgetItem(d.get("imei","")))
+            self.table.setItem(r, 4, QtWidgets.QTableWidgetItem(d.get("iccid","")))
+        self.table.resizeColumnsToContents()
+        v.addWidget(self.table)
+
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        v.addWidget(bb)
+
+        # Preselect best row: prefer interface with an IP address
+        best = 0
+        for idx, d in enumerate(details):
+            ip = (d.get("ip") or "").strip().lower()
+            if ip and ip != "unassigned":
+                best = idx
+                break
+        self.table.selectRow(best)
+
+    def selected_detail(self):
+        row = self.table.currentRow()
+        if row < 0:
+            return None
+        return {
+            "interface": self.table.item(row, 0).text() if self.table.item(row, 0) else "",
+            "ip":        self.table.item(row, 1).text() if self.table.item(row, 1) else "",
+            "imsi":      self.table.item(row, 2).text() if self.table.item(row, 2) else "",
+            "imei":      self.table.item(row, 3).text() if self.table.item(row, 3) else "",
+            "iccid":     self.table.item(row, 4).text() if self.table.item(row, 4) else "",
+        }
+
 # ---------- Device settings dialog ----------
 class DetectSignals(QObject):
     apnDetected = pyqtSignal(str)
@@ -1259,8 +1745,9 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
         self.detectSignals.apnDetected.connect(self.on_apn_detected)
         self.detectSignals.gatewayDetected.connect(self.on_gateway_detected)
         self.detectSignals.detectFailed.connect(self.on_apn_failed)
-        self.detectSignals.cellularDetected.connect(self._finish_cellular_detect)
+        self.detectSignals.cellularDetected.connect(self.on_cellular_detected)
         self.detectSignals.prefillDetected.connect(self._apply_cellular_ids_silent)
+
         self._prefill_started = False
 
         # overlay
@@ -1273,7 +1760,20 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
         self.overlaySpinner.setFixedSize(80, 80)
         self.overlaySpinner.setGeometry(self.overlay.width()//2-40, self.overlay.height()//2-40, 80, 80)
 
+        self.overlay.raise_() 
+
         self.gatewaySpinner = LoadingSpinner(self)
+
+        layout: QtWidgets.QVBoxLayout = self.layout()
+        
+        # --- Interface row (dropdown + status dot)
+        self.ifaceCombo = QtWidgets.QComboBox()
+        self.ifaceStatus = QtWidgets.QLabel("●")
+        self.ifaceStatus.setStyleSheet("QLabel { color:#9ca3af; font-size:14px; }")
+        iface_row_layout = QHBoxLayout()
+        iface_row_layout.addWidget(QtWidgets.QLabel("Interface"))
+        iface_row_layout.addWidget(self.ifaceCombo, 1)
+        iface_row_layout.addWidget(self.ifaceStatus)
 
         # Gateway row
         self.detectGatewayButton = QPushButton("Detect")
@@ -1289,18 +1789,29 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
         apn_row_layout.addWidget(self.detectApnButton)
 
         # Detect Cellular row
-        self.detectCellButton = QPushButton("Detect Cellular")
+        self.detectCellButton = QPushButton("Detect Cellular…")
         cell_row_layout = QHBoxLayout()
         cell_row_layout.addStretch(1)
         cell_row_layout.addWidget(self.detectCellButton)
+
+        # --- Interface row (dropdown + status dot)
+        self.ifaceCombo = QtWidgets.QComboBox()
+        self.ifaceCombo.setObjectName("ifaceCombo")
+        self.ifaceStatus = QtWidgets.QLabel("●")
+        self.ifaceStatus.setObjectName("ifaceStatus")
+        self.ifaceStatus.setStyleSheet("QLabel { color:#9ca3af; font-size:14px; }")  # gray by default
+        iface_row_layout = QHBoxLayout()
+        iface_row_layout.addWidget(QtWidgets.QLabel("Interface"))
+        iface_row_layout.addWidget(self.ifaceCombo, 1)
+        iface_row_layout.addWidget(self.ifaceStatus)
 
         # attach to main layout
         layout: QtWidgets.QVBoxLayout = self.layout()
         layout.insertLayout(2, getway_row_layout)
         layout.insertLayout(3, apn_row_layout)
         layout.insertLayout(4, cell_row_layout)
+        layout.insertLayout(5, iface_row_layout)   # now safe
 
-        # ensure IMSI/IMEI/ICCID fields exist
         self._ensure_id_fields(layout)
 
         # clicks
@@ -1309,6 +1820,25 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
         self.detectCellButton.clicked.connect(self.handle_detect_cellular)
 
         self.device = device
+        if device and device.get("id"):
+            saved = get_device_cellular(device["id"])
+            # map to the structure used by the combo
+            details = []
+            for r in saved:
+                details.append({
+                    "interface": r["interface"],
+                    "ip": r["ip_addr"] or "",
+                    "status": r["status"] or "",
+                    "protocol": r["protocol"] or "",
+                    "imsi": r["imsi"] or "",
+                    "imei": r["imei"] or "",
+                    "iccid": r["iccid"] or "",
+                    "apn": r["apn"] or "",
+                    "sim": r.get("sim","") or "",      # ← include SIM
+                })
+            if details:
+                self._set_interface_list(details, select_best=True)
+
         if device:
             self.nameLineEdit.setText(device["name"])
             self.ipLineEdit.setText(device["ip"])
@@ -1325,7 +1855,64 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
         self.saveButton.clicked.connect(self.accept)
         self.cancelButton.clicked.connect(self.reject)
 
+        self.ifaceCombo.currentIndexChanged.connect(self._on_iface_changed)
+        self._cell_details = []   # holds the list we put in the combo
+        self.selected_interface = ""
+
+        self._busy_widgets = []
+        self._collect_busy_widgets()
         self.resizeEvent = self._resize_event_forward
+
+    def _collect_busy_widgets(self):
+        """Widgets to freeze during background detect work."""
+        w = []
+        for name in [
+            "nameLineEdit", "ipLineEdit", "gatewayLineEdit", "apnLineEdit",
+            "simLineEdit", "emailLineEdit",
+        ]:
+            if hasattr(self, name):
+                w.append(getattr(self, name))
+        # dynamic / created in code
+        w += [
+            self.detectGatewayButton, self.detectApnButton, self.detectCellButton,
+            self.ifaceCombo, getattr(self, "imsiLineEdit", None),
+            getattr(self, "imeiLineEdit", None), getattr(self, "iccidLineEdit", None),
+            getattr(self, "simDetectedLine", None),  # ← added
+            self.saveButton
+        ]
+        # filter Nones
+        self._busy_widgets = [x for x in w if x is not None]
+
+    def _on_sim_changed(self, txt: str):
+        """Keep the edited SIM in sync with the selected interface row and refresh label."""
+        iface = self.selected_interface or ""
+        if not iface or not self._cell_details:
+            return
+
+        for d in self._cell_details:
+            if d.get("interface", "") == iface:
+                d["sim"] = txt.strip()
+                break
+
+        # refresh the current combo-row text so it shows SIM live
+        idx = self.ifaceCombo.currentIndex()
+        if 0 <= idx < self.ifaceCombo.count():
+            self.ifaceCombo.setItemText(idx, self._format_iface_item(self._cell_details[idx]))
+
+    def _set_busy(self, on: bool):
+        """Show centered overlay spinner and disable inputs."""
+        # show overlay on top of the whole dialog
+        self.overlay.setGeometry(self.rect())
+        self.overlay.raise_()
+        self.overlay.setVisible(on)
+        if on:
+            self.overlaySpinner.start()
+        else:
+            self.overlaySpinner.stop()
+
+        # disable/enable fields (keep Cancel enabled so user can close)
+        for w in self._busy_widgets:
+            w.setEnabled(not on)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -1352,62 +1939,171 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
     def _apply_cellular_ids_silent(self, details):
         if not details:
             return
-        first = details[0]
-        if hasattr(self, "imsiLineEdit"):
-            self.imsiLineEdit.setText(first.get("imsi", ""))
-        if hasattr(self, "imeiLineEdit"):
-            self.imeiLineEdit.setText(first.get("imei", ""))
-        if hasattr(self, "iccidLineEdit"):
-            self.iccidLineEdit.setText(first.get("iccid", ""))
+        # we don’t merge anymore for UI; just show the current eligible set
+        self._set_interface_list(details, select_best=True)
+
+    def _format_iface_item(self, d: dict) -> str:
+        name = d.get("interface") or "Cellular?"
+        ip = (d.get("ip") or "").strip()
+        label_ip = ip if ip and ip.lower() != "unassigned" else "unassigned"
+        sim = (d.get("sim") or "").strip() or "—"
+        return f"{name} ({label_ip}) • SIM: {sim}"
+
+    def _update_iface_status(self, d: dict):
+        # consider protocol 'up' or status containing 'up' as link-up
+        protocol = (d.get("protocol") or "").lower()
+        status   = (d.get("status") or "").lower()
+        is_up = ("up" in protocol) or (status == "up")
+        color = "#10b981" if is_up else "#9ca3af"  # green or gray
+        text  = "● up" if is_up else "● down"
+        self.ifaceStatus.setText(text)
+        self.ifaceStatus.setStyleSheet(f"QLabel {{ color:{color}; font-size:14px; }}")
+
+    def _apply_detail_to_fields(self, d: dict):
+        if hasattr(self, "imsiLineEdit"):  self.imsiLineEdit.setText(d.get("imsi",""))
+        if hasattr(self, "imeiLineEdit"):  self.imeiLineEdit.setText(d.get("imei",""))
+        if hasattr(self, "iccidLineEdit"): self.iccidLineEdit.setText(d.get("iccid",""))
+        if hasattr(self, "simLineEdit"):
+            self.simLineEdit.blockSignals(True)
+            self.simLineEdit.setText(d.get("sim",""))
+            self.simLineEdit.blockSignals(False)
+        self._update_iface_status(d)
+        self.selected_interface = d.get("interface","")
+
+    def _set_interface_list(self, details: list, select_best=True):
+        eligible = [dict(d) for d in (details or []) if _is_qualified_cell_row(d)]
+        self._cell_details = eligible
+
+        self.ifaceCombo.blockSignals(True)
+        self.ifaceCombo.clear()
+
+        if not eligible:
+            self._update_iface_status({})  # will show gray "down"
+            self.ifaceCombo.blockSignals(False)
+            return
+
+        for d in eligible:
+            self.ifaceCombo.addItem(self._format_iface_item(d))
+        self.ifaceCombo.blockSignals(False)
+
+        idx = 0
+        if select_best:
+            try:
+                idx = max(range(len(eligible)), key=lambda i: _score_iface(eligible[i]))
+            except ValueError:
+                idx = 0
+        self.ifaceCombo.setCurrentIndex(idx)
+        self._apply_detail_to_fields(eligible[idx])
+
+    def _on_iface_changed(self, idx: int):
+        if idx < 0 or idx >= len(self._cell_details):
+            return
+        self._apply_detail_to_fields(self._cell_details[idx])
 
     # ---------- create IMSI/IMEI/ICCID rows ----------
     def _ensure_id_fields(self, main_vbox: QtWidgets.QVBoxLayout):
+        # Reuse or create the fields
         self.imsiLineEdit  = getattr(self, "imsiLineEdit",  None) or QtWidgets.QLineEdit()
         self.imeiLineEdit  = getattr(self, "imeiLineEdit",  None) or QtWidgets.QLineEdit()
         self.iccidLineEdit = getattr(self, "iccidLineEdit", None) or QtWidgets.QLineEdit()
+        self.simLineEdit   = getattr(self, "simLineEdit",   None) or QtWidgets.QLineEdit()
 
+        # IDs are detected and locked; SIM should be editable
         for w in (self.imsiLineEdit, self.imeiLineEdit, self.iccidLineEdit):
             w.setReadOnly(True)
             w.setPlaceholderText("— detected after clicking ‘Detect Cellular’ —")
 
+        self.simLineEdit.setReadOnly(False)
+        self.simLineEdit.setPlaceholderText("SIM Number")
+
+        # object names (handy if you style/test)
         self.imsiLineEdit.setObjectName("imsiLineEdit")
         self.imeiLineEdit.setObjectName("imeiLineEdit")
         self.iccidLineEdit.setObjectName("iccidLineEdit")
+        self.simLineEdit.setObjectName("simLineEdit")
 
+        # layout
         grid = QtWidgets.QGridLayout()
         grid.setVerticalSpacing(6)
         grid.setHorizontalSpacing(8)
         grid.addWidget(QtWidgets.QLabel("IMSI"),  0, 0); grid.addWidget(self.imsiLineEdit,  0, 1)
         grid.addWidget(QtWidgets.QLabel("IMEI"),  1, 0); grid.addWidget(self.imeiLineEdit,  1, 1)
         grid.addWidget(QtWidgets.QLabel("ICCID"), 2, 0); grid.addWidget(self.iccidLineEdit, 2, 1)
+        grid.addWidget(QtWidgets.QLabel("SIM"),   3, 0); grid.addWidget(self.simLineEdit,   3, 1)
 
-        main_vbox.insertLayout(5, grid)
+        main_vbox.insertLayout(6, grid)
+
+        # when SIM text changes, keep our in-memory detail list in sync
+        self.simLineEdit.textChanged.connect(self._on_sim_changed)
 
     def get_data(self):
-        def val(widget_name):
-            w = getattr(self, widget_name, None)
-            return w.text().strip() if w and hasattr(w, "text") else ""
+        # push the current SIM edit into the selected interface record
+        cur_sim = self.simLineEdit.text().strip() if hasattr(self, "simLineEdit") else ""
+        iface = self.selected_interface or ""
+        for d in self._cell_details:
+            if d.get("interface","") == iface:
+                d["sim"] = cur_sim
+
         return {
-            "name":   val("nameLineEdit"),
-            "ip":     val("ipLineEdit"),
-            "gateway":val("gatewayLineEdit"),
-            "sim":    val("simLineEdit"),
-            "apn":    val("apnLineEdit"),
-            "email":  val("emailLineEdit"),
+            "name": self.nameLineEdit.text().strip(),
+            "ip": self.ipLineEdit.text().strip(),
+            "gateway": self.gatewayLineEdit.text().strip(),
+            "sim": cur_sim,                         # kept for convenience; no longer stored in devices
+            "apn": self.apnLineEdit.text().strip(),
+            "imsi": self.imsiLineEdit.text().strip(),
+            "imei": self.imeiLineEdit.text().strip(),
+            "iccid": self.iccidLineEdit.text().strip(),
+            "email": self.emailLineEdit.text().strip(),
+            "cellular_details": list(self._cell_details),  # includes edited SIM
+            "selected_interface": self.selected_interface or "",
         }
 
     @pyqtSlot(list)
-    def _finish_cellular_detect(self, details):
+    def on_cellular_detected(self, details):
+        self.overlaySpinner.stop(); self.overlay.hide(); self._set_busy(False)
+
+        # UI: only eligible will be shown
+        self._set_interface_list(details, select_best=True)
+        shown = list(self._cell_details)
+
+        best = {}
         try:
-            on_cellular_detected(self, details)
-        finally:
-            self.overlaySpinner.stop()
-            self.overlay.hide()
+            if shown:
+                best = max(shown, key=_score_iface)
+        except ValueError:
+            best = shown[0] if shown else {}
+
+        if best:
+            self._apply_detail_to_fields(best)
+
+        # persist: purge then insert only what we show
+        try:
+            if self.device and self.device.get("id"):
+                apn = self.apnLineEdit.text().strip()
+                to_save = []
+                for d in shown:
+                    dd = dict(d)
+                    if apn and not dd.get("apn"):
+                        dd["apn"] = apn
+                    to_save.append(dd)
+                replace_device_cellular(self.device["id"], to_save)
+                update_device_primary_cellular(self.device["id"], best or {}, apn)
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Warning", f"Saved UI, but failed to store cellular rows:\n{e}")
+
+        QtWidgets.QMessageBox.information(
+            self, "Cellular",
+            f"Saved {len(shown)} interface(s) that meet the criteria."
+            + (f"\nPrimary: {best.get('interface','?')} ({best.get('ip','')})." if best else "\nNo eligible interface.")
+        )
 
     def _resize_event_forward(self, event):
         super().resizeEvent(event)
-        self.overlay.setGeometry(self.rect())
-        self.overlaySpinner.setGeometry(self.overlay.width()//2-40, self.overlay.height()//2-40, 80, 80)
+        if hasattr(self, "overlay") and hasattr(self, "overlaySpinner"):
+            self.overlay.setGeometry(self.rect())
+            self.overlay.raise_()
+            self.overlaySpinner.setGeometry(self.overlay.width()//2-40,
+                                            self.overlay.height()//2-40, 80, 80)
 
     # -------------- Detect actions --------------
     def handle_detect_cellular(self):
@@ -1415,7 +2111,8 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
         if not ip:
             QtWidgets.QMessageBox.warning(self, "Missing IP", "Please enter the router IP first.")
             return
-        self.overlay.show(); self.overlaySpinner.start()
+
+        self._set_busy(True)  # show overlay + disable fields
 
         def run():
             try:
@@ -1433,7 +2130,7 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
             return
 
         self.overlay.show(); self.overlaySpinner.start()
-
+        self._set_busy(True)     
         def run():
             ssh = None
             try:
@@ -1497,16 +2194,19 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
 
     def on_apn_detected(self, apn):
         self.apnLineEdit.setText(apn)
+        self._set_busy(False) 
         self.overlaySpinner.stop(); self.overlay.hide()
         QtWidgets.QMessageBox.information(self, "APN Detected", f"Detected APN: {apn}")
 
     def on_gateway_detected(self, gateway):
         self.gatewayLineEdit.setText(gateway)
+        self._set_busy(False)   
         self.overlaySpinner.stop(); self.overlay.hide()
         QtWidgets.QMessageBox.information(self, "Gateway Detected", f"Detected Gateway: {gateway}")
 
     def on_apn_failed(self, message):
         self.overlaySpinner.stop(); self.overlay.hide()
+        self._set_busy(False)
         QtWidgets.QMessageBox.warning(self, "Detection Failed", message)
 
     def handle_detect_gateway(self):
@@ -1515,7 +2215,7 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(self, "Missing IP", "Please enter the router IP first.")
             return
         self.overlay.show(); self.overlaySpinner.start()
-
+        self._set_busy(True)
         def run():
             try:
                 username, password = get_ssh_credentials()
@@ -1549,6 +2249,9 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         self.smsInboxTable = self.tabSms.findChild(QtWidgets.QTableWidget, "smsTable")
         # Live Capture tab
         self.smsCaptureTable = self.tabCapture.findChild(QtWidgets.QTableWidget, "smsTable")
+        # Build device table quickly
+        self._setup_tunnels_tab()          # <— create the tab widgets (not inserted yet)
+
 
         # Toolbar
         toolbar = self.addToolBar("Filter & Sort"); toolbar.setMovable(False)
@@ -1635,6 +2338,7 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
 
         # Build device table quickly
         self.load_devices(self.devices)
+        self._ensure_tunnels_tab_visibility()
 
         # Start inbox fill on BG thread
         self.fetch_all_devices()
@@ -1646,6 +2350,469 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         self.timer.start(5 * 60 * 1000)
 
     _autohub_checked = set()
+
+
+        # ---------- Tunnel List tab (shown only if we have hubs) ----------
+    def _setup_tunnels_tab(self):
+        """Create (but do not insert) the 'Tunnel list' tab widgets."""
+        self._tunnels_tab_inserted = False
+        self._tunnel_hub_map = {}   # combobox text -> device dict
+
+        self.tabTunnels = QWidget()
+        lay = QVBoxLayout(self.tabTunnels)
+
+        # top bar: hub picker + refresh
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Hub:"))
+        self.tunnelHubPicker = QComboBox()
+        top.addWidget(self.tunnelHubPicker, 1)
+        self.tunnelRefreshBtn = QPushButton("Refresh")
+        top.addWidget(self.tunnelRefreshBtn)
+        top.addStretch(1)
+        lay.addLayout(top)
+
+        # DMVPN/NHRP table
+        lay.addWidget(QLabel("DMVPN / NHRP"))
+        self.dmvpnTable = QTableWidget(0, 5)
+        self.dmvpnTable.setHorizontalHeaderLabels(["Tunnel", "Peer (NHRP)", "NBMA", "State", "Uptime/Notes"])
+        self.dmvpnTable.horizontalHeader().setStretchLastSection(True)
+        lay.addWidget(self.dmvpnTable)
+
+        # EIGRP neighbors table (often runs over the tunnels)
+        lay.addWidget(QLabel("EIGRP Neighbors"))
+        self.eigrpTable = QTableWidget(0, 7)
+        self.eigrpTable.setHorizontalHeaderLabels(["Address", "Interface", "Hold (sec)", "Uptime",
+                                                   "SRTT (ms)", "RTO", "Seq#"])
+        self.eigrpTable.horizontalHeader().setStretchLastSection(True)
+        lay.addWidget(self.eigrpTable)
+
+        self.tunnelRefreshBtn.clicked.connect(self.refresh_tunnels_now)
+        self.tunnelHubPicker.currentIndexChanged.connect(self.refresh_tunnels_now)
+
+    def _ensure_tunnels_tab_visibility(self):
+        """Insert/Remove the 'Tunnel list' tab based on hub presence."""
+        # find the QTabWidget that contains the existing tabs
+        if not hasattr(self, "_mainTabWidget"):
+            self._mainTabWidget = self.findChild(QTabWidget)
+            if not self._mainTabWidget:
+                return  # nothing to do if the UI has no tab widget
+
+        hubs = [d for d in self.devices if d.get("is_hub")]
+        if not hubs:
+            # remove tab if inserted
+            if getattr(self, "_tunnels_tab_inserted", False):
+                idx = self._mainTabWidget.indexOf(self.tabTunnels)
+                if idx >= 0:
+                    self._mainTabWidget.removeTab(idx)
+                self._tunnels_tab_inserted = False
+            return
+
+        # we have hubs → ensure the tab exists
+        if not getattr(self, "_tunnels_tab_inserted", False):
+            # place it right after "Live SMS Capture"
+            after_idx = self._mainTabWidget.indexOf(self.tabCapture)
+            insert_at = (after_idx + 1) if after_idx >= 0 else self._mainTabWidget.count()
+            self._mainTabWidget.insertTab(insert_at, self.tabTunnels, "Tunnel list")
+            self._tunnels_tab_inserted = True
+
+        # populate hub picker
+        self._tunnel_hub_map.clear()
+        self.tunnelHubPicker.blockSignals(True)
+        self.tunnelHubPicker.clear()
+        for d in hubs:
+            label = f"{d.get('name','Hub')} ({d.get('ip','?')})"
+            self._tunnel_hub_map[label] = d
+            self.tunnelHubPicker.addItem(label)
+        self.tunnelHubPicker.blockSignals(False)
+
+        # auto refresh on first show
+        self.refresh_tunnels_now()
+
+    def _run_cmd_new_session(self, transport: paramiko.Transport, cmd: str, *, prompt=b'#', timeout=12) -> str:
+        """
+        Open a NEW session channel on the existing SSH transport, send
+        'terminal length 0' + the command, read until the device prompt,
+        then close the session channel. Returns the captured output.
+        """
+        chan = transport.open_session(timeout=timeout)
+        try:
+            chan.get_pty(term='vt100', width=200, height=50)
+            chan.invoke_shell()
+
+            # small settle + drain any banner
+            time.sleep(0.2)
+            try:
+                while chan.recv_ready():
+                    _ = chan.recv(65535)
+            except Exception:
+                pass
+
+            def send(line: str):
+                chan.send(line + '\n')
+
+            # (optional) try enable (no password) — safe to ignore if not needed
+            try:
+                send('enable'); time.sleep(0.1)
+                while chan.recv_ready():
+                    _ = chan.recv(65535)
+            except Exception:
+                pass
+
+            # disable paging, then run command
+            send('terminal length 0')
+            send(cmd)
+
+            buf = bytearray()
+            chan.settimeout(timeout)
+            more_pat = re.compile(br'--More--|\(q\)uit', re.I)
+
+            last = time.time()
+            while True:
+                if chan.recv_ready():
+                    data = chan.recv(65535)
+                    if not data:
+                        break
+                    buf.extend(data)
+                    last = time.time()
+
+                    tail = bytes(buf[-256:])
+                    if more_pat.search(tail):
+                        chan.send(' ')
+                        continue
+
+                    tail_stripped = tail.rstrip()
+                    if tail_stripped.endswith(prompt) or b'\n' + prompt in tail_stripped:
+                        break
+                else:
+                    if time.time() - last > timeout:
+                        break
+                    time.sleep(0.05)
+
+            # cleanup echoes & prompt
+            out = buf.decode(errors='ignore')
+            cleaned = []
+            for ln in out.splitlines():
+                s = ln.strip()
+                if s.startswith('terminal length 0') or s.startswith(cmd):
+                    continue
+                if (s.endswith(prompt.decode(errors='ignore')) and ' ' not in s and len(s) <= 80):
+                    continue
+                cleaned.append(ln)
+            return '\n'.join(cleaned).strip()
+        finally:
+            try:
+                chan.close()
+            except Exception:
+                pass
+
+    def _get_selected_hub(self):
+        label = self.tunnelHubPicker.currentText().strip()
+        return self._tunnel_hub_map.get(label)
+
+    def refresh_tunnels_now(self):
+        """Run SSH to the selected hub and fill both tables."""
+        hub = self._get_selected_hub()
+        if not hub:
+            # clear tables
+            self._fill_dmvpn_table([])
+            self._fill_eigrp_table([])
+            return
+
+        ip = hub.get("ip")
+        if not is_device_online(ip):
+            QtWidgets.QMessageBox.warning(self, "Hub offline", f"{hub.get('name','Hub')} ({ip}) is not reachable.")
+            self._fill_dmvpn_table([]); self._fill_eigrp_table([]); return
+
+        username, password = get_ssh_credentials()
+        if not username or not password:
+            QtWidgets.QMessageBox.warning(self, "SSH", "SSH credentials are not set.")
+            return
+
+        def work():
+            try:
+                outs = {"nhrp": "", "dmvpn": "", "eigrp": ""}
+
+                # single SSH session; reuse its transport for each command
+                ssh = paramiko.SSHClient()
+                ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                ssh.connect(
+                    ip,
+                    username=username,
+                    password=password,
+                    look_for_keys=False,
+                    allow_agent=False,
+                    timeout=15,
+                    banner_timeout=15,
+                    auth_timeout=15,
+                )
+
+                # small settle
+                time.sleep(0.2)
+
+                t = ssh.get_transport()
+                if not t or not t.is_active():
+                    raise RuntimeError("SSH transport not active after connect")
+
+                outs["nhrp"]  = self._run_cmd_new_session(t, "show ip nhrp", prompt=b'#', timeout=12)
+                outs["dmvpn"] = self._run_cmd_new_session(t, "show dmvpn", prompt=b'#', timeout=12)
+                outs["eigrp"] = self._run_cmd_new_session(t, "show ip eigrp neighbors", prompt=b'#', timeout=12)
+
+                try:
+                    ssh.close()
+                except Exception:
+                    pass
+
+                dmvpn_rows = self._parse_nhrp_or_dmvpn(outs.get("nhrp",""), outs.get("dmvpn",""))
+                eigrp_rows = self._parse_eigrp_neighbors(outs.get("eigrp",""))
+
+                if not dmvpn_rows and not eigrp_rows:
+                    print("[TunnelTab] No rows parsed. Raw samples follow:")
+                    print("--- show ip nhrp ---\n", outs.get("nhrp",""))
+                    print("--- show dmvpn ---\n", outs.get("dmvpn",""))
+                    print("--- show ip eigrp neighbors ---\n", outs.get("eigrp",""))
+
+                QtCore.QTimer.singleShot(0, lambda: self._fill_dmvpn_table(dmvpn_rows))
+                QtCore.QTimer.singleShot(0, lambda: self._fill_eigrp_table(eigrp_rows))
+
+            except Exception as e:
+                QtCore.QTimer.singleShot(0, lambda:
+                    QtWidgets.QMessageBox.critical(self, "Tunnel refresh failed", str(e))
+                )
+                QtCore.QTimer.singleShot(0, lambda: (self._fill_dmvpn_table([]), self._fill_eigrp_table([])))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _parse_eigrp_neighbors(self, text: str):
+        """
+        Robust parser for 'show ip eigrp neighbors' classic table.
+        Expected columns (tokens): H, Address, Interface, Hold, Uptime, SRTT, RTO, Q, Cnt, Seq, Num
+        Uptime can be 'hh:mm:ss', '3d11h', '1w1d', etc. We treat it as one token.
+        """
+        rows = []
+        for line in text.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            if "EIGRP-IPv4" in s or s.startswith("H ") or s.startswith("Address"):
+                continue
+            # must start with an index and contain an IPv4 address
+            if not re.match(r"^\d+\s+\d+\.\d+\.\d+\.\d+\s+", s):
+                continue
+
+            toks = re.split(r"\s+", s)
+            # We expect at least 11 tokens: H, Address, Iface, Hold, Uptime, SRTT, RTO, Q, Cnt, Seq, Num
+            if len(toks) < 11:
+                # Some platforms join Q/Cnt or Seq/Num, try to pad gracefully
+                # safest fallback: skip
+                continue
+
+            try:
+                # index 0: H (ignore)
+                addr   = toks[1]
+                iface  = toks[2]
+                hold   = toks[3]
+                uptime = toks[4]
+                srtt   = toks[5]
+                rto    = toks[6]
+                # toks[7] = Q, toks[8] = Cnt
+                seq    = toks[9]  # "Seq"
+                num    = toks[10] # "Num"
+            except Exception:
+                continue
+
+            rows.append({
+                "addr": addr,
+                "iface": iface,
+                "hold": hold,
+                "uptime": uptime,
+                "srtt": srtt,
+                "rto": rto,
+                "seq": f"{seq} {num}".strip()
+            })
+        return rows
+
+
+    def _parse_nhrp_or_dmvpn(self, nhrp_text: str, dmvpn_text: str):
+        """
+        Prefer 'show ip nhrp'. Supports multi-line NHRP blocks like your sample:
+        172.16.1.200/32 via 172.16.1.200
+            Tunnel1 created 20:12:04, expire 00:05:15
+            Type: dynamic, Flags: unique registered used nhop
+            NBMA address: 192.168.255.200
+        Falls back to 'show dmvpn' if NHRP yields nothing.
+        Returns: list of dicts -> {tunnel, peer, nbma, state, note}
+        """
+        IP = r"(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}"
+        rows, cur = [], {}
+
+        # ---- NHRP block parser ----
+        for line in (nhrp_text or "").splitlines():
+            ln = line.rstrip()
+
+            # Start of peer block: "<IP>/32 via <IP>"
+            m1 = re.match(rf"^\s*({IP})/\d+\s+via\s+({IP})\s*$", ln)
+            if m1:
+                if cur:
+                    rows.append(cur)
+                cur = {"peer": m1.group(1), "via": m1.group(2)}  # 'via' not shown but kept
+                continue
+
+            # "Tunnel1 created 20:12:04, expire ..."
+            m2 = re.match(r"^\s*Tunnel(\d+)\s+created\s+([^,]+),", ln, re.I)
+            if m2 and cur is not None:
+                cur["tunnel"] = f"Tunnel{m2.group(1)}"
+                cur["note"] = f"created {m2.group(2).strip()}"
+                continue
+
+            # "Type: dynamic, Flags: registered nhop" (we'll show Flags as State)
+            m3 = re.match(r"^\s*Type:\s*\S+,\s*Flags:\s*(.+?)\s*$", ln, re.I)
+            if m3 and cur is not None:
+                cur["state"] = m3.group(1).strip()
+                continue
+
+            # "NBMA address: 192.168.255.200"
+            m4 = re.match(rf"^\s*NBMA address:\s*({IP})\s*$", ln, re.I)
+            if m4 and cur is not None:
+                cur["nbma"] = m4.group(1)
+                continue
+
+        if cur:
+            rows.append(cur)
+
+        # Normalize / fill
+        for r in rows:
+            r.setdefault("tunnel", "Tunnel?")
+            r.setdefault("state", "")
+            r.setdefault("note", "")
+            r["nbma"] = r.get("nbma", "")
+
+        if rows:
+            return rows
+
+        # ---- Fallback: very loose 'show dmvpn' parsing ----
+        cur_tun = None
+        for line in (dmvpn_text or "").splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            m_hdr = re.search(r"\bInterface:\s*(Tunnel\S+)", s, re.I)
+            if m_hdr:
+                cur_tun = m_hdr.group(1)
+                continue
+            m = re.search(rf"(?P<nbma>{IP}).*?\b(?P<st>Up|Down)\b", s, re.I)
+            if m:
+                rows.append({
+                    "tunnel": cur_tun or "Tunnel?",
+                    "peer":   m.group("nbma"),
+                    "nbma":   m.group("nbma"),
+                    "state":  m.group("st").lower(),
+                    "note":   ""
+                })
+        return rows
+
+    _IP = r"(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}"
+
+    def parse_ip_nhrp(text: str):
+        """
+        Parses blocks like:
+        172.16.1.200/32 via 172.16.1.200
+            Tunnel1 created 20:12:04, expire 00:05:15
+            Type: dynamic, Flags: unique registered used nhop
+            NBMA address: 192.168.255.200
+        Returns list of dicts: tunnel, peer, nbma, state, uptime
+        """
+        rows, cur = [], {}
+        for line in (text or "").splitlines():
+            line = line.rstrip()
+
+            m1 = re.match(rf"^\s*({_IP})/\d+\s+via\s+({_IP})\s*$", line)
+            if m1:
+                # start a new peer block
+                if cur:
+                    rows.append(cur)
+                peer = m1.group(1)
+                cur = {"peer": peer, "via": m1.group(2)}
+                continue
+
+            m2 = re.match(r"^\s*Tunnel(\d+)\s+created\s+([^,]+),", line, re.I)
+            if m2:
+                cur["tunnel"] = f"Tunnel{m2.group(1)}"
+                cur["uptime"] = m2.group(2).strip()
+                continue
+
+            m3 = re.match(r"^\s*Type:\s*\S+,\s*Flags:\s*(.+?)\s*$", line, re.I)
+            if m3:
+                # use Flags as our 'state' column text
+                cur["state"] = m3.group(1).strip()
+                continue
+
+            m4 = re.match(rf"^\s*NBMA address:\s*({_IP})\s*$", line, re.I)
+            if m4:
+                cur["nbma"] = m4.group(1)
+                continue
+
+        if cur:
+            rows.append(cur)
+
+        # Normalize / fill
+        for r in rows:
+            r.setdefault("tunnel", "Tunnel?")
+            r.setdefault("state", "")
+            r.setdefault("uptime", "")
+            r["nbma"] = r.get("nbma", "")
+        return rows
+
+
+    def parse_eigrp_neighbors(text: str):
+        """
+        Parses 'show ip eigrp neighbors' table (IOS classic style).
+        Returns list of dicts with: address, iface, hold, uptime, srtt, rto, qcnt, seq
+        """
+        rows = []
+        for line in (text or "").splitlines():
+            # skip headers/blank
+            if not line.strip() or "Neighbors for AS" in line or line.lstrip().startswith(("H ", "Address", "(")):
+                continue
+            # Example:
+            # 7   172.16.1.206            Tu1       12 00:27:00   42  1512  0  1446
+            m = re.match(
+                rf"^\s*\d+\s+({_IP})\s+(\S+)\s+(\d+)\s+([\w:]+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*$",
+                line
+            )
+            if m:
+                addr, iface, hold, uptime, srtt, rto, qcnt, seq = m.groups()
+                # normalize Tu1 -> Tunnel1
+                if iface.lower().startswith("tu"):
+                    digits = re.sub(r"\D", "", iface)
+                    iface = f"Tunnel{digits}" if digits else iface
+                rows.append({
+                    "address": addr, "iface": iface, "hold": hold, "uptime": uptime,
+                    "srtt": srtt, "rto": rto, "qcnt": qcnt, "seq": seq
+                })
+        return rows
+
+
+    def _fill_dmvpn_table(self, rows):
+        self.dmvpnTable.setRowCount(len(rows))
+        for r, d in enumerate(rows):
+            self.dmvpnTable.setItem(r, 0, QTableWidgetItem(d.get("tunnel","")))
+            self.dmvpnTable.setItem(r, 1, QTableWidgetItem(d.get("peer","")))
+            self.dmvpnTable.setItem(r, 2, QTableWidgetItem(d.get("nbma","")))
+            self.dmvpnTable.setItem(r, 3, QTableWidgetItem(d.get("state","")))
+            self.dmvpnTable.setItem(r, 4, QTableWidgetItem(d.get("note","")))
+        self.dmvpnTable.resizeColumnsToContents()
+
+    def _fill_eigrp_table(self, rows):
+        self.eigrpTable.setRowCount(len(rows))
+        for r, d in enumerate(rows):
+            self.eigrpTable.setItem(r, 0, QTableWidgetItem(d.get("addr","")))
+            self.eigrpTable.setItem(r, 1, QTableWidgetItem(d.get("iface","")))
+            self.eigrpTable.setItem(r, 2, QTableWidgetItem(str(d.get("hold",""))))
+            self.eigrpTable.setItem(r, 3, QTableWidgetItem(d.get("uptime","")))
+            self.eigrpTable.setItem(r, 4, QTableWidgetItem(str(d.get("srtt",""))))
+            self.eigrpTable.setItem(r, 5, QTableWidgetItem(str(d.get("rto",""))))
+            self.eigrpTable.setItem(r, 6, QTableWidgetItem(str(d.get("seq",""))))
+        self.eigrpTable.resizeColumnsToContents()
 
     def _auto_detect_and_flag_hub(self, row_index: int, dev: dict):
         ip = dev.get("ip")
@@ -1676,11 +2843,25 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         if dialog.exec_() == QtWidgets.QDialog.Accepted:
             updated_data = dialog.get_data()
             updated_data["ip"] = device["ip"]
+            updated_data["id"] = device["id"]      # <— add this
             update_device_in_db(updated_data)
             self.refresh_devices_from_db()
             QtWidgets.QMessageBox.information(self, "Success", "Device updated successfully.")
 
     # Inside class CiscoSMSMonitorApp
+
+    def register_device_by_id(self, dev_id: int):
+        idx = next((i for i, dv in enumerate(self.devices) if dv.get("id") == dev_id), None)
+        if idx is None:
+            QtWidgets.QMessageBox.warning(self, "Not found", "Device row not found.")
+            return
+        self.device_register(idx)
+        try:
+            ip = self.devices[idx]["ip"]
+            _REGISTER_CACHE.pop(ip, None)  # flip status quickly
+        except Exception:
+            pass
+        self.refresh_devices_from_db()
 
     def add_device(self):
         """Open the Add Device dialog, insert to DB, and refresh UI."""
@@ -1925,6 +3106,9 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         ssh.close()
         self.devices = load_devices_from_db()
         self.load_devices(self.devices)
+        QtWidgets.QMessageBox.information(self, "Registered",
+            f"Syslog host set on {self.devices[index]['name']} ({self.devices[index]['ip']}).")
+
 
     # ---------- Table build ----------
     def load_devices(self, device_list):
@@ -1971,6 +3155,12 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             action_button.setPopupMode(QToolButton.MenuButtonPopup)
             menu = QMenu(action_button)
 
+            # Show "Register" only when device is online, has cellular, and is Not Register
+            need_register = (
+                d.get("has_cellular", False)
+                and d.get("status") == "Not Register"
+            )
+
             detect_hub_action = QAction("Detect hub now", self)
             menu.addAction(detect_hub_action); menu.addSeparator()
 
@@ -2006,6 +3196,13 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             sms_logs_action.triggered.connect(lambda _, id=dev_id: self.show_sms_log_dialog_by_id(id))
             send_sms_action.triggered.connect(lambda _, id=dev_id: self.show_send_sms_dialog_by_id(id))
             delete_action.triggered.connect(lambda _, id=dev_id: self.delete_device_by_id(id))
+
+            if need_register:
+                register_action = QAction(QIcon(resource_path("icons/plug.png")), "Register (set logging host)", self)
+                register_action.setStatusTip("Configure this router to send syslog to this app")
+                register_action.triggered.connect(lambda _, id=dev_id: self.register_device_by_id(id))
+                menu.addAction(register_action)
+                menu.addSeparator()
 
             def on_toggle_hub(id=dev_id):
                 try:
