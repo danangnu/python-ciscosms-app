@@ -1,0 +1,104 @@
+[2025-10-08T16:19:03] Refresh for ABB01 (192.168.18.43)
+ALLOW_SSH_HUB_DETECT=True
+Allow-list: ['192.168.18.43']
+is_device_online=True
+Connecting with ssh_connect_resilient() …
+SSH transport active.
+Running 11 commands in a single shell session…
+
+Used NHRP cmd:  show ip nhrp
+Used DMVPN cmd: show dmvpn
+Used EIGRP cmd: show ip eigrp neighbors
+
+=== SHOW IP NHRP ===
+172.16.1.200/32 via 172.16.1.200
+   Tunnel1 created 1d19h, expire 00:06:23
+   Type: dynamic, Flags: registered nhop 
+   NBMA address: 192.168.255.200 
+172.16.1.201/32 via 172.16.1.201
+   Tunnel1 created 1d19h, expire 00:05:14
+   Type: dynamic, Flags: registered nhop 
+   NBMA address: 192.168.255.201 
+172.16.1.202/32 via 172.16.1.202
+   Tunnel1 created 1d19h, expire 00:06:13
+   Type: dynamic, Flags: registered nhop 
+   NBMA address: 10.56.205.108 
+172.16.1.203/32 via 172.16.1.203
+   Tunnel1 created 1d19h, expire 00:05:02
+   Type: dynamic, Flags: registered nhop 
+   NBMA address: 192.168.255.203 
+172.16.1.204/32 via 172.16.1.204
+   Tunnel1 created 05:01:47, expire 00:06:43
+   Type: dynamic, Flags: registered nhop 
+   NBMA address: 192.168.255.204 
+172.16.1.205/32 via 172.16.1.205
+   Tunnel1 created 3d00h, expire 00:06:31
+   Type: dynamic, Flags: registered nhop 
+   NBMA address: 192.168.255.205 
+172.16.1.206/32 via 172.16.1.206
+   Tunnel1 created 05:04:41, expire 00:05:15
+   Type: dynamic, Flags: registered nhop 
+   NBMA address: 192.168.255.206 
+172.16.1.209/32 via 172.16.1.209
+   Tunnel1 created 3d00h, expire 00:06:57
+   Type: dynamic, Flags: registered nhop 
+   NBMA address: 192.168.255.209 
+172.16.1.210/32 via 172.16.1.210
+   Tunnel1 created 1w2d, expire 00:05:34
+   Type: dynamic, Flags: unique registered nhop 
+   NBMA address: 10.47.214.96 
+172.16.1.230/32 via 172.16.1.230
+   Tunnel1 created 5d00h, expire 00:07:29
+   Type: dynamic, Flags: unique registered used nhop 
+   NBMA address: 192.168.1.5 
+172.16.1.231/32 via 172.16.1.231
+   Tunnel1 created 15:48:39, expire 00:05:49
+   Type: dynamic, Flags: unique registered nhop 
+   NBMA address: 10.1.1.2 
+172.16.1.232/32 via 172.16.1.232
+   Tunnel1 created 06:15:15, expire 00:06:13
+   Type: dynamic, Flags: unique registered nhop 
+   NBMA address: 192.168.0.102
+
+=== SHOW DMVPN ===
+Legend: Attrb --> S - Static, D - Dynamic, I - Incomplete
+	N - NATed, L - Local, X - No Socket
+	T1 - Route Installed, T2 - Nexthop-override
+	C - CTS Capable, I2 - Temporary
+	# Ent --> Number of NHRP entries with same NBMA peer
+	NHS Status: E --> Expecting Replies, R --> Responding, W --> Waiting
+	UpDn Time --> Up or Down Time for a Tunnel
+==========================================================================
+Interface: Tunnel1, IPv4 NHRP Details 
+Type:Hub, NHRP Peers:12, 
+ # Ent  Peer NBMA Addr Peer Tunnel Add State  UpDn Tm Attrb
+ ----- --------------- --------------- ----- -------- -----
+     1 192.168.255.200    172.16.1.200    UP    1d19h     D
+     1 192.168.255.201    172.16.1.201    UP    1d19h     D
+     1 10.56.205.108      172.16.1.202    UP    1d19h     D
+     1 192.168.255.203    172.16.1.203    UP    1d19h     D
+     1 192.168.255.204    172.16.1.204    UP 05:01:16     D
+     1 192.168.255.205    172.16.1.205    UP    3d00h     D
+     1 192.168.255.206    172.16.1.206    UP 05:03:38     D
+     1 192.168.255.209    172.16.1.209    UP    3d00h     D
+     1 10.47.214.96       172.16.1.210    UP     1w2d     D
+     1 192.168.1.5        172.16.1.230    UP    5d00h     D
+     1 10.1.1.2           172.16.1.231    UP 15:48:40     D
+     1 192.168.0.102      172.16.1.232    UP 06:15:16     D
+
+=== SHOW IP EIGRP NEIGHBORS ===
+EIGRP-IPv4 Neighbors for AS(10)
+H   Address                 Interface              Hold Uptime   SRTT   RTO  Q  Seq
+                                                   (sec)         (ms)       Cnt Num
+0   172.16.1.232            Tu1                      11 04:30:02   88  1632  0  1523
+7   172.16.1.204            Tu1                      11 05:01:12   54  1632  0  63
+5   172.16.1.206            Tu1                      10 05:03:36   48  1632  0  1646
+8   172.16.1.231            Tu1                      14 1d05h      48  1632  0  1398
+2   172.16.1.209            Tu1                      10 1d05h      37  1632  0  1050
+11  172.16.1.202            Tu1                      14 1d19h      31  1632  0  689
+10  172.16.1.201            Tu1                      14 1d19h      32  1632  0  690
+9   172.16.1.203            Tu1                      13 1d19h      35  1632  0  464
+3   172.16.1.200            Tu1                      13 1d19h      30  1632  0  693
+1   172.16.1.205            Tu1                      13 3d00h      32  1632  0  1054
+4   172.16.1.230            Tu1                      12 4d11h      86  1632  0  1166
+6   172.16.1.210            Tu1                      28 1w2d       61  1632  0  1679
