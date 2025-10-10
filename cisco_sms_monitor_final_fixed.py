@@ -13,6 +13,7 @@ from datetime import datetime
 from PyQt5 import QtWidgets, uic, QtCore
 from sms_log_dialog import SMSLogDialog
 from PyQt5.QtGui import QMovie, QIcon
+from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import Qt, QSize, QTimer, QObject, pyqtSignal, pyqtSlot
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QPushButton, QHBoxLayout, QLabel,
@@ -112,6 +113,39 @@ def _make_cell_spinner(parent) -> QLabel:
     lbl.movie = mv
     mv.start()
     return lbl
+
+def _find_first_attr(self, names):
+        for n in names:
+            if hasattr(self, n) and getattr(self, n) is not None:
+                return getattr(self, n)
+        return None
+
+def _get_table_widget(self, kind: str):
+        """
+        Returns (widget, mode) where:
+        mode == "widget" -> QTableWidget
+        mode == "view"   -> QTableView (we'll attach/replace a QStandardItemModel)
+        'kind' is "dmvpn" or "eigrp".
+        """
+        name_sets = {
+            "dmvpn": ["dmvpnTable", "dmvpnTbl", "tblDmvpn", "dmvpn", "tableDMVPN", "tableNhrp"],
+            "eigrp": ["eigrpTable", "eigrpTbl", "tblEigrp", "eigrp", "tableEigrp"]
+        }
+        w = _find_first_attr(self, name_sets.get(kind, []))
+        if w is None:
+            raise RuntimeError(f"Could not find a {kind} table widget on the form.")
+
+        if isinstance(w, QtWidgets.QTableWidget):
+            return w, "widget"
+        if isinstance(w, QtWidgets.QTableView):
+            return w, "view"
+        # Some forms embed the view inside a layout — try to unwrap common cases
+        for child in w.findChildren((QtWidgets.QTableWidget, QtWidgets.QTableView)):
+            if isinstance(child, QtWidgets.QTableWidget):
+                return child, "widget"
+            if isinstance(child, QtWidgets.QTableView):
+                return child, "view"
+        raise RuntimeError(f"{kind} table is neither QTableWidget nor QTableView (got {type(w).__name__}).")
 
 def ssh_connect_resilient(ip, username, password,
                           conn_timeout=8, banner_timeout=25, auth_timeout=20,
@@ -729,6 +763,160 @@ Message:
         print("✅ Email notification queued/sent.")
     except Exception as e:
         print(f"❌ Failed to send email: {e}")
+
+# put near other Qt classes
+class DetectAllRunner(QtCore.QObject):
+    step_started = pyqtSignal(str)
+    step_done    = pyqtSignal(str, bool, object)   # name, ok, payload
+    finished     = pyqtSignal()
+
+    def __init__(self, dev: dict, parent=None):
+        super().__init__(parent)
+        self.dev = dev
+        self._cancel = False
+
+    @pyqtSlot()
+    def run(self):
+        ip = self.dev.get("ip", "")
+        try:
+            username, password = get_ssh_credentials()
+            if not (username and password):
+                # no creds → still “finish” the flow
+                self.step_done.emit("init", False, "No SSH credentials")
+                self.finished.emit(); return
+        except Exception as e:
+            self.step_done.emit("init", False, str(e))
+            self.finished.emit(); return
+
+        # ---- STEP 1: Gateway ----
+        if not self._cancel:
+            self.step_started.emit("Gateway")
+            ok, payload = False, None
+            try:
+                gw, _ = detect_default_gateway(ip, username, password)
+                if gw:
+                    ok, payload = True, gw
+                    update_device_in_db({**self.dev, "gateway": gw, "cellular_details": []})
+                else:
+                    payload = "Gateway of last resort not set"
+            except Exception as e:
+                payload = f"{type(e).__name__}: {e}"
+            self.step_done.emit("Gateway", ok, payload)
+
+        # ---- STEP 2: Cellular ----
+        shown = []
+        best  = {}
+        if not self._cancel:
+            self.step_started.emit("Cellular")
+            ok, payload = False, None
+            try:
+                details = fetch_all_cellular_details(ip, timeout=8)  # per-step timeout
+                shown = [d for d in (details or []) if _is_qualified_cell_row(d)]
+                if shown:
+                    replace_device_cellular(self.dev["id"], shown)  # persist NOW
+                    try:
+                        best = max(shown, key=_score_iface)
+                    except ValueError:
+                        best = shown[0]
+                    ok, payload = True, f"{len(shown)} interface(s)"
+                else:
+                    payload = "No eligible cellular interfaces"
+            except Exception as e:
+                payload = f"{type(e).__name__}: {e}"
+            self.step_done.emit("Cellular", ok, payload)
+
+        # ---- STEP 3: APN ----
+        apn = None
+        if not self._cancel:
+            self.step_started.emit("APN")
+            ok, payload = False, None
+            try:
+                # strict SSH timeouts; safe reads
+                cli = paramiko.SSHClient()
+                cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                cli.connect(
+                    ip, username=username, password=password,
+                    look_for_keys=False, allow_agent=False,
+                    timeout=6, banner_timeout=10, auth_timeout=8
+                )
+                sh = cli.invoke_shell(); sh.settimeout(6)
+                time.sleep(0.4)
+                if sh.recv_ready(): _ = sh.recv(65535)
+
+                def send(cmd): return _shell_send_and_read(sh, cmd, sleep=0.35, drain_loops=8)
+
+                brief = send("show ip interface brief")
+                slot  = _find_cellular_slot_from_brief(brief)
+                big = ""
+                if slot:
+                    for cmd in (
+                        f"show cellular {slot} profile",
+                        f"show cellular {slot} lte profile",
+                        f"show cellular {slot} all",
+                        f"show running-config | section ^cellular {slot}",
+                        "show running-config | include apn",
+                    ):
+                        big += "\n--- " + cmd + " ---\n" + send(cmd)
+
+                try: sh.close()
+                except: pass
+                try: cli.close()
+                except: pass
+
+                apn = _parse_apn(big) or None
+                if apn:
+                    # write APN now; also update device primary if we have a 'best'
+                    update_device_in_db({**self.dev, "apn": apn, "cellular_details": []})
+                    if best:
+                        update_device_primary_cellular(self.dev["id"], best, apn)
+                    ok, payload = True, apn
+                else:
+                    payload = "APN not found"
+            except Exception as e:
+                payload = f"{type(e).__name__}: {e}"
+            self.step_done.emit("APN", ok, payload)
+
+        # Finalize: if there was a best cellular iface and no APN change yet,
+        # still ensure device primary fields are consistent.
+        try:
+            if best and not apn:
+                update_device_primary_cellular(self.dev["id"], best, self.dev.get("apn") or "")
+        except Exception:
+            pass
+
+        self.finished.emit()
+
+    def cancel(self):
+        self._cancel = True
+
+class DetectAllProgress(QtWidgets.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Detect All")
+        self.setModal(True)
+        self.setFixedWidth(420)
+        v = QVBoxLayout(self)
+
+        self.l_status = QLabel("Starting…")
+        self.l_gw  = QLabel("Gateway: pending")
+        self.l_cell= QLabel("Cellular: pending")
+        self.l_apn = QLabel("APN: pending")
+        for lbl in (self.l_status, self.l_gw, self.l_cell, self.l_apn):
+            v.addWidget(lbl)
+
+        self.btnCancel = QPushButton("Cancel next steps")
+        v.addWidget(self.btnCancel)
+
+    def show_step_started(self, name):
+        self.l_status.setText(f"Running: {name} …")
+
+    def show_step_done(self, name, ok, payload):
+        mark = "✅" if ok else "⚠️"
+        text = f"{name}: {mark} {payload if isinstance(payload, str) else ''}"
+        if name == "Gateway":  self.l_gw.setText(text)
+        if name == "Cellular": self.l_cell.setText(text)
+        if name == "APN":      self.l_apn.setText(text)
+        self.l_status.setText("Ready for next step…")
 
 # ---------- UI helpers ----------
 class LoadingSpinner(QWidget):
@@ -2035,7 +2223,7 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
 
         # 🚀 start the background worker
         threading.Thread(target=work, daemon=True).start()
-
+    
     @QtCore.pyqtSlot(object, list, object, object)
     def _on_all_detected(self, gw, details, apn, err):
         self._detectAllWatchdog.stop()        # ← stop watchdog
@@ -2436,6 +2624,7 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
 
 # ---------- Main window ----------
 class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
+    tunnelResultsReady = QtCore.pyqtSignal(list, list, str)
     def __init__(self):
         super().__init__()
         ui_file = resource_path("combined_sms_monitor.ui")
@@ -2453,7 +2642,10 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         self.smsCaptureTable = self.tabCapture.findChild(QtWidgets.QTableWidget, "smsTable")
         # Build device table quickly
         self._setup_tunnels_tab()          # <— create the tab widgets (not inserted yet)
+        self.dmvpnTable.setObjectName("dmvpnTable_real")
+        self.eigrpTable.setObjectName("eigrpTable_real")
         self.tunnelDebugBtn.clicked.connect(self._show_last_tunnel_raw)
+        self.tunnelResultsReady.connect(self._apply_tunnel_results)
 
         # Toolbar
         toolbar = self.addToolBar("Filter & Sort"); toolbar.setMovable(False)
@@ -2515,6 +2707,11 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         self.spinner = LoadingSpinner(self); self.spinner.setGeometry(self.rect())
         self.resizeEvent = self._resizeEvent
 
+        # in CiscoSMSMonitorApp.__init__ (after self.spinner setup is fine)
+        self._rowDetectWatchdog = QtCore.QTimer(self)
+        self._rowDetectWatchdog.setSingleShot(True)
+        self._rowDetectWatchdog.timeout.connect(self._detect_all_row_timed_out)
+
         self._sms_pool = ThreadPoolExecutor(max_workers=4)
 
         self._sms_pending = {}             # row_idx -> QTimer
@@ -2555,6 +2752,16 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         self.timer.start(5 * 60 * 1000)
 
     _autohub_checked = set()
+
+    def _detect_all_row_timed_out(self):
+        # UI must recover even if the worker thread is stuck
+        try: self.spinner.stop()
+        except: pass
+        QtWidgets.QMessageBox.warning(
+            self, "Detect All",
+            "Timed out after 30 seconds. The device may be slow or unreachable.\n"
+            "Partial results (if any) were not applied."
+        )
 
     def _show_last_tunnel_raw(self):
         try:
@@ -2764,9 +2971,10 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
     ) -> dict:
         """
         Open ONE interactive shell (PTY), disable paging once, then run several commands.
-        Returns a dict: {cmd: output_string} (cleaned of echoes/prompts).
-        Handles '--More--' and '(q)uit' paging prompts.
-        More robust than opening a new session per command (avoids EOF on some IOS/IOS-XE).
+        Returns {cmd: output_string}, with echoes/prompts removed.
+        - Tries 'enable' only if current prompt looks like exec ('>').
+        - If 'Password:' is requested for enable, we cancel and stay in exec mode.
+        - Handles pagers ('--More--' / '(q)uit').
         """
         out_by_cmd = {c: "" for c in cmds}
         if not cmds:
@@ -2795,25 +3003,40 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
 
             # settle/login banner
             time.sleep(0.25)
-            _drain_all()
+            banner = _drain_all()
 
-            # enter enable (no password) — harmless if already enabled
-            try:
+            # Only attempt 'enable' if we seem to be at an EXEC prompt (endswith '>')
+            def _looks_exec_prompt(b: bytes) -> bool:
+                lines = b.strip().splitlines()
+                if not lines:
+                    return False
+                last = lines[-1].strip()
+                return last.endswith(b'>') and (b' ' not in last)
+
+            def _attempt_enable():
                 _send('enable')
-                time.sleep(0.1)
-                _drain_all()
-            except Exception:
-                pass
+                time.sleep(0.15)
+                buf = _drain_all()
+                # If enable password is prompted, cancel (blank line) and continue in exec
+                if b'Password:' in buf or b'password:' in buf:
+                    _send('')
+                    time.sleep(0.15)
+                    _drain_all()
+
+            if _looks_exec_prompt(banner):
+                try:
+                    _attempt_enable()
+                except Exception:
+                    pass
 
             # disable paging once
             _send('terminal length 0')
             time.sleep(0.1)
-            _drain_all()
+            _ = _drain_all()
 
             more_pat = re.compile(br'--More--|\(q\)uit', re.I)
 
             for cmd in cmds:
-                # issue command
                 _send(cmd)
                 buf = bytearray()
                 last_rx = time.time()
@@ -2827,8 +3050,9 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
                         last_rx = time.time()
 
                         tail = bytes(buf[-512:])
+                        # pager handling
                         if more_pat.search(tail):
-                            chan.send(' ')   # advance pager
+                            chan.send(' ')
                             continue
 
                         tail_stripped = tail.rstrip()
@@ -2842,14 +3066,13 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
                             break
                         time.sleep(0.05)
 
-                # clean the captured output for this command
+                # clean echoes & trailing prompt
                 raw = buf.decode(errors='ignore')
                 cleaned = []
                 for ln in raw.splitlines():
                     s = ln.strip()
                     if not s:
                         continue
-                    # skip our own echoes and bare prompts
                     if s.startswith('terminal length 0'):
                         continue
                     if s == cmd or s.startswith(cmd + ' '):
@@ -2872,26 +3095,22 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         transport: paramiko.Transport,
         cmd: str,
         *,
-        prompt_end=(b'#', b'>'),   # accept enable/exec prompts
+        prompt_end=(b'#', b'>'),
         timeout: int = 16
     ) -> str:
         """
         Open a NEW session channel on the existing SSH transport, run a single CLI
-        command with paging disabled, and return the captured output (without echoes
-        and prompt lines).
-
-        - Stops on prompts ending with '#' or '>' (configurable via prompt_end).
-        - Handles pagers like '--More--' or '(q)uit'.
-        - Tolerates noisy banners and 'enable' on platforms where it's harmless.
+        command with paging disabled, and return cleaned output.
+        - Tries 'enable' ONLY if at exec prompt ('>'); cancels if 'Password:' shown.
+        - Handles pagers.
         """
         chan = transport.open_session(timeout=timeout)
         try:
-            # Get a PTY and start an interactive shell for pager-safe output
             chan.get_pty(term='vt100', width=200, height=50)
             chan.invoke_shell()
             chan.settimeout(timeout)
 
-            def _drain():
+            def _drain() -> bytes:
                 buf = bytearray()
                 try:
                     while chan.recv_ready():
@@ -2906,25 +3125,36 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             def _send(line: str):
                 chan.send(line.rstrip() + '\n')
 
-            # Small settle; drain any login banner/motd
             time.sleep(0.2)
-            _drain()
+            banner = _drain()
 
-            # Try 'enable' (no password); ignore if not needed
-            try:
+            def _looks_exec_prompt(b: bytes) -> bool:
+                lines = b.strip().splitlines()
+                if not lines:
+                    return False
+                last = lines[-1].strip()
+                return last.endswith(b'>') and (b' ' not in last)
+
+            def _attempt_enable():
                 _send('enable')
-                time.sleep(0.1)
-                _drain()
-            except Exception:
-                pass
+                time.sleep(0.15)
+                buf = _drain()
+                if b'Password:' in buf or b'password:' in buf:
+                    _send('')
+                    time.sleep(0.15)
+                    _drain()
 
-            # Disable paging and run command
+            if _looks_exec_prompt(banner):
+                try:
+                    _attempt_enable()
+                except Exception:
+                    pass
+
             _send('terminal length 0')
             _send(cmd)
 
             buf = bytearray()
             more_pat = re.compile(br'--More--|\(q\)uit', re.I)
-            # Some platforms echo "Type escape sequence to abort."—not harmful
             last_rx = time.time()
 
             while True:
@@ -2935,13 +3165,11 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
                     buf.extend(chunk)
                     last_rx = time.time()
 
-                    tail = bytes(buf[-512:])  # look at recent tail only
-                    # Handle pager prompts
+                    tail = bytes(buf[-512:])
                     if more_pat.search(tail):
-                        chan.send(' ')  # advance one page
+                        chan.send(' ')
                         continue
 
-                    # Stop if we see any acceptable prompt at line end
                     tail_stripped = tail.rstrip()
                     if any(
                         tail_stripped.endswith(pe) or (b'\n' + pe) in tail_stripped
@@ -2949,25 +3177,18 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
                     ):
                         break
                 else:
-                    # Timeout if nothing new arrived for a while
                     if time.time() - last_rx > timeout:
                         break
                     time.sleep(0.05)
 
-            # Clean echoes and the trailing prompt lines
             raw = buf.decode(errors='ignore')
-
-            # Remove common echoes: the 'terminal length 0' and the command itself
             cleaned_lines = []
             for ln in raw.splitlines():
                 s = ln.strip()
                 if not s:
                     continue
-                # Skip our own commands
                 if s.startswith('terminal length 0') or s == cmd or s.startswith(cmd + ' '):
                     continue
-                # Skip a bare prompt line (like 'router#' or 'router>')
-                # Heuristic: ends with # or >, short, and no spaces
                 if (s.endswith('#') or s.endswith('>')) and (' ' not in s) and (len(s) <= 80):
                     continue
                 cleaned_lines.append(ln)
@@ -2984,311 +3205,330 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         label = self.tunnelHubPicker.currentText().strip()
         return self._tunnel_hub_map.get(label)
 
+    # =========================
+    # END-TO-END REFRESH (SAFE)
+    # =========================
+
     def refresh_tunnels_now(self):
+        """
+        Thread-safe: fetch NHRP/DMVPN/EIGRP via one SSH session,
+        parse rows, then marshal UI updates to the main thread.
+        """
+        from datetime import datetime
+        import threading
+
         def set_status(txt, warn=False):
-            if hasattr(self, "tunnelStatusLbl"):
+            if hasattr(self, "tunnelStatusLbl") and self.tunnelStatusLbl:
                 self.tunnelStatusLbl.setText(txt)
                 self.tunnelStatusLbl.setStyleSheet(f"color:{'#ef4444' if warn else '#6b7280'};")
 
         hub = self._get_selected_hub()
         if not hub:
-            self._fill_dmvpn_table([]); self._fill_eigrp_table([])
-            set_status("No hub selected", warn=True)
+            self._apply_tunnel_results([], [], "No hub selected")
             return
 
         ip   = hub.get("ip")
         name = hub.get("name", "Hub")
 
-        # We’ll accumulate a full trace and ALWAYS write tunnel_debug.txt,
-        # even if we fail early, so “Show Raw” is useful for diagnostics.
-        diag = []
-        def d(line): diag.append(line)
-
-        d(f"[{datetime.now().isoformat(timespec='seconds')}] Refresh for {name} ({ip})")
-        d(f"ALLOW_SSH_HUB_DETECT={ALLOW_SSH_HUB_DETECT}")
-        d(f"Allow-list: {sorted(list(HUB_PROBE_ALLOWLIST))}")
-
+        # quick gates
         if not ALLOW_SSH_HUB_DETECT:
-            d("Blocked: SSH hub detection disabled")
-            set_status("SSH hub detection disabled", warn=True)
-            with open("tunnel_debug.txt", "w", encoding="utf-8") as f:
-                f.write("\n".join(diag) + "\n")
-            QtWidgets.QMessageBox.warning(self, "SSH disabled",
-                                        "ALLOW_SSH_HUB_DETECT=False — enable it to query the hub.")
+            self._apply_tunnel_results([], [], "SSH hub detection disabled")
             return
-
         if ip not in HUB_PROBE_ALLOWLIST:
-            d("Blocked: hub IP not in allow-list")
-            set_status("Hub not in allow-list", warn=True)
-            with open("tunnel_debug.txt", "w", encoding="utf-8") as f:
-                f.write("\n".join(diag) + "\n")
-            QtWidgets.QMessageBox.warning(self, "Hub not allowed",
-                                        f"{ip} is not in HUB_PROBE_ALLOWLIST.")
-            self._fill_dmvpn_table([]); self._fill_eigrp_table([])
+            self._apply_tunnel_results([], [], f"Hub {ip} not in allow-list")
             return
-
-        online = is_device_online(ip)
-        d(f"is_device_online={online}")
-        if not online:
-            d("Blocked: TCP/22 not reachable")
-            set_status("Hub offline/unreachable on TCP/22", warn=True)
-            with open("tunnel_debug.txt", "w", encoding="utf-8") as f:
-                f.write("\n".join(diag) + "\n")
-            self._fill_dmvpn_table([]); self._fill_eigrp_table([])
+        if not is_device_online(ip):
+            self._apply_tunnel_results([], [], f"{ip} is offline / TCP 22 closed")
             return
 
         username, password = get_ssh_credentials()
-        if not username or not password:
-            d("Blocked: missing SSH credentials")
-            set_status("SSH credentials not set", warn=True)
-            with open("tunnel_debug.txt", "w", encoding="utf-8") as f:
-                f.write("\n".join(diag) + "\n")
-            QtWidgets.QMessageBox.warning(self, "SSH", "SSH credentials are not set.")
+        if not (username and password):
+            self._apply_tunnel_results([], [], "SSH credentials not set")
             return
 
         set_status("Connecting…")
-        def work():
+
+        def worker():
+            # Always write a debug file you can open with “Show Raw”
+            log_lines = [
+                f"[{datetime.now().isoformat(timespec='seconds')}] Refresh for {name} ({ip})",
+                f"Used NHRP cmd:  show ip nhrp",
+                f"Used DMVPN cmd: show dmvpn",
+                f"Used EIGRP cmd: show ip eigrp neighbors",
+                "",
+            ]
             outs = {"nhrp": "", "dmvpn": "", "eigrp": ""}
-            used = {"nhrp": "", "dmvpn": "", "eigrp": ""}
-            error_txt = ""
 
             try:
-                d("Connecting with ssh_connect_resilient() …")
-                ssh = ssh_connect_resilient(
-                    ip, username, password,
-                    conn_timeout=10, banner_timeout=40, auth_timeout=25, tries=3, sleep_between=1.0
-                )
+                cli = ssh_connect_resilient(ip, username, password,
+                                            conn_timeout=10, banner_timeout=40, auth_timeout=25,
+                                            tries=3, sleep_between=1.0)
                 try:
-                    t = ssh.get_transport()
+                    t = cli.get_transport()
                     if not t or not t.is_active():
-                        raise RuntimeError("SSH transport not active after connect")
-                    d("SSH transport active.")
-
-                    # candidate commands (keep your lists)
-                    nhrp_cmds  = ["show ip nhrp", "show ip nhrp detail", "show nhrp", "show nhrp detail", "show ip nhrp brief"]
-                    dmvpn_cmds = ["show dmvpn", "show dmvpn detail", "show dmvpn tunnel"]
-                    eigrp_cmds = ["show ip eigrp neighbors", "show ip eigrp neighbors detail", "show eigrp neighbors detail"]
-
-                    # run ALL candidates in ONE shell session to avoid EOF on subsequent opens
-                    all_cmds = nhrp_cmds + dmvpn_cmds + eigrp_cmds
-                    d(f"Running {len(all_cmds)} commands in a single shell session…")
-                    results = self._run_cmds_single_shell(t, all_cmds, prompt_end=(b'#', b'>'), timeout=20)
-
-                    # pick first non-empty per topic (and remember which one)
-                    def first_non_empty(cmd_list, key):
-                        for c in cmd_list:
-                            txt = results.get(c, "")
-                            if txt and txt.strip():
-                                used[key] = c
-                                return txt
-                        used[key] = cmd_list[0] if cmd_list else ""
-                        return ""
-
-                    outs["nhrp"]  = first_non_empty(nhrp_cmds,  "nhrp")
-                    outs["dmvpn"] = first_non_empty(dmvpn_cmds, "dmvpn")
-                    outs["eigrp"] = first_non_empty(eigrp_cmds, "eigrp")
-
+                        raise RuntimeError("SSH transport not active")
+                    # one PTY shell, multiple commands, pager handled
+                    outs = self._ssh_run_multi(t, [
+                        "show ip nhrp",
+                        "show dmvpn",
+                        "show ip eigrp neighbors",
+                    ], timeout=20)
                 finally:
-                    try: ssh.close()
+                    try: cli.close()
                     except: pass
-
             except Exception as e:
-                error_txt = f"{type(e).__name__}: {e}"
-                d("EXCEPTION during refresh: " + error_txt)
-
-            # ALWAYS write the raw debug file, even if exception or empty
-            try:
+                log_lines.append(f"SSH ERROR: {type(e).__name__}: {e}")
                 with open("tunnel_debug.txt", "w", encoding="utf-8") as f:
-                    f.write("\n".join(diag) + "\n\n")
-                    if used["nhrp"] or used["dmvpn"] or used["eigrp"]:
-                        f.write(f"Used NHRP cmd:  {used['nhrp']}\n")
-                        f.write(f"Used DMVPN cmd: {used['dmvpn']}\n")
-                        f.write(f"Used EIGRP cmd: {used['eigrp']}\n\n")
-                    f.write("=== SHOW IP NHRP ===\n")
-                    f.write((outs.get("nhrp") or "").rstrip() + "\n\n")
-                    f.write("=== SHOW DMVPN ===\n")
-                    f.write((outs.get("dmvpn") or "").rstrip() + "\n\n")
-                    f.write("=== SHOW IP EIGRP NEIGHBORS ===\n")
-                    f.write((outs.get("eigrp") or "").rstrip() + "\n")
-                d("Saved raw outputs to tunnel_debug.txt")
-            except Exception as we:
-                d(f"Failed to write tunnel_debug.txt: {we}")
+                    f.write("\n".join(log_lines) + "\n")
+                # post failure to UI
+                self._apply_tunnel_results([], [], f"SSH error: {e}")
+                return
 
-            # Parse and update UI
-            try:
-                dmvpn_rows = self._parse_nhrp_or_dmvpn(outs.get("nhrp",""), outs.get("dmvpn",""))
-                if not dmvpn_rows and outs.get("dmvpn"):
-                    d("Parser returned 0 DMVPN rows, using fallback parser.")
-                    dmvpn_rows = self._fallback_parse_dmvpn(outs.get("dmvpn",""))
+            # put raw in the debug file (matches what you pasted)
+            log_lines += [
+                "=== SHOW IP NHRP ===",
+                outs.get("show ip nhrp","").rstrip(),
+                "",
+                "=== SHOW DMVPN ===",
+                outs.get("show dmvpn","").rstrip(),
+                "",
+                "=== SHOW IP EIGRP NEIGHBORS ===",
+                outs.get("show ip eigrp neighbors","").rstrip(),
+                ""
+            ]
+            with open("tunnel_debug.txt", "w", encoding="utf-8") as f:
+                f.write("\n".join(log_lines) + "\n")
 
-                eigrp_rows = self._parse_eigrp_neighbors(outs.get("eigrp",""))
-                if not eigrp_rows and outs.get("eigrp"):
-                    d("Parser returned 0 EIGRP rows, using fallback parser.")
-                    eigrp_rows = self._fallback_parse_eigrp(outs.get("eigrp",""))
+            # parse exactly your formats
+            dmvpn_rows = self._parse_nhrp_or_dmvpn(
+                outs.get("show ip nhrp",""),
+                outs.get("show dmvpn","")
+            )
+            eigrp_rows = self._parse_eigrp_neighbors(
+                outs.get("show ip eigrp neighbors","")
+            )
 
-                def apply_tables():
-                    self._fill_dmvpn_table(dmvpn_rows)
-                    self._fill_eigrp_table(eigrp_rows)
-                    if error_txt:
-                        set_status(f"Refresh error: {error_txt}", warn=True)
-                    elif not dmvpn_rows and not eigrp_rows:
-                        set_status("No peers parsed. Click ‘Show Raw’ to inspect.", warn=True)
+            # helpful console prints (you saw “[PARSE] … rows: 12” in your logs)
+            print(f"[PARSE] DMVPN rows: {len(dmvpn_rows)}")
+            print(f"[PARSE] EIGRP rows: {len(eigrp_rows)}")
+
+            # hand results to the UI thread
+            self.tunnelResultsReady.emit(dmvpn_rows, eigrp_rows, "OK")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+
+    def _apply_tunnel_results(self, dmvpn_rows, eigrp_rows, status_text):
+        """
+        ALWAYS called on the Qt (GUI) thread. If called off-thread, we re-invoke with QueuedConnection.
+        """
+        # If we’re not on the GUI thread, bounce this back to it.
+        if QtCore.QThread.currentThread() != QtWidgets.QApplication.instance().thread():
+            QtCore.QMetaObject.invokeMethod(
+                self,
+                "_apply_tunnel_results",
+                QtCore.Qt.QueuedConnection,
+                QtCore.Q_ARG(list, dmvpn_rows),
+                QtCore.Q_ARG(list, eigrp_rows),
+                QtCore.Q_ARG(str,  status_text),
+            )
+            return
+
+        # Update status label
+        if hasattr(self, "tunnelStatusLbl") and self.tunnelStatusLbl:
+            warn = (status_text != "OK")
+            self.tunnelStatusLbl.setText(status_text)
+            self.tunnelStatusLbl.setStyleSheet(f"color:{'#ef4444' if warn else '#6b7280'};")
+
+        # Fill tables (these painters NEVER no-op)
+        try:
+            self._fill_dmvpn_table(dmvpn_rows or [])
+            self._fill_eigrp_table(eigrp_rows or [])
+        except Exception as e:
+            # even painter errors get surfaced
+            if hasattr(self, "tunnelStatusLbl") and self.tunnelStatusLbl:
+                self.tunnelStatusLbl.setText(f"UI error: {e}")
+                self.tunnelStatusLbl.setStyleSheet("color:#ef4444;")
+
+
+    def _ssh_run_multi(self, transport, cmds, *, timeout=20):
+        """
+        Minimal single-PTY command runner (pager aware) returning {cmd: output}.
+        Keeps your earlier semantics but self-contained for this refresh path.
+        """
+        out = {c: "" for c in cmds}
+        chan = transport.open_session(timeout=timeout)
+        try:
+            chan.get_pty(term='vt100', width=200, height=50)
+            chan.invoke_shell()
+            chan.settimeout(timeout)
+
+            def drain():
+                buf = bytearray()
+                try:
+                    while chan.recv_ready():
+                        chunk = chan.recv(65535)
+                        if not chunk:
+                            break
+                        buf.extend(chunk)
+                except Exception:
+                    pass
+                return bytes(buf)
+
+            def send(line):
+                chan.send(line.rstrip() + "\n")
+
+            # settle & (optional) enable
+            import time, re
+            time.sleep(0.25); banner = drain()
+            def looks_exec(b: bytes):
+                lines = b.strip().splitlines()
+                return bool(lines and lines[-1].strip().endswith(b'>') and b' ' not in lines[-1])
+            if looks_exec(banner):
+                send("enable"); time.sleep(0.15); b = drain()
+                if b"Password:" in b or b"password:" in b:
+                    send("")  # cancel enable if it prompts
+
+            # no paging
+            send("terminal length 0"); time.sleep(0.1); _ = drain()
+            more_pat = re.compile(br'--More--|\(q\)uit', re.I)
+
+            for c in cmds:
+                send(c)
+                buf = bytearray(); last = time.time()
+                while True:
+                    if chan.recv_ready():
+                        chunk = chan.recv(65535)
+                        if not chunk:
+                            break
+                        buf.extend(chunk); last = time.time()
+                        tail = bytes(buf[-512:])
+                        if more_pat.search(tail):
+                            chan.send(' ')
+                            continue
+                        # stop when we see a fresh prompt at line end
+                        tail_stripped = tail.rstrip()
+                        if tail_stripped.endswith(b'#') or tail_stripped.endswith(b'>'):
+                            break
                     else:
-                        set_status(f"OK — DMVPN rows: {len(dmvpn_rows)}, EIGRP rows: {len(eigrp_rows)}", warn=False)
+                        if time.time() - last > timeout:
+                            break
+                        time.sleep(0.05)
 
-                    # If nothing parsed, auto-open raw to help adapt parsers
-                    if DEBUG_TUNNELS and not dmvpn_rows and not eigrp_rows:
-                        _show_text_dialog(self, "Tunnel debug (raw outputs)",
-                                        "\n".join(diag) + "\n\n" +
-                                        f"(Used: NHRP={used['nhrp']} DMVPN={used['dmvpn']} EIGRP={used['eigrp']})\n\n" +
-                                        "=== SHOW IP NHRP ===\n" + (outs.get("nhrp") or "") + "\n\n" +
-                                        "=== SHOW DMVPN ===\n" + (outs.get("dmvpn") or "") + "\n\n" +
-                                        "=== SHOW IP EIGRP NEIGHBORS ===\n" + (outs.get("eigrp") or ""))
-                QtCore.QTimer.singleShot(0, apply_tables)
+                # clean echoes/prompts
+                raw = buf.decode(errors="ignore")
+                cleaned = []
+                for ln in raw.splitlines():
+                    s = ln.strip()
+                    if not s:
+                        continue
+                    if s.startswith("terminal length 0") or s == c or s.startswith(c + " "):
+                        continue
+                    if (s.endswith('#') or s.endswith('>')) and (' ' not in s) and len(s) <= 80:
+                        continue
+                    cleaned.append(ln)
+                out[c] = "\n".join(cleaned).strip()
 
-            except Exception as pe:
-                QtCore.QTimer.singleShot(0, lambda:
-                    QtWidgets.QMessageBox.critical(self, "Tunnel refresh failed", str(pe))
-                )
-                QtCore.QTimer.singleShot(0, lambda: (self._fill_dmvpn_table([]), self._fill_eigrp_table([])))
-                QtCore.QTimer.singleShot(0, lambda: set_status(f"Parse error: {pe}", warn=True))
+            return out
+        finally:
+            try: chan.close()
+            except: pass
 
-        threading.Thread(target=work, daemon=True).start()
+    @QtCore.pyqtSlot(object, object, str)
+    def _apply_tunnel_tables(self, dmvpn_rows, eigrp_rows, error_txt):
+        self._fill_dmvpn_table(dmvpn_rows or [])
+        self._fill_eigrp_table(eigrp_rows or [])
+        if error_txt:
+            self.tunnelStatusLbl.setText(f"Refresh error: {error_txt}")
+            self.tunnelStatusLbl.setStyleSheet("color:#ef4444;")
+        elif not dmvpn_rows and not eigrp_rows:
+            self.tunnelStatusLbl.setText("No peers parsed. Click ‘Show Raw’ to inspect.")
+            self.tunnelStatusLbl.setStyleSheet("color:#ef4444;")
+        else:
+            self.tunnelStatusLbl.setText(f"OK — DMVPN rows: {len(dmvpn_rows)}, EIGRP rows: {len(eigrp_rows)}")
+            self.tunnelStatusLbl.setStyleSheet("color:#6b7280;")
 
+    @QtCore.pyqtSlot()
+    def _apply_on_gui_helper(self):
+        # this body will be replaced dynamically before invoke in refresh_tunnels_now
+        # we keep the slot only to have a stable QObject method for invokeMethod
+        pass
 
     def _parse_eigrp_neighbors(self, text: str):
         """
-        Parses 'show ip eigrp neighbors' in classic format.
-
-        Example from your hub:
-        H   Address                 Interface   Hold Uptime   SRTT   RTO  Q  Seq
-        7   172.16.1.204            Tu1           14 00:06:03  45  1632  0  51
+        Returns list of dicts:
+        {"addr": "172.16.1.200", "iface":"Tu1", "hold":"14",
+        "uptime":"3d03h", "srtt":"43", "rto":"1704", "seq":"1682"}
+        Matches your 'show ip eigrp neighbors' table.
         """
-        ip_pat = r"(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}"
+        import re
         rows = []
-
-        for line in (text or "").splitlines():
-            s = line.strip()
+        ip = r"(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}"
+        for ln in (text or "").splitlines():
+            s = ln.strip()
             if not s or s.startswith(("EIGRP-IPv4", "H ", "(")):
                 continue
-
-            # With leading H column:
-            m = re.match(
-                rf"^\d+\s+({ip_pat})\s+(\S+)\s+(\d+)\s+([\w:]+)\s+(\d+)\s+(\d+)\s+\d+\s+(\d+)\s*$",
-                s
-            )
+            # With leading H col:
+            m = re.match(rf"^\d+\s+({ip})\s+(\S+)\s+(\d+)\s+([\w:]+)\s+(\d+)\s+(\d+)\s+\d+\s+(\d+)\s*$", s)
+            # Without H col:
             if not m:
-                # Fallback without leading H:
-                m = re.match(
-                    rf"^({ip_pat})\s+(\S+)\s+(\d+)\s+([\w:]+)\s+(\d+)\s+(\d+)\s+\d+\s+(\d+)\s*$",
-                    s
-                )
+                m = re.match(rf"^({ip})\s+(\S+)\s+(\d+)\s+([\w:]+)\s+(\d+)\s+(\d+)\s+\d+\s+(\d+)\s*$", s)
             if m:
                 addr, iface, hold, uptime, srtt, rto, seq = m.groups()
-                if iface.lower().startswith("tu"):
-                    digits = re.sub(r"\D", "", iface)
-                    iface = f"Tunnel{digits}" if digits else iface
-                rows.append({
-                    "addr": addr,
-                    "iface": iface,
-                    "hold": hold,
-                    "uptime": uptime,
-                    "srtt": srtt,
-                    "rto": rto,
-                    "seq": seq
-                })
-
-        print(f"[PARSE] EIGRP rows: {len(rows)}")
+                rows.append({"addr": addr, "iface": iface, "hold": hold,
+                            "uptime": uptime, "srtt": srtt, "rto": rto, "seq": seq})
         return rows
 
     def _parse_nhrp_or_dmvpn(self, nhrp_text: str, dmvpn_text: str):
         """
-        Returns rows like: [{"tunnel","peer","nbma","state","note"}]
-        Works for:
-        • 'show dmvpn' table (your device output)
-        • 'show ip nhrp' detailed blocks
+        Returns list of dicts:
+        {"tunnel": "Tunnel1", "peer": "172.16.1.200", "nbma": "192.168.255.200",
+        "state": "up"/"down", "note": "3d18h" }
+        Works with either 'show ip nhrp' (by pairing NBMA lines) and/or 'show dmvpn'.
         """
-        ip_pat = r"(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}"
         rows = []
 
-        # ---------- A) DMVPN table ----------
-        tun = None
-        in_table = False
+        # ---- First pass: DMVPN table (your sample) ----
+        #   Interface: Tunnel1 ...
+        #   <nbma> <peer>  UP/DOWN  <uptime>  D
+        import re
+        ip = r"(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}"
+        cur_tun = None
         for ln in (dmvpn_text or "").splitlines():
             s = ln.strip()
             if not s:
                 continue
-
             m_if = re.search(r"\bInterface:\s*(Tunnel\S+)", s, re.I)
             if m_if:
-                tun = m_if.group(1)
-                in_table = False
-                continue
+                cur_tun = m_if.group(1); continue
+            # NBMA, Peer, State, Uptime
+            m = re.match(rf"^\s*({ip})\s+({ip})\s+(UP|DOWN)\s+(\S+)", s, re.I)
+            if m and cur_tun:
+                nbma, peer, st, updn = m.groups()
+                rows.append({"tunnel": cur_tun, "peer": peer, "nbma": nbma,
+                            "state": st.lower(), "note": updn})
 
-            if re.search(r"^#\s*Ent\b", s):     # header line of the table
-                in_table = True
-                continue
+        # ---- Fallback: pair NHRP blocks if DMVPN not present ----
+        if not rows:
+            cur_tun = None
+            last_peer = None
+            for ln in (nhrp_text or "").splitlines():
+                s = ln.strip()
+                if not s:
+                    continue
+                m_t = re.search(r"^Tunnel\d+", s, re.I)
+                if m_t:
+                    cur_tun = m_t.group(0)
+                m_peer = re.search(rf"^({ip})/32\s+via\s+({ip})", s, re.I)
+                if m_peer:
+                    last_peer = m_peer.group(2)  # tunnel address is after 'via'
+                    continue
+                m_nbma = re.search(rf"NBMA address:\s*({ip})", s, re.I)
+                if m_nbma and cur_tun and last_peer:
+                    rows.append({"tunnel": cur_tun, "peer": last_peer,
+                                "nbma": m_nbma.group(1), "state": "up", "note": ""})
+                    last_peer = None
 
-            if in_table:
-                # Examples (NBMA first, then Peer, then UP/DOWN, then UpDn Tm, then Attrb):
-                # 1 192.168.255.200    172.16.1.200    UP    1d13h     D
-                m = re.match(
-                    rf"^\d+\s+({ip_pat})\s+({ip_pat})\s+(UP|DOWN)\s+(\S+)\s+\S+",
-                    s, re.I
-                )
-                if m:
-                    nbma, peer, state, uptime = m.groups()
-                    rows.append({
-                        "tunnel": tun or "Tunnel?",
-                        "peer":   peer,
-                        "nbma":   nbma,
-                        "state":  state.lower(),   # "up"/"down"
-                        "note":   uptime
-                    })
-
-        if rows:
-            print(f"[PARSE] DMVPN rows: {len(rows)}")
-            return rows
-
-        # ---------- B) Classic 'show ip nhrp' detailed blocks ----------
-        cur = {}
-        for line in (nhrp_text or "").splitlines():
-            ln = line.rstrip()
-
-            m1 = re.match(rf"^\s*({ip_pat})/\d+\s+via\s+({ip_pat})\s*$", ln)
-            if m1:
-                if cur:
-                    rows.append(cur)
-                cur = {"peer": m1.group(1), "via": m1.group(2)}
-                continue
-
-            m2 = re.match(r"^\s*Tunnel(\d+)\s+created\s+([^,]+),", ln, re.I)
-            if m2:
-                cur["tunnel"] = f"Tunnel{m2.group(1)}"
-                cur["note"]   = f"created {m2.group(2).strip()}"
-                continue
-
-            m3 = re.match(r"^\s*Type:\s*\S+,\s*Flags:\s*(.+?)\s*$", ln, re.I)
-            if m3:
-                cur["state"] = m3.group(1).strip()   # keep full Flags text
-                continue
-
-            m4 = re.match(rf"^\s*NBMA address:\s*({ip_pat})\s*$", ln, re.I)
-            if m4:
-                cur["nbma"] = m4.group(1)
-                continue
-
-        if cur:
-            rows.append(cur)
-
-        # normalize
-        for r in rows:
-            r.setdefault("tunnel", "Tunnel?")
-            r.setdefault("nbma", "")
-            r.setdefault("state", "")
-            r.setdefault("note", "")
-
-        print(f"[PARSE] NHRP rows: {len(rows)}")
         return rows
 
     _IP = r"(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}"
@@ -3373,27 +3613,66 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         return rows
 
 
-    def _fill_dmvpn_table(self, rows):
-        self.dmvpnTable.setRowCount(len(rows))
-        for r, d in enumerate(rows):
-            self.dmvpnTable.setItem(r, 0, QTableWidgetItem(d.get("tunnel","")))
-            self.dmvpnTable.setItem(r, 1, QTableWidgetItem(d.get("peer","")))
-            self.dmvpnTable.setItem(r, 2, QTableWidgetItem(d.get("nbma","")))
-            self.dmvpnTable.setItem(r, 3, QTableWidgetItem(d.get("state","")))
-            self.dmvpnTable.setItem(r, 4, QTableWidgetItem(d.get("note","")))
-        self.dmvpnTable.resizeColumnsToContents()
+    # ------------ PAINTERS (force repaint on GUI thread) ------------
+    def _fill_dmvpn_table(self, rows: list):
+        # Bounce to GUI thread if needed
+        if QtCore.QThread.currentThread() != QtWidgets.QApplication.instance().thread():
+            QtCore.QMetaObject.invokeMethod(
+                self, "_fill_dmvpn_table", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(list, rows)
+            ); return
 
-    def _fill_eigrp_table(self, rows):
-        self.eigrpTable.setRowCount(len(rows))
+        tbl = self.dmvpnTable  # created in _setup_tunnels_tab
+        tbl.setSortingEnabled(False)
+        tbl.clearContents()
+        tbl.setRowCount(len(rows))
+
         for r, d in enumerate(rows):
-            self.eigrpTable.setItem(r, 0, QTableWidgetItem(d.get("addr","")))
-            self.eigrpTable.setItem(r, 1, QTableWidgetItem(d.get("iface","")))
-            self.eigrpTable.setItem(r, 2, QTableWidgetItem(str(d.get("hold",""))))
-            self.eigrpTable.setItem(r, 3, QTableWidgetItem(d.get("uptime","")))
-            self.eigrpTable.setItem(r, 4, QTableWidgetItem(str(d.get("srtt",""))))
-            self.eigrpTable.setItem(r, 5, QTableWidgetItem(str(d.get("rto",""))))
-            self.eigrpTable.setItem(r, 6, QTableWidgetItem(str(d.get("seq",""))))
-        self.eigrpTable.resizeColumnsToContents()
+            tbl.setItem(r, 0, QtWidgets.QTableWidgetItem(d.get("tunnel","")))
+            tbl.setItem(r, 1, QtWidgets.QTableWidgetItem(d.get("peer","")))
+            tbl.setItem(r, 2, QtWidgets.QTableWidgetItem(d.get("nbma","")))
+            st = d.get("state","").lower()
+            st_txt = "UP" if st == "up" else ("DOWN" if st == "down" else st.upper())
+            item_state = QtWidgets.QTableWidgetItem(st_txt)
+            if st == "up":
+                item_state.setForeground(QtGui.QBrush(QtGui.QColor("#10b981")))  # green
+            elif st == "down":
+                item_state.setForeground(QtGui.QBrush(QtGui.QColor("#ef4444")))  # red
+            tbl.setItem(r, 3, item_state)
+            tbl.setItem(r, 4, QtWidgets.QTableWidgetItem(d.get("note","")))
+
+        tbl.resizeColumnsToContents()
+        tbl.horizontalHeader().setStretchLastSection(True)
+        tbl.viewport().update()
+        tbl.setSortingEnabled(True)
+        print("DMVPN rowCount:", tbl.rowCount())
+
+
+    def _fill_eigrp_table(self, rows: list):
+        # Bounce to GUI thread if needed
+        if QtCore.QThread.currentThread() != QtWidgets.QApplication.instance().thread():
+            QtCore.QMetaObject.invokeMethod(
+                self, "_fill_eigrp_table", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(list, rows)
+            ); return
+
+        tbl = self.eigrpTable
+        tbl.setSortingEnabled(False)
+        tbl.clearContents()
+        tbl.setRowCount(len(rows))
+
+        for r, d in enumerate(rows):
+            tbl.setItem(r, 0, QtWidgets.QTableWidgetItem(d.get("addr","")))
+            tbl.setItem(r, 1, QtWidgets.QTableWidgetItem(d.get("iface","")))
+            tbl.setItem(r, 2, QtWidgets.QTableWidgetItem(d.get("hold","")))
+            tbl.setItem(r, 3, QtWidgets.QTableWidgetItem(d.get("uptime","")))
+            tbl.setItem(r, 4, QtWidgets.QTableWidgetItem(d.get("srtt","")))
+            tbl.setItem(r, 5, QtWidgets.QTableWidgetItem(d.get("rto","")))
+            tbl.setItem(r, 6, QtWidgets.QTableWidgetItem(d.get("seq","")))
+
+        tbl.resizeColumnsToContents()
+        tbl.horizontalHeader().setStretchLastSection(True)
+        tbl.viewport().update()
+        tbl.setSortingEnabled(True)
+        print("EIGRP rowCount:", tbl.rowCount())
 
     def _auto_detect_and_flag_hub(self, row_index: int, dev: dict):
         if not ALLOW_SSH_HUB_DETECT:
@@ -3696,6 +3975,30 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.information(self, "Registered",
             f"Syslog host set on {self.devices[index]['name']} ({self.devices[index]['ip']}).")
 
+    # --- add inside CiscoSMSMonitorApp ---
+    def _clear_cell(self, row: int, col: int):
+        """Remove any cell widget and clear the item so we can safely replace."""
+        w = self.deviceTable.cellWidget(row, col)
+        if w:
+            try:
+                self.deviceTable.removeCellWidget(row, col)
+                w.deleteLater()
+            except Exception:
+                pass
+        # also clear any existing item
+        self.deviceTable.setItem(row, col, QtWidgets.QTableWidgetItem(""))
+
+    def _set_sim_apn_cells(self, row: int, has_cell: bool, sim_text: str, apn_text: str):
+        SIM_COL, APN_COL = 3, 4
+        # always clear first so we can switch between widget<->item cleanly
+        self._clear_cell(row, SIM_COL)
+        self._clear_cell(row, APN_COL)
+        if not has_cell:
+            self.deviceTable.setCellWidget(row, SIM_COL, badge_widget("NO CELL"))
+            self.deviceTable.setCellWidget(row, APN_COL, badge_widget("NO CELL"))
+        else:
+            self.deviceTable.setItem(row, SIM_COL, QtWidgets.QTableWidgetItem(sim_text or ""))
+            self.deviceTable.setItem(row, APN_COL, QtWidgets.QTableWidgetItem(apn_text or ""))
 
     # ---------- Table build ----------
     def load_devices(self, device_list):
@@ -3731,13 +4034,7 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             self.deviceTable.setItem(i, 1, IPItem(d["ip"]))
             self.deviceTable.setItem(i, 2, QtWidgets.QTableWidgetItem(d["gateway"]))
 
-            # SIM/APN
-            if not d.get("has_cellular", False):
-                self.deviceTable.setCellWidget(i, 3, badge_widget("NO CELL"))
-                self.deviceTable.setCellWidget(i, 4, badge_widget("NO CELL"))
-            else:
-                self.deviceTable.setItem(i, 3, QtWidgets.QTableWidgetItem(d["sim"]))
-                self.deviceTable.setItem(i, 4, QtWidgets.QTableWidgetItem(d["apn"]))
+            self._set_sim_apn_cells(i, d.get("has_cellular", False), d.get("sim", ""), d.get("apn", ""))
 
             # Email
             self.deviceTable.setItem(i, 5, QtWidgets.QTableWidgetItem(d["email"]))
@@ -3854,123 +4151,36 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         if not dev:
             QtWidgets.QMessageBox.warning(self, "Not found", "Device could not be found.")
             return
-
-        ip = dev.get("ip", "").strip()
-        if not ip:
+        if not (dev.get("ip") or "").strip():
             QtWidgets.QMessageBox.warning(self, "Missing IP", "This device has no IP configured.")
             return
 
-        # show spinner over main window while working
-        self.spinner.start()
+        # UI
+        dlg = DetectAllProgress(self)
+        runner = DetectAllRunner(dev)
+        thr = QtCore.QThread(self)
+        runner.moveToThread(thr)
 
-        def work():
-            gw = None
-            details = []
-            apn = None
-            err = None
+        # signals
+        runner.step_started.connect(dlg.show_step_started)
+        def on_done(name, ok, payload):
+            dlg.show_step_done(name, ok, payload)
+            # refresh device table after each step so user sees incremental results
+            self.refresh_devices_from_db()
+        runner.step_done.connect(on_done)
 
-            try:
-                username, password = get_ssh_credentials()
-                if not username or not password:
-                    raise RuntimeError("SSH credentials not set.")
+        def on_finished():
+            thr.quit(); thr.wait()
+            dlg.l_status.setText("Finished.")
+            # short delay so the user can see the last line update, then close
+            QtCore.QTimer.singleShot(600, dlg.accept)
 
-                # 1) Gateway
-                try:
-                    gw, _ = detect_default_gateway(ip, username, password)
-                except Exception:
-                    gw = None
+        runner.finished.connect(on_finished)
+        dlg.btnCancel.clicked.connect(runner.cancel)
 
-                # 2) Cellular (interfaces + IMSI/IMEI/ICCID/SIM + status/IP)
-                try:
-                    details = fetch_all_cellular_details(ip)
-                except Exception:
-                    details = []
-
-                # 3) APN (reuse your dialog logic helpers)
-                try:
-                    import paramiko, time
-                    ssh = paramiko.SSHClient()
-                    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                    ssh.connect(ip, username=username, password=password,
-                                look_for_keys=False, allow_agent=False)
-                    sh = ssh.invoke_shell(); time.sleep(0.4)
-                    if sh.recv_ready(): _ = sh.recv(65535)
-
-                    def send(cmd):
-                        sh.send(cmd + "\n"); time.sleep(0.45)
-                        out = ""
-                        while sh.recv_ready():
-                            out += sh.recv(65535).decode(errors="ignore")
-                        return out
-
-                    brief = send("show ip interface brief")
-                    slot = _find_cellular_slot_from_brief(brief)
-                    big = ""
-                    if slot:
-                        for cmd in [f"show cellular {slot} profile",
-                                    f"show cellular {slot} lte profile",
-                                    f"show cellular {slot} all",
-                                    f"show running-config | section ^cellular {slot}",
-                                    "show running-config | include apn"]:
-                            big += "\n--- " + cmd + " ---\n" + send(cmd)
-                    try: sh.close()
-                    except: pass
-                    try: ssh.close()
-                    except: pass
-
-                    _apn = _parse_apn(big)
-                    apn = _apn if _apn else None
-                except Exception:
-                    apn = None
-
-                # ---- persist results ----
-                # a) update gateway field on device
-                if gw:
-                    updated = {**dev, "gateway": gw, "cellular_details": []}
-                    update_device_in_db(updated)
-
-                # b) store only eligible cellular rows & set primary/APN on devices table
-                shown = [d for d in (details or []) if _is_qualified_cell_row(d)]
-                if shown:
-                    try:
-                        replace_device_cellular(dev_id, shown)
-                    except Exception as e:
-                        print(f"⚠️ replace_device_cellular failed: {e}")
-
-                    # choose best for device’s primary fields + apn
-                    try:
-                        best = max(shown, key=_score_iface)
-                    except ValueError:
-                        best = shown[0]
-                    try:
-                        update_device_primary_cellular(dev_id, best, apn or dev.get("apn") or "")
-                    except Exception as e:
-                        print(f"⚠️ update_device_primary_cellular failed: {e}")
-
-                # c) if APN detected, write it to device record
-                if apn:
-                    updated = {**dev, "apn": apn, "cellular_details": []}
-                    update_device_in_db(updated)
-
-            except Exception as e:
-                err = f"{type(e).__name__}: {e}"
-
-            # back to UI thread
-            def done():
-                self.spinner.stop()
-                self.refresh_devices_from_db()
-                msg = []
-                msg.append(f"Detect All for {dev.get('name','Device')} finished.")
-                msg.append(f"• Gateway: {'OK' if gw else '—'}")
-                msg.append(f"• Cellular: {len(details) if details else 0} interface(s)")
-                msg.append(f"• APN: {apn if apn else '—'}")
-                if err:
-                    msg.append(f"\nNote: {err}")
-                QtWidgets.QMessageBox.information(self, "Detect All", "\n".join(msg))
-
-            QtCore.QTimer.singleShot(0, done)
-
-        threading.Thread(target=work, daemon=True).start()
+        thr.started.connect(runner.run)
+        thr.start()
+        dlg.exec_()  # modal progress while the worker runs
 
     def update_last_sms(self, row, ip):
         def work():
