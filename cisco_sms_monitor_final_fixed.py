@@ -120,6 +120,15 @@ def _find_first_attr(self, names):
                 return getattr(self, n)
         return None
 
+def update_sim_for_device(device_id: int, sim_number: str):
+    """Set SIM for all cellular rows of a device (idempotent)."""
+    db = get_db_config()
+    conn = mysql.connector.connect(**db)
+    cur = conn.cursor()
+    cur.execute("UPDATE device_cellular SET sim=%s WHERE device_id=%s", (sim_number, device_id))
+    conn.commit()
+    cur.close(); conn.close()
+
 def _get_table_widget(self, kind: str):
         """
         Returns (widget, mode) where:
@@ -2763,6 +2772,19 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             "Partial results (if any) were not applied."
         )
 
+    def _resolve_recipient(self, to_text: str) -> str:
+        """Return a dialable number. Accepts raw number or device name."""
+        s = (to_text or "").strip()
+        if is_phone_number(s):                 # already a number
+            return s
+        # try device name (case-insensitive)
+        dev = next((d for d in self.devices if d.get("name","").lower() == s.lower()), None)
+        if dev:
+            sim = (dev.get("sim") or "").strip()
+            if sim:
+                return sim
+        return ""  # unknown
+
     def _show_last_tunnel_raw(self):
         try:
             with open("tunnel_debug.txt", "r", encoding="utf-8") as f:
@@ -3810,17 +3832,43 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             return
         if not device.get("has_cellular", False):
             QtWidgets.QMessageBox.information(self, "No Cellular",
-                                              f"'{device.get('name','Unknown')}' has no cellular interface.")
+                                            f"'{device.get('name','Unknown')}' has no cellular interface.")
             return
-        if not (device.get("sim") or "").strip():
-            QtWidgets.QMessageBox.warning(self, "SIM Missing",
-                                          f"Cannot send SMS for '{device.get('name','Unknown')}'.\nPlease set the SIM value first.")
-            return
+
         dialog = SendSMSDialog(device_name=device["name"], router_ip=device["ip"], parent=self)
+
+        # Optional convenience: prefill with the device’s own SIM if present
+        sim_val = (device.get("sim") or "").strip()
+        if sim_val:
+            dialog.to_input.setText(sim_val)
+
         if dialog.exec_() == QtWidgets.QDialog.Accepted:
-            to_number, message = dialog.get_sms_data()
+            to_text, message = dialog.get_sms_data()
+            recipient = self._resolve_recipient(to_text)
+            if not recipient:
+                QtWidgets.QMessageBox.warning(
+                    self, "Unknown recipient",
+                    "Enter a phone number, or a device name that has a SIM set."
+                )
+                return
             username, password = get_ssh_credentials()
-            self.send_sms(device["ip"], username, password, to_number, message)
+            self.send_sms(device["ip"], username, password, recipient, message)
+
+            # ✅ No SIM check here anymore
+            dialog = SendSMSDialog(device_name=device["name"], router_ip=device["ip"], parent=self)
+
+            # Optional: prefill the To: field if we *do* have a SIM value
+            sim_val = (device.get("sim") or "").strip()
+            if sim_val:
+                dialog.to_input.setText(sim_val)
+
+            if dialog.exec_() == QtWidgets.QDialog.Accepted:
+                to_number, message = dialog.get_sms_data()
+                if not to_number.strip():
+                    QtWidgets.QMessageBox.warning(self, "Missing number", "Please enter a recipient number.")
+                    return
+                username, password = get_ssh_credentials()
+                self.send_sms(device["ip"], username, password, to_number.strip(), message)
 
     # ---------- Inbox table fetch/render ----------
     def _populate_inbox_table(self, smsList):
@@ -4093,14 +4141,13 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
                 sms_logs_action.setStatusTip("No cellular interface on this device")
             menu.addAction(sms_logs_action)
 
-            sim_present = bool((d.get("sim") or "").strip())
-            can_send = sim_present and has_cell
+            # ✅ Change: allow Send SMS whenever the device has cellular (SIM may be blank)
+            can_send = has_cell
             send_sms_action.setEnabled(can_send)
             if not has_cell:
                 send_sms_action.setStatusTip("Send SMS disabled: no cellular interface")
-            elif not sim_present:
-                send_sms_action.setStatusTip("Send SMS disabled: SIM is empty for this device")
             menu.addAction(send_sms_action)
+
             menu.addSeparator()
             menu.addAction(delete_action)
 
@@ -4145,6 +4192,8 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
                 except Exception as e:
                     QtWidgets.QMessageBox.critical(self, "Detect failed", str(e))
             detect_hub_action.triggered.connect(on_detect_hub_now)
+
+        self.deviceTable.setSortingEnabled(True)
 
     def detect_all_from_row(self, dev_id: int):
         dev = self._find_device_by_id(dev_id)
@@ -4247,26 +4296,59 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.bind(("0.0.0.0", 514))
             print("📡 Syslog listener started...")
+
             while True:
                 data, addr = sock.recvfrom(1024)
                 if self.is_paused:
                     continue
+
                 message = data.decode("utf-8", errors="ignore")
                 router_ip = addr[0]
                 print(f"🔔 Syslog from {router_ip}: {message.strip()}")
+
+                # EEM applet logs like: "SMS Extracted -> ID: <number>"
                 match = re.search(r"SMS Extracted -> ID: (\d+)", message)
-                if match:
-                    sms_index = match.group(1)
-                    sms = fetch_sms_details(router_ip, sms_index)
-                    last_two = "".join(router_ip.split(".")[-2:])
-                    logical_ip = f"192.168.{last_two}"
-                    email_to = get_email_by_router_ip(logical_ip)
-                    if email_to:
-                        send_email(sms, email_to)
-                    sms["Router"] = self.get_router_name(logical_ip)
-                    self.add_sms_log(sms)
-                else:
+                if not match:
                     print("⚠️ Pattern not matched.")
+                    continue
+
+                sms_index = match.group(1)
+
+                # Pull full SMS from the router
+                sms = fetch_sms_details(router_ip, sms_index)
+
+                # Map “router_ip” (NBMA) to your logical LAN (192.168.X.Y) scheme
+                last_two = "".join(router_ip.split(".")[-2:])
+                logical_ip = f"192.168.{last_two}"
+
+                # Optional email queueing
+                email_to = get_email_by_router_ip(logical_ip)
+                if email_to:
+                    try:
+                        send_email(sms, email_to)
+                    except Exception as e:
+                        print(f"❌ Email send failed: {e}")
+
+                # Tag for UI and push into Live Capture tab
+                sms["Router"] = self.get_router_name(logical_ip)
+
+                # 🔧 Auto-learn SIM from inbound SMS “From” number
+                try:
+                    sender_num = sms.get("From", "")
+                    if is_phone_number(sender_num):
+                        dev = next((d for d in self.devices if d.get("ip") == logical_ip), None)
+                        if dev:
+                            new_sim = normalize_sender(sender_num)  # preserve +61 etc if present
+                            if (dev.get("sim") or "").strip() != new_sim:
+                                update_sim_for_device(dev["id"], new_sim)
+                                # Refresh so SIM appears in Devices table immediately
+                                QtCore.QTimer.singleShot(0, self.refresh_devices_from_db)
+                except Exception as e:
+                    print(f"⚠️ SIM learn failed for {logical_ip}: {e}")
+
+                # Add to in-app log view
+                self.add_sms_log(sms)
+
         t = threading.Thread(target=listen, daemon=True)
         t.start()
 
