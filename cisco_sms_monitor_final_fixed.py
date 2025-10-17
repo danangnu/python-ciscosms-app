@@ -129,32 +129,88 @@ def update_sim_for_device(device_id: int, sim_number: str):
     conn.commit()
     cur.close(); conn.close()
 
-def _get_table_widget(self, kind: str):
-        """
-        Returns (widget, mode) where:
-        mode == "widget" -> QTableWidget
-        mode == "view"   -> QTableView (we'll attach/replace a QStandardItemModel)
-        'kind' is "dmvpn" or "eigrp".
-        """
-        name_sets = {
-            "dmvpn": ["dmvpnTable", "dmvpnTbl", "tblDmvpn", "dmvpn", "tableDMVPN", "tableNhrp"],
-            "eigrp": ["eigrpTable", "eigrpTbl", "tblEigrp", "eigrp", "tableEigrp"]
-        }
-        w = _find_first_attr(self, name_sets.get(kind, []))
-        if w is None:
-            raise RuntimeError(f"Could not find a {kind} table widget on the form.")
+# --- Router facts (hostname / IOS / modem firmware) -------------------------
 
-        if isinstance(w, QtWidgets.QTableWidget):
-            return w, "widget"
-        if isinstance(w, QtWidgets.QTableView):
-            return w, "view"
-        # Some forms embed the view inside a layout — try to unwrap common cases
-        for child in w.findChildren((QtWidgets.QTableWidget, QtWidgets.QTableView)):
-            if isinstance(child, QtWidgets.QTableWidget):
-                return child, "widget"
-            if isinstance(child, QtWidgets.QTableView):
-                return child, "view"
-        raise RuntimeError(f"{kind} table is neither QTableWidget nor QTableView (got {type(w).__name__}).")
+def _parse_hostname(ver_text: str, run_cfg_line: str) -> str:
+    m = re.search(r"(?mi)^\s*hostname\s+([A-Za-z0-9_.-]+)\s*$", run_cfg_line or "")
+    if m: return m.group(1).strip()
+    m = re.search(r"(?m)^\s*([A-Za-z0-9_.-]+)\s+uptime is\b", ver_text or "")
+    return (m.group(1).strip() if m else "")
+
+def _parse_ios_version(ver_text: str) -> str:
+    t = ver_text or ""
+    m = re.search(r"(?i)Cisco IOS XE Software,\s*Version\s*([0-9A-Za-z.\(\)-]+)", t)
+    if m: return m.group(1)
+    m = re.search(r"(?i)Cisco IOS Software.*Version\s*([0-9A-Za-z.\(\)-]+)", t)
+    if m: return m.group(1)
+    m = re.search(r"(?i)\bVersion\s*([0-9A-Za-z.\(\)-]+)", t)
+    return m.group(1) if m else ""
+
+def _parse_cell_fw(*texts: str) -> str:
+    for s in texts:
+        if not s: continue
+        m = re.search(r"(?i)\b(?:Modem\s+)?Firmware(?:\s+|-)Version\s*[:=]\s*([^\r\n]+)", s)
+        if m: return m.group(1).strip()
+        m = re.search(r"(?i)\bFirmware\s*[:=]\s*([^\r\n]+)", s)
+        if m: return m.group(1).strip()
+    return ""
+
+def update_device_facts_in_db(*, device_id=None, ip=None, hostname=None, ios=None, firmware=None):
+    try:
+        db_config = get_db_config()
+        conn = mysql.connector.connect(**db_config)
+        cur = conn.cursor()
+        if device_id is not None:
+            cur.execute("""
+                UPDATE devices
+                   SET hostname=%s, ios_version=%s, modem_firmware=%s
+                 WHERE id=%s
+            """, (hostname, ios, firmware, int(device_id)))
+        elif ip:
+            cur.execute("""
+                UPDATE devices
+                   SET hostname=%s, ios_version=%s, modem_firmware=%s
+                 WHERE ip=%s
+            """, (hostname, ios, firmware, ip))
+        conn.commit(); cur.close(); conn.close()
+    except Exception as e:
+        print(f"⚠️ update_device_facts_in_db: {e}")
+
+def get_router_facts(ip: str, *, timeout: int = 10) -> dict:
+    """Return {'hostname','ios','firmware'} via SSH; best-effort."""
+    facts = {"hostname": "", "ios": "", "firmware": ""}
+    if not is_device_online(ip):
+        return facts
+    username, password = get_ssh_credentials()
+    if not (username and password):
+        return facts
+    try:
+        cli = ssh_connect_resilient(ip, username, password,
+                                    conn_timeout=8, banner_timeout=25, auth_timeout=20, tries=2)
+        sh = cli.invoke_shell(); sh.settimeout(timeout)
+        time.sleep(0.3)
+        if sh.recv_ready(): _ = sh.recv(65535)
+        _shell_send_and_read(sh, "terminal length 0", sleep=0.15, drain_loops=6)
+        ver   = _shell_send_and_read(sh, "show version", sleep=0.35, drain_loops=10)
+        hline = _shell_send_and_read(sh, "show running-config | include ^hostname ", sleep=0.25, drain_loops=6)
+        brief = _shell_send_and_read(sh, "show ip interface brief", sleep=0.3, drain_loops=8)
+
+        facts["hostname"] = _parse_hostname(ver, hline)
+        facts["ios"]      = _parse_ios_version(ver)
+
+        slot = _find_cellular_slot_from_brief(brief)
+        if slot:
+            hw  = _shell_send_and_read(sh, f"show cellular {slot} hardware", sleep=0.3, drain_loops=10)
+            all_= _shell_send_and_read(sh, f"show cellular {slot} all",      sleep=0.35, drain_loops=12)
+            facts["firmware"] = _parse_cell_fw(hw, all_)
+    except Exception as e:
+        print(f"⚠️ get_router_facts({ip}): {e}")
+    finally:
+        try: sh.close()
+        except Exception: pass
+        try: cli.close()
+        except Exception: pass
+    return facts
 
 def ssh_connect_resilient(ip, username, password,
                           conn_timeout=8, banner_timeout=25, auth_timeout=20,
@@ -1065,7 +1121,8 @@ def load_devices_from_db():
     conn = mysql.connector.connect(**db_config)
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT d.name, d.ip, d.gateway, d.apn, d.email, d.id, IFNULL(d.is_hub,0)
+        SELECT d.name, d.ip, d.gateway, d.apn, d.email, d.id, IFNULL(d.is_hub,0),
+               IFNULL(d.hostname,''), IFNULL(d.ios_version,''), IFNULL(d.modem_firmware,'')
         FROM devices d
     """)
     rows = cursor.fetchall()
@@ -1073,48 +1130,39 @@ def load_devices_from_db():
 
     devices = []
     for row in rows:
-        name, ip, gateway, apn, email, dev_id, is_hub = row
+        name, ip, gateway, apn, email, dev_id, is_hub, hostname, ios, fw = row
 
         online = is_device_online(ip)
 
-        # read cellular rows & choose eligible “best” one for UI
         try:
-            cells = get_device_cellular(dev_id)  # now returns sim field too
+            cells = get_device_cellular(dev_id)
         except Exception:
             cells = []
 
         eligible = []
         for r in cells:
             d = {
-                "interface": r["interface"],
-                "ip": r["ip_addr"],
-                "status": r["status"],
-                "protocol": r["protocol"],
-                "imsi": r["imsi"],
-                "imei": r["imei"],
-                "iccid": r["iccid"],
-                "apn": r["apn"],
-                "sim": r.get("sim") or "",
+                "interface": r["interface"], "ip": r["ip_addr"], "status": r["status"], "protocol": r["protocol"],
+                "imsi": r["imsi"], "imei": r["imei"], "iccid": r["iccid"], "apn": r["apn"], "sim": r.get("sim") or "",
             }
             if _is_qualified_cell_row(d):
                 eligible.append(d)
 
         has_cell = bool(eligible)
-        best = max(eligible, key=_score_iface) if eligible else {}
-        sim_for_ui = best.get("sim", "")
-        # keep APN on devices; (display stays the device column value)
-        register = is_device_register(ip) if (online and has_cell) else False
+        try:
+            best = max(eligible, key=_score_iface) if eligible else {}
+        except ValueError:
+            best = eligible[0] if eligible else {}
+        sim_for_ui = (best.get("sim") or "")
 
-        status = "Offline"
-        if online:
-            status = "Online" if register or not has_cell else "Not Register"
+        register = is_device_register(ip) if (online and has_cell) else False
+        status = "Online" if (online and (register or not has_cell)) else ("Offline" if not online else "Not Register")
 
         devices.append({
             "name": name, "ip": ip, "gateway": gateway,
-            "sim": sim_for_ui,        # <— for UI & filters
-            "apn": apn,
-            "imsi": "", "imei": "", "iccid": "",  # no longer used at device level
-            "email": email, "lastSMS": "", "signal": 0, "status": status,
+            "sim": sim_for_ui, "apn": apn, "email": email,
+            "hostname": hostname, "ios_version": ios, "modem_firmware": fw,  # ← NEW
+            "lastSMS": "", "signal": 0, "status": status,
             "id": dev_id, "is_hub": bool(is_hub), "has_cellular": has_cell,
         })
     return devices
@@ -1125,14 +1173,13 @@ def update_device_in_db(device):
     cursor = conn.cursor()
     cursor.execute("""
         UPDATE devices
-        SET apn=%s,
-            email=%s,
-            name=%s,
-            gateway=%s
-        WHERE ip=%s
-    """, (device["apn"], device["email"], device["name"], device["gateway"], device["ip"]))
-    conn.commit()
-    cursor.close(); conn.close()
+           SET apn=%s, email=%s, name=%s, gateway=%s,
+               hostname=%s, ios_version=%s, modem_firmware=%s
+         WHERE ip=%s
+    """, (device["apn"], device["email"], device["name"], device["gateway"],
+          device.get("hostname") or None, device.get("ios_version") or None, device.get("modem_firmware") or None,
+          device["ip"]))
+    conn.commit(); cursor.close(); conn.close()
 
     if device.get("id"):
         try:
@@ -1160,15 +1207,15 @@ def insert_device_to_db(device):
         pass
 
     cur.execute("""
-        INSERT INTO devices (name, ip, gateway, apn, email, is_hub)
-        VALUES (%s,%s,%s,%s,%s,%s)
+        INSERT INTO devices (name, ip, gateway, apn, email, is_hub, hostname, ios_version, modem_firmware)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
     """, (device["name"], device["ip"], device["gateway"], device["apn"],
-        device["email"], is_hub))
+          device["email"], is_hub,
+          device.get("hostname") or None, device.get("ios_version") or None, device.get("modem_firmware") or None))
     conn.commit()
     device_id = cur.lastrowid
     cur.close(); conn.close()
 
-    # Save qualified cellular rows only
     try:
         replace_device_cellular(device_id, device.get("cellular_details", []))
     except Exception as e:
@@ -2114,6 +2161,9 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
             self.nameLineEdit.setText(device["name"])
             self.ipLineEdit.setText(device["ip"])
             self.gatewayLineEdit.setText(device["gateway"])
+            self.hostnameLineEdit.setText(device.get("hostname",""))
+            self.iosLineEdit.setText(device.get("ios_version",""))
+            self.fwLineEdit.setText(device.get("modem_firmware",""))
             self.simLineEdit.setText(device["sim"])
             self.apnLineEdit.setText(device["apn"])
             self.emailLineEdit.setText(device["email"])
@@ -2430,7 +2480,22 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
         grid.addWidget(QtWidgets.QLabel("ICCID"), 2, 0); grid.addWidget(self.iccidLineEdit, 2, 1)
         grid.addWidget(QtWidgets.QLabel("SIM"),   3, 0); grid.addWidget(self.simLineEdit,   3, 1)
 
+                # NEW: Hostname / IOS / Firmware (IOS+Firmware read-only; fetched via SSH)
+        self.hostnameLineEdit = getattr(self, "hostnameLineEdit", None) or QtWidgets.QLineEdit()
+        self.iosLineEdit      = getattr(self, "iosLineEdit",      None) or QtWidgets.QLineEdit()
+        self.fwLineEdit       = getattr(self, "fwLineEdit",       None) or QtWidgets.QLineEdit()
+        self.iosLineEdit.setReadOnly(True); self.fwLineEdit.setReadOnly(True)
+        self.iosLineEdit.setPlaceholderText("— detected via SSH —")
+        self.fwLineEdit.setPlaceholderText("— detected via SSH —")
+
+        grid2 = QtWidgets.QGridLayout()
+        grid2.setVerticalSpacing(6); grid2.setHorizontalSpacing(8)
+        grid2.addWidget(QtWidgets.QLabel("Hostname"), 0, 0); grid2.addWidget(self.hostnameLineEdit, 0, 1)
+        grid2.addWidget(QtWidgets.QLabel("IOS"),      1, 0); grid2.addWidget(self.iosLineEdit,      1, 1)
+        grid2.addWidget(QtWidgets.QLabel("Firmware"), 2, 0); grid2.addWidget(self.fwLineEdit,       2, 1)
+        
         main_vbox.insertLayout(6, grid)
+        main_vbox.insertLayout(7, grid2)
 
         # when SIM text changes, keep our in-memory detail list in sync
         self.simLineEdit.textChanged.connect(self._on_sim_changed)
