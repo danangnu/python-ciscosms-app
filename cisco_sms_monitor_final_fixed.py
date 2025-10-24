@@ -1142,8 +1142,15 @@ def load_devices_from_db():
         eligible = []
         for r in cells:
             d = {
-                "interface": r["interface"], "ip": r["ip_addr"], "status": r["status"], "protocol": r["protocol"],
-                "imsi": r["imsi"], "imei": r["imei"], "iccid": r["iccid"], "apn": r["apn"], "sim": r.get("sim") or "",
+                "interface": r["interface"],
+                "ip": r["ip_addr"],
+                "status": r["status"],
+                "protocol": r["protocol"],
+                "imsi": r["imsi"],
+                "imei": r["imei"],
+                "iccid": r["iccid"],
+                "apn": r["apn"],
+                "sim": r.get("sim") or "",
             }
             if _is_qualified_cell_row(d):
                 eligible.append(d)
@@ -1153,17 +1160,34 @@ def load_devices_from_db():
             best = max(eligible, key=_score_iface) if eligible else {}
         except ValueError:
             best = eligible[0] if eligible else {}
-        sim_for_ui = (best.get("sim") or "")
+
+        sim_for_ui   = (best.get("sim") or "")
+        iccid_for_ui = (best.get("iccid") or "")  # ← NEW
 
         register = is_device_register(ip) if (online and has_cell) else False
-        status = "Online" if (online and (register or not has_cell)) else ("Offline" if not online else "Not Register")
+        status = (
+            "Online"
+            if (online and (register or not has_cell))
+            else ("Offline" if not online else "Not Register")
+        )
 
         devices.append({
-            "name": name, "ip": ip, "gateway": gateway,
-            "sim": sim_for_ui, "apn": apn, "email": email,
-            "hostname": hostname, "ios_version": ios, "modem_firmware": fw,  # ← NEW
-            "lastSMS": "", "signal": 0, "status": status,
-            "id": dev_id, "is_hub": bool(is_hub), "has_cellular": has_cell,
+            "name": name,
+            "ip": ip,
+            "gateway": gateway,
+            "sim": sim_for_ui,
+            "apn": apn,
+            "iccid": iccid_for_ui,  # ← NEW (use this to display after APN)
+            "email": email,
+            "hostname": hostname,
+            "ios_version": ios,
+            "modem_firmware": fw,
+            "lastSMS": "",
+            "signal": 0,
+            "status": status,
+            "id": dev_id,
+            "is_hub": bool(is_hub),
+            "has_cellular": has_cell,
         })
     return devices
 
@@ -1355,17 +1379,29 @@ def parse_ids_from_cellular_text(text: str):
     """
     imsi = imei = iccid = ""
 
-    # IMSI (SIM x IMSI:, IMSI =, IMSI:)
-    m = re.search(r"(?im)^\s*(?:SIM\s*\d+\s*)?IMSI\s*[:=]\s*([0-9]{6,20})\b", text)
-    if m: imsi = m.group(1)
+    # IMSI: allow "IMSI =" or "International Mobile Subscriber Identity (IMSI) ="
+    m = re.search(
+        r"(?im)^\s*(?:International\s+Mobile\s+Subscriber\s+Identity\s*\(IMSI\)\s*|(?:SIM\s*\d+\s*)?IMSI)\s*[:=]\s*([0-9]{6,20})\b",
+        text
+    )
+    if m:
+        imsi = m.group(1)
 
-    # IMEI (International Mobile Equipment Identity (IMEI) = NNN…)
-    m = re.search(r"(?im)^\s*(?:International\s+Mobile\s+Equipment\s+Identity\s*\(IMEI\)\s*|IMEI)\s*[:=]\s*([0-9]{8,20})\b", text)
-    if m: imei = m.group(1)
+    # IMEI: current pattern already handles long/short forms with (IMEI)
+    m = re.search(
+        r"(?im)^\s*(?:International\s+Mobile\s+Equipment\s+Identity\s*\(IMEI\)\s*|IMEI)\s*[:=]\s*([0-9]{8,20})\b",
+        text
+    )
+    if m:
+        imei = m.group(1)
 
-    # ICCID (ICCID:, ICCID (SIM x):, Integrated Circuit Card ID)
-    m = re.search(r"(?im)^\s*(?:ICCID|Integrated\s+Circuit\s+Card\s+ID)\s*(?:\(\s*SIM\s*\d+\s*\))?\s*[:=]\s*([0-9A-F]{10,30})\b", text)
-    if m: iccid = m.group(1)
+    # ICCID: allow "Integrated Circuit Card ID (ICCID) =" or "ICCID (SIM x) ="
+    m = re.search(
+        r"(?im)^\s*(?:Integrated\s+Circuit\s+Card\s+ID(?:\s*\(ICCID\))?|ICCID(?:\s*\(\s*SIM\s*\d+\s*\))?)\s*[:=]\s*([0-9A-Fa-f]{10,30})\b",
+        text
+    )
+    if m:
+        iccid = m.group(1)
 
     return imsi, imei, iccid
 
@@ -4125,14 +4161,18 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         self._view_devices = list(device_list)
 
         self.deviceTable.setSortingEnabled(False)
-        self.deviceTable.setColumnCount(10)
+
+        # ⬅️ We now have 11 columns (added ICCID after APN)
+        self.deviceTable.setColumnCount(11)
         self.deviceTable.setHorizontalHeaderLabels([
-            "Device", "IP", "Gateway", "SIM", "APN", "Email", "Last SMS", "Signal", "Status", "Actions"
+            "Device", "IP", "Gateway", "SIM", "APN",
+            "ICCID",                      # new column
+            "Email", "Last SMS", "Signal", "Status", "Actions"
         ])
         self.deviceTable.setRowCount(len(device_list))
 
-        # resolve Last SMS column index once
-        self._last_sms_col = _col_index(self, "Last SMS", default=6)
+        # resolve Last SMS column index once (fallback moved from 6 → 7 because of ICCID)
+        self._last_sms_col = _col_index(self, "Last SMS", default=7)
 
         for i, d in enumerate(device_list):
             dev_id = d["id"]
@@ -4147,10 +4187,19 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             self.deviceTable.setItem(i, 1, IPItem(d["ip"]))
             self.deviceTable.setItem(i, 2, QtWidgets.QTableWidgetItem(d["gateway"]))
 
+            # SIM (col 3) + APN (col 4)
             self._set_sim_apn_cells(i, d.get("has_cellular", False), d.get("sim", ""), d.get("apn", ""))
 
-            # Email
-            self.deviceTable.setItem(i, 5, QtWidgets.QTableWidgetItem(d["email"]))
+            # ICCID (col 5) — show parsed ICCID from best cellular iface (or em dash)
+            col_iccid = _col_index(self, "ICCID")     # <-- use function, not self._col_index
+            if col_iccid != -1:
+                iccid_txt = d.get("iccid") or "—"
+                item = QtWidgets.QTableWidgetItem(iccid_txt)
+                item.setTextAlignment(Qt.AlignCenter)
+                self.deviceTable.setItem(i, col_iccid, item)
+
+            # Email (shifted to col 6)
+            self.deviceTable.setItem(i, 6, QtWidgets.QTableWidgetItem(d["email"]))
 
             # Last SMS: spinner + watchdog if cellular, else static text
             if d.get("has_cellular", False):
@@ -4165,14 +4214,14 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
                     w.deleteLater()
                 self.deviceTable.setItem(i, last_col, QtWidgets.QTableWidgetItem("No Cellular"))
 
-            # Signal
-            self.deviceTable.setItem(i, 7, QtWidgets.QTableWidgetItem("▓" * d.get("signal", 0)))
+            # Signal (shifted to col 8)
+            self.deviceTable.setItem(i, 8, QtWidgets.QTableWidgetItem("▓" * d.get("signal", 0)))
 
-            # Status
+            # Status (shifted to col 9)
             status_widget = create_status_label(d["status"])
-            self.deviceTable.setCellWidget(i, 8, status_widget)
+            self.deviceTable.setCellWidget(i, 9, status_widget)
 
-            # Actions menu
+            # Actions menu (shifted to col 10)
             action_button = QToolButton()
             action_button.setText("Edit")
             action_button.setIcon(QIcon(resource_path("icons/edit.png")))
@@ -4206,7 +4255,7 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
                 sms_logs_action.setStatusTip("No cellular interface on this device")
             menu.addAction(sms_logs_action)
 
-            # ✅ Change: allow Send SMS whenever the device has cellular (SIM may be blank)
+            # allow Send SMS whenever the device has cellular
             can_send = has_cell
             send_sms_action.setEnabled(can_send)
             if not has_cell:
@@ -4217,7 +4266,7 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             menu.addAction(delete_action)
 
             action_button.setMenu(menu)
-            self.deviceTable.setCellWidget(i, 9, action_button)
+            self.deviceTable.setCellWidget(i, 10, action_button)
 
             # Connect actions
             action_button.clicked.connect(lambda _, id=dev_id: self.open_settings_dialog_by_id(id))
