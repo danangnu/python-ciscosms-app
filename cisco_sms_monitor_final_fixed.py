@@ -26,7 +26,12 @@ import mysql.connector
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 
-RECENT_SENDER_WINDOW_SEC = 900   # 15 minutes; tune as you like
+from collections import deque
+_RECENT_SENDERS = deque(maxlen=200)
+_RECENT_LOCK = threading.Lock()
+RECENT_SENDER_WINDOW_SEC = 3 * 60  # 3 minutes is plenty
+RECENT_SENDER_WINDOW_SEC = 900  # 15 min
+_clock = time.time
 
 # ---------- Helpers / resources ----------
 def resource_path(relative_path):
@@ -405,6 +410,29 @@ try:
     _ipv4_re
 except NameError:
     _ipv4_re = re.compile(_IPV4_PATTERN)
+
+def map_to_lan(ip: str) -> str:
+    """
+    Map NBMA (e.g. 172.16.1.205) -> LAN (192.168.205.1).
+    Rule: swap the last two octets, and prefix with 192.168.
+    If the IP is already 192.168.X.Y, return it unchanged.
+    """
+    try:
+        a, b, c, d = ip.split(".")
+    except ValueError:
+        return ip  # not IPv4-ish, bail
+
+    # If it's already on the LAN scheme, don't touch it
+    if a == "192" and b == "168":
+        return ip
+
+    # NBMA -> LAN: 172.16.c.d  ==>  192.168.d.c
+    return f"192.168.{d}.{c}"
+
+def note_recent_sender(lan_ip: str):
+    """Remember that 'lan_ip' just sent an SMS (now)."""
+    with _RECENT_LOCK:
+        _RECENT_SENDERS.append((lan_ip, time.time()))
 
 def is_device_register(ip: str, *, timeout: int = 8) -> bool:
     """
@@ -818,16 +846,19 @@ def _eligible_detail(d: dict) -> bool:
     )
 
 def replace_device_cellular(device_id: int, details: list):
-    """Purge then insert only qualified rows."""
+    # keep only real rows, then bail if nothing to update
     details = [d for d in (details or []) if _is_qualified_cell_row(d)]
+    if not details:
+        return  # ← Do nothing; preserves existing SIM/IDs
+
     db = get_db_config()
     conn = mysql.connector.connect(**db)
     cur = conn.cursor()
     cur.execute("DELETE FROM device_cellular WHERE device_id=%s", (device_id,))
     conn.commit()
     cur.close(); conn.close()
-    if details:
-        upsert_device_cellular(device_id, details)
+
+    upsert_device_cellular(device_id, details)
 
 # ---------- Fast single-SSH probe ----------
 def probe_device_fast(ip: str, timeout: int = 6):
@@ -1287,25 +1318,179 @@ def load_devices_from_db():
         })
     return devices
 
-def update_device_in_db(device):
+def update_device_in_db(device: dict):
+    """
+    Update the devices row and (optionally) cellular rows/SIM.
+    - Only replaces device_cellular rows if non-empty 'cellular_details' are provided.
+    - If a SIM text is supplied (device['sim']), persist it to device_cellular.sim.
+    """
     db_config = get_db_config()
-    conn = mysql.connector.connect(**db_config)
-    cursor = conn.cursor()
-    cursor.execute("""
-        UPDATE devices
-           SET apn=%s, email=%s, name=%s, gateway=%s,
-               hostname=%s, ios_version=%s, modem_firmware=%s
-         WHERE ip=%s
-    """, (device["apn"], device["email"], device["name"], device["gateway"],
-          device.get("hostname") or None, device.get("ios_version") or None, device.get("modem_firmware") or None,
-          device["ip"]))
-    conn.commit(); cursor.close(); conn.close()
 
-    if device.get("id"):
+    # 1) Update main devices table
+    conn = mysql.connector.connect(**db_config)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE devices
+               SET apn=%s,
+                   email=%s,
+                   name=%s,
+                   gateway=%s,
+                   hostname=%s,
+                   ios_version=%s,
+                   modem_firmware=%s
+             WHERE ip=%s
+            """,
+            (
+                device.get("apn") or None,
+                device.get("email") or None,
+                device.get("name") or None,
+                device.get("gateway") or None,
+                device.get("hostname") or None,
+                device.get("ios_version") or None,
+                device.get("modem_firmware") or None,
+                device["ip"],
+            ),
+        )
+        conn.commit()
+    finally:
+        try: cur.close()
+        except: pass
+        conn.close()
+
+    # 2) Replace device_cellular rows ONLY if caller passed new details
+    dev_id = device.get("id")
+    details = device.get("cellular_details", None)
+    if dev_id and details:
         try:
-            replace_device_cellular(device["id"], device.get("cellular_details", []))
+            replace_device_cellular(dev_id, details)
         except Exception as e:
             print(f"⚠️ replace_device_cellular failed: {e}")
+
+    # 3) If user typed a SIM in the dialog, persist it to device_cellular.sim
+    sim_text = (device.get("sim") or "").strip()
+    if dev_id and sim_text:
+        try:
+            # If you already have this helper, prefer it:
+            # update_cellular_sim(dev_id, sim_text, prefer_iface=device.get("interface"))
+            # Otherwise, use a minimal inline updater:
+            _update_sim_for_device(dev_id, sim_text, prefer_iface=device.get("interface"))
+        except Exception as e:
+            print(f"⚠️ SIM update failed for device_id={dev_id}: {e}")
+
+
+def replace_device_cellular(device_id: int, details: list):
+    """
+    Safely replace cellular rows for a device.
+    - No-op if 'details' is empty (prevents accidental deletion when editing basic fields).
+    - Inserts only 'qualified' rows.
+    """
+    # Reuse your existing qualifier if present; otherwise, use a conservative fallback.
+    try:
+        qual = _is_qualified_cell_row  # type: ignore[name-defined]
+    except NameError:
+        def qual(d: dict) -> bool:
+            if not d: return False
+            if not d.get("interface"): return False
+            # keep row if any meaningful cellular field is present
+            keys = ("ip_addr", "status", "protocol", "imsi", "imei", "iccid", "apn", "sim")
+            return any((d.get(k) or "").strip() for k in keys)
+
+    rows = [r for r in (details or []) if qual(r)]
+    if not rows:
+        # Nothing to replace → keep existing DB rows intact
+        return
+
+    db_config = get_db_config()
+    conn = mysql.connector.connect(**db_config)
+    try:
+        cur = conn.cursor()
+        # purge and re-insert only when we actually have rows
+        cur.execute("DELETE FROM device_cellular WHERE device_id=%s", (device_id,))
+        conn.commit()
+
+        ins = (
+            "INSERT INTO device_cellular "
+            "(device_id, interface, ip_addr, status, protocol, imsi, imei, iccid, apn, sim, modem_firm, last_seen) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, NOW())"
+        )
+        for r in rows:
+            cur.execute(
+                ins,
+                (
+                    device_id,
+                    r.get("interface") or "",
+                    r.get("ip_addr") or "unassigned",
+                    r.get("status") or "",
+                    r.get("protocol") or "",
+                    r.get("imsi") or "",
+                    r.get("imei") or "",
+                    r.get("iccid") or "",
+                    r.get("apn") or "",
+                    r.get("sim") or "",
+                    r.get("modem_firmware") or "",
+                ),
+            )
+        conn.commit()
+    finally:
+        try: cur.close()
+        except: pass
+        conn.close()
+
+
+def _update_sim_for_device(device_id: int, sim_text: str, prefer_iface: str | None = None):
+    """
+    Minimal inline SIM updater for device_cellular.sim.
+    - If prefer_iface exists, update that row.
+    - Else update the 'best' row (has IP, then status up, newest).
+    - If no row exists, create a minimal one.
+    """
+    db_config = get_db_config()
+    conn = mysql.connector.connect(**db_config)
+    try:
+        cur = conn.cursor()
+
+        row_id = None
+        if prefer_iface:
+            cur.execute(
+                "SELECT id FROM device_cellular WHERE device_id=%s AND interface=%s LIMIT 1",
+                (device_id, prefer_iface),
+            )
+            r = cur.fetchone()
+            if r: row_id = r[0]
+
+        if row_id is None:
+            cur.execute(
+                """
+                SELECT id FROM device_cellular
+                  WHERE device_id=%s
+                  ORDER BY (ip_addr <> 'unassigned') DESC,
+                           (status='up') DESC,
+                           id DESC
+                  LIMIT 1
+                """,
+                (device_id,),
+            )
+            r = cur.fetchone()
+            if r: row_id = r[0]
+
+        if row_id is not None:
+            cur.execute("UPDATE device_cellular SET sim=%s, last_seen=NOW() WHERE id=%s", (sim_text, row_id))
+        else:
+            cur.execute(
+                """
+                INSERT INTO device_cellular
+                    (device_id, interface, ip_addr, status, protocol, imsi, imei, iccid, apn, sim, modem_firm, last_seen)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+                """,
+                (device_id, prefer_iface or "Cellular0/0/0", "unassigned", "down", "", "", "", "", "", sim_text, ""),
+            )
+        conn.commit()
+    finally:
+        try: cur.close()
+        except: pass
+        conn.close()
 
 def delete_device_from_db(device_id):
     db_config = get_db_config()
@@ -2844,7 +3029,8 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         self._view_devices = []
         # track recent outgoing-sender events (ip, t)
         from collections import deque
-        self._recent_senders = deque(maxlen=32)
+        self._recent_senders = deque(maxlen=200)   # stores (lan_ip, ts_seconds)
+        self._senders_lock = threading.Lock()
 
         # --- after uic.loadUi(ui_file, self) ---
         # Bind tabs by name (these must exist in the .ui)
@@ -4604,6 +4790,8 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             print(f"📤 Sending SMS: {cmd}")
             ssh.exec_command(cmd); ssh.close()
             QtWidgets.QMessageBox.information(self, "Success", f"SMS sent to {recipient}")
+            lan_ip = map_to_lan(router_ip)  # 172.16.1.203 -> 192.168.203.1
+            note_recent_sender(lan_ip)
         except Exception as e:
             QtWidgets.QMessageBox.warning(self, "Error", f"Failed to send SMS:\n{e}")
 
@@ -4712,6 +4900,38 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         if not self._cell_refresh_timer.isActive():
             self._cell_refresh_timer.start(delay_ms)
 
+    def _append_recent_sender(self, ip: str) -> None:
+            ts = _clock()  # seconds
+            with self._senders_lock:
+                self._recent_senders.append((ip, ts))
+
+    def _pick_recent_sender(self) -> str | None:
+        now = _clock()
+        with self._senders_lock:
+            for ip, t in reversed(self._recent_senders):
+                # tolerate bad scales (ms / ns / strings)
+                try:
+                    ts = float(t)
+                except Exception:
+                    continue
+                if ts > 1e12:      # looks like milliseconds
+                    ts /= 1000.0
+                if ts > 1e15:      # looks like nanoseconds
+                    ts /= 1e9
+
+                age = now - ts
+                if 0 <= age <= RECENT_SENDER_WINDOW_SEC:
+                    return ip
+        # debug if nothing matched
+        try:
+            oldest = min((float(t) for _, t in self._recent_senders), default=None)
+            newest = max((float(t) for _, t in self._recent_senders), default=None)
+            print(f"[recent] none in window; count={len(self._recent_senders)}, "
+                f"age_oldest={now-(oldest or now):.1f}s age_newest={now-(newest or now):.1f}s")
+        except Exception:
+            pass
+        return None
+    
     def _maybe_mark_refresh_by_ip(self, ip: str):
         dev = self._find_device_by_ip(ip)
         if not dev:
@@ -4736,7 +4956,6 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             return f"192.168.{parts[3]}.{parts[2]}"
         return syslog_ip
 
-
     # ---------- Syslog listener ----------
     def start_syslog_listener(self):
         # make sure the recent-senders ring exists
@@ -4744,17 +4963,15 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             from collections import deque
             self._recent_senders = deque(maxlen=32)
 
-        def map_to_lan(ip: str) -> str:
-            """
-            NBMA (e.g., 172.16.1.200) -> LAN (192.168.200.1)
-            Rule: A.B.C.D  ->  192.168.D.C
-            """
-            p = (ip or "").split(".")
-            if len(p) == 4 and all(part.isdigit() for part in p):
-                return f"192.168.{p[3]}.{p[2]}"
-            return ip
-
-
+        def pick_recent_sender(now: float | None = None) -> str | None:
+            """Return most recent sender within window."""
+            now = now or time.time()
+            with _RECENT_LOCK:
+                for ip, t in reversed(_RECENT_SENDERS):
+                    if now - t <= RECENT_SENDER_WINDOW_SEC:
+                        return ip
+            return None
+    
         def is_phone_number(s: str) -> bool:
             return bool(re.fullmatch(r"[+]?[\d]{6,20}", (s or "").strip()))
 
@@ -4858,7 +5075,9 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
                 # 1) OUTGOING SMS (sender) — remember who just sent
                 if "%CELLWAN-5-OUTGOING_SMS_SENT" in message:
                     sender_ip = map_to_lan(router_ip)     # e.g., 192.168.203.1
-                    self._recent_senders.append((sender_ip, time.time()))
+                    lan_ip = self._map_syslog_ip_to_device_ip(router_ip)
+                    self._append_recent_sender(lan_ip)
+                    # self._recent_senders.append((sender_ip, time.time()))
                     # optionally also do a quick cellular refresh of the sender:
                     QtCore.QTimer.singleShot(0, lambda ip=sender_ip: self._maybe_mark_refresh_by_ip(ip))
 
@@ -4897,16 +5116,12 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
                 try:
                     from_num = normalize_msisdn(sms.get("From", ""))
                     if is_phone_number(from_num):
-                        # pick most-recent sender within 3 minutes
-                        now = time.time()
-                        sender_ip = None
-                        for ip, t in reversed(self._recent_senders):
-                            if now - t <= RECENT_SENDER_WINDOW_SEC:
-                                sender_ip = ip
-                                break
+                        # Find the most recent sender inside the window
+                        sender_ip = pick_recent_sender()
+
                         if sender_ip:
                             # update in-memory device, DB, and repaint the sender row
-                            dev = self._find_device_by_ip(sender_ip)
+                            dev = self._find_device_by_ip(lan_ip)
                             if dev and (dev.get("sim") or "").strip() != from_num:
                                 try:
                                     update_sender_sim_in_db(dev["id"], from_num)
