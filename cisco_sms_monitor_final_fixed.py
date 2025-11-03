@@ -33,11 +33,45 @@ RECENT_SENDER_WINDOW_SEC = 3 * 60  # 3 minutes is plenty
 RECENT_SENDER_WINDOW_SEC = 900  # 15 min
 _clock = time.time
 
+# put near imports once
+_PROMPT_LINE_RE = re.compile(rb'^[^\r\n]*[>#]\s*$', re.M)
+_TERM_LEN_RE    = re.compile(r'(?:\bterminal\b.*\blength\b|^term\s+len.*$|length\s*=\s*0)', re.I)
+
 # ---------- Helpers / resources ----------
 def resource_path(relative_path):
     if hasattr(sys, '_MEIPASS'):
         return os.path.join(sys._MEIPASS, relative_path)
     return os.path.join(os.path.abspath("."), relative_path)
+
+def _strip_term_len_noise(s: str) -> str:
+    if not s: return s
+    return '\n'.join(ln for ln in s.splitlines() if not _TERM_LEN_RE.search(ln))
+
+def _capture_prompt(chan, timeout: float = 3.0) -> bytes:
+    """Return the current prompt line (bytes, no CRLF)."""
+    deadline = time.time() + timeout
+    buf = bytearray()
+    # ask device to print a prompt
+    chan.send('\n')
+    while time.time() < deadline:
+        if chan.recv_ready():
+            chunk = chan.recv(65535)
+            if not chunk:
+                break
+            buf.extend(chunk)
+            # scan last few lines for a prompt-like line
+            tail = bytes(buf[-2048:])
+            m = _PROMPT_LINE_RE.search(tail)
+            if m:
+                # return the last matching line
+                lines = tail.splitlines()
+                for i in range(len(lines) - 1, -1, -1):
+                    if _PROMPT_LINE_RE.match(lines[i]):
+                        return lines[i].rstrip()
+        else:
+            time.sleep(0.03)
+    # fallback: generic
+    return b'#'
 
 def _is_qualified_cell_row(d: dict) -> bool:
     """
@@ -185,6 +219,26 @@ def _parse_cell_fw(*texts: str) -> str:
         m = re.search(r"(?i)\bFirmware\s*[:=]\s*([^\r\n]+)", s)
         if m: return m.group(1).strip()
     return ""
+
+def fetch_latest_sim_from_db(device_id: int) -> str:
+    """Return the newest non-empty SIM for a device from device_cellular."""
+    db = get_db_config()
+    conn = mysql.connector.connect(**db)
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT sim
+            FROM device_cellular
+            WHERE device_id = %s AND COALESCE(sim, '') <> ''
+            ORDER BY id DESC
+            LIMIT 1
+        """, (device_id,))
+        row = cur.fetchone()
+        return (row[0] or "").strip() if row else ""
+    finally:
+        try: cur.close()
+        except: pass
+        conn.close()
 
 def parse_sms_view_all_for_dialog(text: str):
     """
@@ -454,7 +508,6 @@ def is_device_register(ip: str, *, timeout: int = 8) -> bool:
         _REGISTER_CACHE[ip] = (now, False)
         return False
 
-    import paramiko
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
@@ -757,10 +810,11 @@ def upsert_device_cellular(device_id: int, details: list):
       last_seen=NOW();
     """
     for d in details:
+        ip_addr = (d.get("ip_addr") or d.get("ip") or "").strip() or None
         cur.execute(sql, (
             device_id,
             d.get("interface",""),
-            d.get("ip") or None,
+            ip_addr,
             d.get("status") or None,
             d.get("protocol") or None,
             d.get("imsi") or None,
@@ -1238,6 +1292,43 @@ def set_device_hub_flag(device_id: int, is_hub: bool) -> int:
     cur.close(); conn.close()
     return affected
 
+def _extract_sms_body(raw: str) -> str:
+        """
+        Cisco '... sms view <id>' output → return just the message text.
+        Works for formats like:
+        SMS ID: 13
+        TIME: 25-11-03 10:24:28
+        FROM: 61403352637
+        SIZE: 19
+        "sent from 206 (1)"
+        Also copes with bodies that aren't quoted or are multi-line.
+        """
+        if not raw:
+            return ""
+
+        txt = raw.strip()
+
+        # 1) Common case: quoted body on the next line after SIZE:
+        m = re.search(r"SIZE:\s*\d+.*?\n(.*)$", txt, flags=re.I | re.S)
+        body = (m.group(1).strip() if m else "")
+
+        # 2) If not captured, try generic quoted content anywhere:
+        if not body:
+            m = re.search(r'"([^"]+)"', txt, flags=re.S)
+            if m:
+                body = m.group(1).strip()
+
+        # 3) If still empty, try "Content:" style:
+        if not body:
+            m = re.search(r"CONTENT\s*:\s*(.*)$", txt, flags=re.I | re.S)
+            if m:
+                body = m.group(1).strip()
+
+        # Cleanup: remove dashed footers and collapse whitespace
+        body = re.sub(r"-{3,}.*$", "", body, flags=re.S)
+        body = re.sub(r"\s+", " ", body).strip()
+        return body
+
 def _parse_msisdn(text: str) -> str:
     # MSISDN, MDN, Phone number, Line number: accept + and digits
     m = re.search(r"(?im)^\s*(?:MSISDN|MDN|Phone\s*Number|Line\s*Number)\s*[:=]\s*([+\d]{6,20})\b", text)
@@ -1412,7 +1503,7 @@ def replace_device_cellular(device_id: int, details: list):
 
         ins = (
             "INSERT INTO device_cellular "
-            "(device_id, interface, ip_addr, status, protocol, imsi, imei, iccid, apn, sim, modem_firm, last_seen) "
+            "(device_id, interface, ip_addr, status, protocol, imsi, imei, iccid, apn, sim, modem_firmware, last_seen) "
             "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, NOW())"
         )
         for r in rows:
@@ -1481,7 +1572,7 @@ def _update_sim_for_device(device_id: int, sim_text: str, prefer_iface: str | No
             cur.execute(
                 """
                 INSERT INTO device_cellular
-                    (device_id, interface, ip_addr, status, protocol, imsi, imei, iccid, apn, sim, modem_firm, last_seen)
+                    (device_id, interface, ip_addr, status, protocol, imsi, imei, iccid, apn, sim, modem_firmware, last_seen)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
                 """,
                 (device_id, prefer_iface or "Cellular0/0/0", "unassigned", "down", "", "", "", "", "", sim_text, ""),
@@ -1766,6 +1857,203 @@ def extract_sms_content(sms_text: str) -> str:
                 return lines[i + 1].strip().strip('"')
     return ""
 
+def _normalize_cellular_iface(s: str) -> str:
+    """
+    Accepts: 'Cellular0/1/0', 'cellular 0/1/0', '0/1/0', etc.
+    Returns: 'cellular 0/1/0'
+    """
+    s = (s or "").strip()
+    # pull the slot/port/controller (e.g. 0/1/0)
+    m = re.search(r'(\d+/\d+/\d+)', s)
+    if m:
+        return f"cellular {m.group(1)}"
+    # safe default
+    return "cellular 0/1/0"
+
+
+def _alive(t):
+    try:
+        return bool(t and t.is_active())
+    except Exception:
+        return False
+    
+import re, time, paramiko
+
+_PROMPT_LINE_RE = re.compile(rb'^[^\r\n]*[>#]\s*$', re.M)
+_TERM_LEN_RE    = re.compile(r'(?:\bterminal\b.*\blength\b|^term\s+len.*$|length\s*=\s*0)', re.I)
+
+def _strip_term_len_noise(s: str) -> str:
+    if not s: return s
+    return '\n'.join(ln for ln in s.splitlines() if not _TERM_LEN_RE.search(ln))
+
+def _capture_prompt_line(chan, timeout: float = 2.5) -> bytes:
+    """Ask device to print prompt once; return that exact line (bytes, no CRLF)."""
+    deadline = time.time() + timeout
+    buf = bytearray()
+    chan.send('\n')
+    while time.time() < deadline:
+        if chan.recv_ready():
+            chunk = chan.recv(65535)
+            if not chunk:
+                break
+            buf.extend(chunk)
+            tail = bytes(buf[-2048:])
+            m = _PROMPT_LINE_RE.search(tail)
+            if m:
+                # return the last prompt-like line
+                lines = tail.splitlines()
+                for i in range(len(lines) - 1, -1, -1):
+                    if _PROMPT_LINE_RE.match(lines[i]):
+                        return lines[i].rstrip()
+        else:
+            time.sleep(0.03)
+    return b'#'
+
+def run_one_cmd_standalone(transport: paramiko.Transport, cmd: str, timeout: int = 30) -> str:
+    """
+    Open a fresh PTY shell for `cmd`, set 'terminal length 0', read until prompt reappears,
+    close shell, and return cleaned output.
+    """
+    if not transport or not transport.is_active():
+        raise RuntimeError("SSH transport not active")
+
+    chan = transport.open_session(timeout=timeout)
+    try:
+        chan.get_pty(term='vt100', width=200, height=50)
+        chan.invoke_shell()
+        chan.settimeout(timeout)
+
+        def drain_all():
+            buf = bytearray()
+            while chan.recv_ready():
+                chunk = chan.recv(65535)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+            return bytes(buf)
+
+        # settle
+        time.sleep(0.12)
+        drain_all()
+
+        # capture exact prompt once
+        prompt_line = _capture_prompt_line(chan) or b'#'
+
+        # try enable if in exec mode
+        if prompt_line.endswith(b'>'):
+            chan.send('enable\n'); time.sleep(0.15)
+            tmp = drain_all()
+            if b'assword' in tmp or b'assword' in tmp.lower():
+                # cancel enable
+                chan.send('\n'); time.sleep(0.15); drain_all()
+            prompt_line = _capture_prompt_line(chan) or prompt_line
+
+        # disable paging (and flush the confirmation)
+        chan.send('terminal length 0\n'); time.sleep(0.15); drain_all()
+
+        # send the command
+        chan.send(cmd.rstrip() + '\n')
+        time.sleep(0.05)  # small nudge so device starts writing
+
+        buf = bytearray()
+        last_rx = time.time()
+        saw_body = False
+        more_pat = re.compile(br'--More--|\(q\)uit', re.I)
+
+        while True:
+            if chan.recv_ready():
+                chunk = chan.recv(65535)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                last_rx = time.time()
+
+                tail = bytes(buf[-2048:])
+
+                if more_pat.search(tail):
+                    chan.send(' ')
+                    continue
+
+                # treat as body once we see the echo or typical structured lines
+                if (cmd.encode() in tail) or (b':' in tail) or (b'\n' in tail):
+                    if not _TERM_LEN_RE.search(tail.decode('utf-8', 'ignore')):
+                        saw_body = True
+
+                # stop only after body and *exact* prompt line reappear
+                if saw_body:
+                    # examine the last line
+                    last_nl = tail.rfind(b'\n')
+                    last_line = tail[last_nl+1:] if last_nl != -1 else tail
+                    if last_line.rstrip().endswith(prompt_line):
+                        break
+            else:
+                if time.time() - last_rx > timeout:
+                    break
+                time.sleep(0.04)
+
+        raw = buf.decode('utf-8', 'ignore')
+
+        # remove echoed command (first occurrence only)
+        idx = raw.find(cmd)
+        if idx != -1:
+            nl = raw.find('\n', idx)
+            if nl != -1:
+                raw = raw[nl+1:]
+
+        # drop trailing prompt line (exact)
+        raw = re.sub(rf"\r?\n{re.escape(prompt_line.decode('utf-8','ignore'))}\s*$", "", raw)
+
+        # clean pager/ANSI/term-len noise
+        raw = re.sub(r'--More--|\(q\)uit', '', raw, flags=re.I)
+        raw = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', raw)
+        raw = _strip_term_len_noise(raw)
+
+        return raw.strip()
+    finally:
+        try: chan.close()
+        except Exception: pass
+    
+def run_cmds_resilient_over_ssh(ip: str, username: str, password: str,
+                                cmds: list[str], timeout: int = 30) -> dict[str, str]:
+    """
+    Open an SSH connection, run each cmd in its own fresh PTY shell.
+    If the transport dies between commands, reconnect once and continue.
+    """
+    out: dict[str, str] = {}
+    ssh = None
+
+    def _connect(_tries=2):
+        return ssh_connect_resilient(ip, username, password, tries=_tries)
+
+    try:
+        ssh = _connect(_tries=2)
+        for c in cmds:
+            try:
+                t = ssh.get_transport()
+                out[c] = run_one_cmd_standalone(t, c, timeout=timeout)
+            except Exception as e:
+                # reconnect once, then retry this command
+                try:
+                    if ssh:
+                        ssh.close()
+                except:
+                    pass
+                ssh = _connect(_tries=1)
+                t = ssh.get_transport()
+                try:
+                    out[c] = run_one_cmd_standalone(t, c, timeout=timeout)
+                except Exception:
+                    # give up on this cmd but keep going for the rest
+                    out[c] = ""
+    finally:
+        try:
+            if ssh:
+                ssh.close()
+        except:
+            pass
+
+    return out
+
 def fetch_last_sms(ip):
     try:
         if not list_cellular_interfaces(ip):
@@ -1777,34 +2065,58 @@ def fetch_last_sms(ip):
         ssh = ssh_connect_resilient(ip, username, password, tries=2)
         try:
             t = ssh.get_transport()
-            sms_iface = choose_sms_iface(ip)  # ← NEW
+            sms_iface = choose_sms_iface(ip)  # e.g., 'cellular 0/1/0'
+            iface_cmd = _normalize_cellular_iface(sms_iface)  # same as before
 
-            # first pass: list all
-            results = CiscoSMSMonitorApp._run_cmds_single_shell(
-                None, t, [f"{sms_iface} lte sms view all"], timeout=12
-            )
-            sms_list_output = results.get(f"{sms_iface} lte sms view all", "")
+            # First pass: list all IDs (try both LTE & legacy forms)
+            list_cmds = [
+                f"{iface_cmd} lte sms view all",
+            ]
+            # results = run_cmds_resilient_over_ssh(None, t, list_cmds, timeout=25)
+            results = run_cmds_resilient_over_ssh(ip, username, password, list_cmds, timeout=25)
+            sms_list_output = next((v for v in (results.get(c, "") for c in list_cmds) if v), "")
+
+            if not sms_list_output:
+                # DEBUG: dump once so we can see what came back
+                with open("last_sms_debug.txt", "a", encoding="utf-8") as f:
+                    f.write(f"\n[{ip}] Empty list output at {time.strftime('%F %T')}\n")
+                    for c in list_cmds:
+                        f.write(f"--- {c} ---\n{results.get(c,'')}\n")
+                return "No SMS"
+
             ids = re.findall(r"SMS ID:\s*(\d+)", sms_list_output)
             if not ids:
                 return "No SMS"
             last = max(map(int, ids))
 
-            # second pass: view the last one
-            results = CiscoSMSMonitorApp._run_cmds_single_shell(
-                None, t, [f"{sms_iface} lte sms view {last}"], timeout=12
-            )
-            sms_output = results.get(f"{sms_iface} lte sms view {last}", "")
+            # Second pass: view the last one (again try forms)
+            view_cmds = [
+                f"{iface_cmd} lte sms view {last}",
+            ]
+            
+            if not _alive(t):
+                t = ssh.get_transport()
+
+            # res2 = run_cmds_resilient_over_ssh(None, t, view_cmds, timeout=25)
+            res2 = run_cmds_resilient_over_ssh(ip, username, password, view_cmds, timeout=25)
+            sms_view_output = next((v for v in (res2.get(c, "") for c in view_cmds) if v), "")
+
+            if not sms_view_output:
+                with open("last_sms_debug.txt", "a", encoding="utf-8") as f:
+                    f.write(f"\n[{ip}] Empty view output for ID {last} at {time.strftime('%F %T')}\n")
+                    for c in view_cmds:
+                        f.write(f"--- {c} ---\n{res2.get(c,'')}\n")
+                return "No SMS"
+
+            return sms_view_output.strip()
         finally:
-            try: ssh.close()
-            except: pass
-
-        msg = extract_sms_content(sms_output).strip()
-        return msg or "No SMS"
-
-    except Exception:
-        traceback.print_exc()
-        return "Error"
-
+            try:
+                ssh.close()
+            except Exception:
+                pass
+    except Exception as e:
+        return f"Error: {e}"
+    
 def fetch_sms_details(router_ip, sms_index):
     ssh = paramiko.SSHClient(); ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     username, password = get_ssh_credentials()
@@ -2459,6 +2771,7 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
         self.detectCellButton.clicked.connect(self.handle_detect_cellular)
 
         self.device = device
+        self.device_id = self.device.get("id")
         if device and device.get("id"):
             saved = get_device_cellular(device["id"])
             # map to the structure used by the combo
@@ -2466,14 +2779,15 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
             for r in saved:
                 details.append({
                     "interface": r["interface"],
-                    "ip": r["ip_addr"] or "",
-                    "status": r["status"] or "",
-                    "protocol": r["protocol"] or "",
-                    "imsi": r["imsi"] or "",
-                    "imei": r["imei"] or "",
-                    "iccid": r["iccid"] or "",
-                    "apn": r["apn"] or "",
-                    "sim": r.get("sim","") or "",      # ← include SIM
+                    "ip_addr": (r.get("ip_addr") or "").strip(),
+                    "ip": (r.get("ip_addr") or "").strip(),     # backward-compatible
+                    "status": (r.get("status") or "").strip(),
+                    "protocol": (r.get("protocol") or "").strip(),
+                    "imsi": (r.get("imsi") or "").strip(),
+                    "imei": (r.get("imei") or "").strip(),
+                    "iccid": (r.get("iccid") or "").strip(),
+                    "apn": (r.get("apn") or "").strip(),
+                    "sim": (r.get("sim") or "").strip(),
                 })
             if details:
                 self._set_interface_list(details, select_best=True)
@@ -2525,6 +2839,46 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
         # filter Nones
         self._busy_widgets = [x for x in w if x is not None]
 
+    # inside DeviceSettingsDialog
+    def _cell_text(self, row, col):
+        it = self.cellularTable.item(row, col)
+        return (it.text().strip() if it else "")
+
+    def _collect_cellular_rows(self) -> list[dict]:
+        rows = []
+        if not hasattr(self, "cellularTable") or self.cellularTable is None:
+            return rows
+
+        # Map your columns → fields. Adjust indices to your table:
+        COL_IFACE   = 0
+        COL_IP      = 1
+        COL_STATUS  = 2
+        COL_PROTO   = 3
+        COL_IMSI    = 4
+        COL_IMEI    = 5
+        COL_ICCID   = 6
+        COL_APN     = 7
+        COL_SIM     = 8
+        COL_MODEMFW = 9  # if you have it; otherwise remove
+
+        for r in range(self.cellularTable.rowCount()):
+            d = {
+                "interface":       self._cell_text(r, COL_IFACE),
+                "ip_addr":         self._cell_text(r, COL_IP) or "unassigned",
+                "status":          self._cell_text(r, COL_STATUS),
+                "protocol":        self._cell_text(r, COL_PROTO),
+                "imsi":            self._cell_text(r, COL_IMSI),
+                "imei":            self._cell_text(r, COL_IMEI),
+                "iccid":           self._cell_text(r, COL_ICCID),
+                "apn":             self._cell_text(r, COL_APN),
+                "sim":             self._cell_text(r, COL_SIM),
+                "modem_firmware":  self._cell_text(r, COL_MODEMFW),
+            }
+            # keep only non-empty rows (has interface or any meaningful cell field)
+            if d["interface"] or any(d[k] for k in ("ip_addr","status","protocol","imsi","imei","iccid","apn","sim","modem_firmware")):
+                rows.append(d)
+        return rows
+
     def handle_detect_all(self):
         ip = self.ipLineEdit.text().strip()
         if not ip:
@@ -2559,7 +2913,6 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
 
                 # 3) APN
                 try:
-                    import paramiko, time
                     ssh = paramiko.SSHClient()
                     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
                     ssh.connect(ip, username=username, password=password,
@@ -2768,6 +3121,15 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
     def _on_iface_changed(self, idx: int):
         if idx < 0 or idx >= len(self._cell_details):
             return
+        row = self._cell_details[idx]
+
+        # parse "(X.Y.Z.W)" from the combo text
+        text = self.ifaceCombo.currentText()
+        m = re.search(r"\((\d{1,3}(?:\.\d{1,3}){3})\)", text)
+        parsed_ip = m.group(1) if m else ""
+
+        row["ip_addr"] = parsed_ip
+        row["ip"] = parsed_ip
         self._apply_detail_to_fields(self._cell_details[idx])
 
     # ---------- create IMSI/IMEI/ICCID rows ----------
@@ -2821,27 +3183,73 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
         # when SIM text changes, keep our in-memory detail list in sync
         self.simLineEdit.textChanged.connect(self._on_sim_changed)
 
-    def get_data(self):
-        # push the current SIM edit into the selected interface record
-        cur_sim = self.simLineEdit.text().strip() if hasattr(self, "simLineEdit") else ""
-        iface = self.selected_interface or ""
-        for d in self._cell_details:
-            if d.get("interface","") == iface:
-                d["sim"] = cur_sim
+    # inside DeviceSettingsDialog
+    def get_data(self) -> dict:
+        # Safe helpers
+        def _txt(obj_name: str) -> str:
+            w = getattr(self, obj_name, None)
+            if isinstance(w, QtWidgets.QLineEdit):
+                return w.text().strip()
+            # fallback: find by objectName in UI if not attached as attribute
+            w = self.findChild(QtWidgets.QLineEdit, obj_name)
+            return w.text().strip() if w else ""
 
-        return {
-            "name": self.nameLineEdit.text().strip(),
-            "ip": self.ipLineEdit.text().strip(),
-            "gateway": self.gatewayLineEdit.text().strip(),
-            "sim": cur_sim,                         # kept for convenience; no longer stored in devices
-            "apn": self.apnLineEdit.text().strip(),
-            "imsi": self.imsiLineEdit.text().strip(),
-            "imei": self.imeiLineEdit.text().strip(),
-            "iccid": self.iccidLineEdit.text().strip(),
-            "email": self.emailLineEdit.text().strip(),
-            "cellular_details": list(self._cell_details),  # includes edited SIM
-            "selected_interface": self.selected_interface or "",
+        dev_id = getattr(self, "device_id", None) or (self.device.get("id") if isinstance(self.device, dict) else None)
+        iface   = self.ifaceCombo.currentText().strip() if hasattr(self, "ifaceCombo") else ""
+        iface_name = iface.split(" (", 1)[0].strip() if iface else ""
+
+        # Base device fields from your simple UI
+        data = {
+            "id":            dev_id,
+            "name":          _txt("nameLineEdit"),
+            "ip":            _txt("ipLineEdit"),
+            "gateway":       _txt("gatewayLineEdit"),
+            "apn":           _txt("apnLineEdit"),
+            "email":         _txt("emailLineEdit"),
+            "hostname":      getattr(self, "hostnameLineEdit", None) and _txt("hostnameLineEdit") or "",
+            "ios_version":   getattr(self, "iosLineEdit", None) and _txt("iosLineEdit") or "",
+            "modem_firmware": getattr(self, "fwLineEdit", None) and _txt("fwLineEdit") or "",
         }
+
+        # Editable SIM from the dialog top (this is your primary SIM field)
+        sim_edit = _txt("simLineEdit")
+        if sim_edit:
+            data["sim"] = sim_edit
+        
+        # Pull what we know about the selected interface from detect / saved rows
+        selected = {}
+        try:
+            # _cell_details is a list of dicts added either from DB (get_device_cellular)
+            # or detect result. Pick the one that matches current iface.
+            for d in getattr(self, "_cell_details", []) or []:
+                if d.get("interface", "")  == iface_name:
+                    selected = dict(d)
+                    break
+        except Exception:
+            selected = {}
+
+        # Build one cellular_details row merging selected + edits
+        row = {
+            "interface": iface_name or selected.get("interface", ""),
+            "ip_addr":   selected.get("ip", "") or "unassigned",   # DB expects ip_addr
+            "status":    selected.get("status", ""),
+            "protocol":  selected.get("protocol", ""),
+            "imsi":      _txt("imsiLineEdit")  or selected.get("imsi", ""),
+            "imei":      _txt("imeiLineEdit")  or selected.get("imei", ""),
+            "iccid":     _txt("iccidLineEdit") or selected.get("iccid", ""),
+            "apn":       _txt("apnLineEdit")   or selected.get("apn", ""),
+            "sim":       sim_edit or selected.get("sim", ""),
+        }
+
+        # Only include if we have an interface or any meaningful field
+        details = []
+        if row["interface"] or any(row[k] for k in ("imsi","imei","iccid","apn","sim")):
+            details.append(row)
+
+        if details:
+            data["cellular_details"] = details
+
+        return data
 
     @pyqtSlot(list)
     def on_cellular_detected(self, details):
@@ -3027,6 +3435,7 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         self.setWindowIcon(QIcon(resource_path("icons/cisco.png")))
         self.statusBar()
         self._view_devices = []
+        self._sim_pending = {}     # row_idx -> True (marker that we have a pending SIM refresh)
         # track recent outgoing-sender events (ip, t)
         from collections import deque
         self._recent_senders = deque(maxlen=200)   # stores (lan_ip, ts_seconds)
@@ -3136,7 +3545,7 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         self.just_added_device = False
         self.worker_signals = WorkerSignals(self)
         self.worker_signals.deviceAdded.connect(self.update_devices_and_ui)
-        self.worker_signals.smsLogsFetched.connect(self.display_sms_log_dialog_result)
+        # self.worker_signals.smsLogsFetched.connect(self.display_sms_log_dialog_result)
         self.worker_signals.refreshCompleted.connect(self.update_devices_after_refresh)
 
         # in CiscoSMSMonitorApp.__init__ (after creating self.worker_signals)
@@ -3197,6 +3606,31 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
 
     _autohub_checked = set()
 
+    def _get_column_index(self, header_text: str):
+        """
+        Return the 0-based column index in deviceTable whose header matches
+        `header_text` (case-insensitive). Returns None if not found.
+        """
+        if not hasattr(self, "deviceTable") or self.deviceTable is None:
+            return None
+        wanted = (header_text or "").strip().lower()
+        for i in range(self.deviceTable.columnCount()):
+            hdr = self.deviceTable.horizontalHeaderItem(i)
+            if hdr and hdr.text().strip().lower() == wanted:
+                return i
+        return None
+
+
+    def _ensure_on_gui(self, fn, *args, **kwargs):
+        """
+        Run `fn` on the GUI thread (useful when called from worker threads).
+        """
+        app_thread = QtWidgets.QApplication.instance().thread()
+        if QtCore.QThread.currentThread() is not app_thread:
+            QtCore.QTimer.singleShot(0, lambda: fn(*args, **kwargs))
+            return False
+        return True
+
     def _detect_all_row_timed_out(self):
         # UI must recover even if the worker thread is stuck
         try: self.spinner.stop()
@@ -3206,6 +3640,82 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             "Timed out after 30 seconds. The device may be slow or unreachable.\n"
             "Partial results (if any) were not applied."
         )
+
+    def _start_sim_refresh(self, row_idx: int, ip: str):
+        col = self._col_index_e("SIM")
+        if col == -1:
+            return
+        self._sim_pending[row_idx] = True
+
+        # --- create a centered spinner with a parent so it never becomes a window
+        container = QtWidgets.QWidget(self.deviceTable)
+        lay = QtWidgets.QHBoxLayout(container)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        lbl = QtWidgets.QLabel(container)          # parented!
+        lbl.setAlignment(Qt.AlignCenter)
+        mv = QMovie(resource_path("icons/spinner.gif"))
+        if not mv.isValid():
+            # graceful fallback if the gif isn't found
+            lbl.setText("…")
+        else:
+            lbl.setMovie(mv)
+            mv.start()
+
+        # keep refs so GC doesn’t stop it
+        container._spinner_label = lbl
+        container._spinner_movie = mv
+
+        lay.addStretch(1)
+        lay.addWidget(lbl, 0, Qt.AlignCenter)
+        lay.addStretch(1)
+
+        self.deviceTable.setCellWidget(row_idx, col, container)
+
+        def worker():
+            sim_text = ""
+            try:
+                dev = self._find_device_by_ip(ip)
+                if dev and dev.get("id"):
+                    sim_text = fetch_latest_sim_from_db(dev["id"]) or (dev.get("sim") or "")
+            except Exception:
+                try:
+                    dev = self._find_device_by_ip(ip)
+                    sim_text = dev.get("sim") or ""
+                except Exception:
+                    sim_text = ""
+            QtCore.QTimer.singleShot(0, lambda: self._finish_sim_refresh(row_idx, ip, sim_text))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_sim_refresh(self, row_idx: int, ip: str, sim_text: str):
+        """Replace spinner with the SIM text."""
+        self._sim_pending.pop(row_idx, None)
+        col = self._col_index("SIM")
+        if col == -1:
+            return
+
+        # remove spinner if present
+        w = self.deviceTable.cellWidget(row_idx, col)
+        if w:
+            try:
+                mv = getattr(w, "movie", None)
+                if mv: mv.stop()
+            except:
+                pass
+            self.deviceTable.removeCellWidget(row_idx, col)
+            w.deleteLater()
+
+        # set final text
+        item = QTableWidgetItem(sim_text or "")
+        item.setTextAlignment(Qt.AlignCenter)
+        self.deviceTable.setItem(row_idx, col, item)
+
+        # also sync the in-memory device copy
+        dev = self._find_device_by_ip(ip)
+        if dev is not None:
+            dev["sim"] = sim_text or dev.get("sim") or ""
 
     def _resolve_recipient(self, to_text: str) -> str:
         """Return a dialable number. Accepts raw number or device name."""
@@ -3248,7 +3758,7 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         """Background: fetch last SMS, but ALWAYS emit a result."""
         txt = "No SMS"
         try:
-            txt = fetch_last_sms(ip) or "No SMS"
+            txt = _extract_sms_body(fetch_last_sms(ip)) or "No SMS"
         except Exception as e:
             txt = f"Error"
         finally:
@@ -3418,85 +3928,61 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         # auto refresh on first show
         self.refresh_tunnels_now()
 
-    def _run_cmds_single_shell(
-        self,
-        transport: paramiko.Transport,
-        cmds: list[str],
-        *,
-        prompt_end=(b'#', b'>'),
-        timeout: int = 20
-    ) -> dict:
+    def _run_cmds_single_shell(self, transport, cmds, *, timeout: int = 30) -> dict:
         """
-        Open ONE interactive shell (PTY), disable paging once, then run several commands.
-        Returns {cmd: output_string}, with echoes/prompts removed.
-        - Tries 'enable' only if current prompt looks like exec ('>').
-        - If 'Password:' is requested for enable, we cancel and stay in exec mode.
-        - Handles pagers ('--More--' / '(q)uit').
+        Step-proof IOS shell runner:
+        - capture exact prompt once
+        - no pre-command blank-line flush
+        - stop only after we saw real content and the prompt line again
         """
         out_by_cmd = {c: "" for c in cmds}
         if not cmds:
             return out_by_cmd
+        if not transport or not transport.is_active():
+            raise RuntimeError("SSH transport not active")
 
         chan = transport.open_session(timeout=timeout)
         try:
-            chan.get_pty(term='vt100', width=200, height=50)
+            chan.get_pty(term='vt100', width=180, height=50)
             chan.invoke_shell()
             chan.settimeout(timeout)
 
-            def _drain_all() -> bytes:
+            def _drain_all():
                 buf = bytearray()
-                try:
-                    while chan.recv_ready():
-                        chunk = chan.recv(65535)
-                        if not chunk:
-                            break
-                        buf.extend(chunk)
-                except Exception:
-                    pass
+                while chan.recv_ready():
+                    chunk = chan.recv(65535)
+                    if not chunk:
+                        break
+                    buf.extend(chunk)
                 return bytes(buf)
 
-            def _send(line: str):
-                chan.send(line.rstrip() + '\n')
+            # settle & capture exact prompt
+            time.sleep(0.15); _drain_all()
+            prompt_line = _capture_prompt(chan)
+            if not prompt_line:
+                prompt_line = b'#'
 
-            # settle/login banner
-            time.sleep(0.25)
-            banner = _drain_all()
+            # try enable if we were in exec
+            if prompt_line.endswith(b'>'):
+                chan.send('enable\n'); time.sleep(0.15)
+                tmp = _drain_all()
+                if b'assword' in tmp or b'assword' in tmp.lower():
+                    chan.send('\n'); time.sleep(0.15); _drain_all()
+                # recapture prompt (should be '#')
+                prompt_line = _capture_prompt(chan) or prompt_line
 
-            # Only attempt 'enable' if we seem to be at an EXEC prompt (endswith '>')
-            def _looks_exec_prompt(b: bytes) -> bool:
-                lines = b.strip().splitlines()
-                if not lines:
-                    return False
-                last = lines[-1].strip()
-                return last.endswith(b'>') and (b' ' not in last)
-
-            def _attempt_enable():
-                _send('enable')
-                time.sleep(0.15)
-                buf = _drain_all()
-                # If enable password is prompted, cancel (blank line) and continue in exec
-                if b'Password:' in buf or b'password:' in buf:
-                    _send('')
-                    time.sleep(0.15)
-                    _drain_all()
-
-            if _looks_exec_prompt(banner):
-                try:
-                    _attempt_enable()
-                except Exception:
-                    pass
-
-            # disable paging once
-            _send('terminal length 0')
-            time.sleep(0.1)
-            _ = _drain_all()
+            # disable paging once and flush any echo
+            chan.send('terminal length 0\n'); time.sleep(0.15); _drain_all()
 
             more_pat = re.compile(br'--More--|\(q\)uit', re.I)
 
             for cmd in cmds:
-                _send(cmd)
+                chan.send(cmd.rstrip() + '\n')
+                time.sleep(0.04)  # nudge device to start output
+
                 buf = bytearray()
                 last_rx = time.time()
+                saw_body = False
 
                 while True:
                     if chan.recv_ready():
@@ -3506,46 +3992,54 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
                         buf.extend(chunk)
                         last_rx = time.time()
 
-                        tail = bytes(buf[-512:])
-                        # pager handling
+                        tail = bytes(buf[-2048:])
+
+                        # auto page
                         if more_pat.search(tail):
                             chan.send(' ')
                             continue
 
-                        tail_stripped = tail.rstrip()
-                        if any(
-                            tail_stripped.endswith(pe) or (b'\n' + pe) in tail_stripped
-                            for pe in prompt_end
-                        ):
-                            break
+                        # mark once we really saw content (command echo OR a line with ':' etc.)
+                        if (cmd.encode() in tail) or (b':' in tail) or (b'\n' in tail):
+                            # but ignore stray term length echoes
+                            txt = tail.decode('utf-8', 'ignore')
+                            if not _TERM_LEN_RE.search(txt):
+                                saw_body = True
+
+                        # stop only after body and prompt are seen
+                        if saw_body:
+                            # examine last line
+                            last_nl = tail.rfind(b'\n')
+                            last_line = tail[last_nl+1:] if last_nl != -1 else tail
+                            if last_line.rstrip().endswith(prompt_line):
+                                break
                     else:
                         if time.time() - last_rx > timeout:
                             break
-                        time.sleep(0.05)
+                        time.sleep(0.04)
 
-                # clean echoes & trailing prompt
-                raw = buf.decode(errors='ignore')
-                cleaned = []
-                for ln in raw.splitlines():
-                    s = ln.strip()
-                    if not s:
-                        continue
-                    if s.startswith('terminal length 0'):
-                        continue
-                    if s == cmd or s.startswith(cmd + ' '):
-                        continue
-                    if (s.endswith('#') or s.endswith('>')) and (' ' not in s) and (len(s) <= 80):
-                        continue
-                    cleaned.append(ln)
-                out_by_cmd[cmd] = '\n'.join(cleaned).strip()
+                raw = buf.decode('utf-8', 'ignore')
 
+                # remove the first echoed command line (only that line)
+                idx = raw.find(cmd)
+                if idx != -1:
+                    nl = raw.find('\n', idx)
+                    if nl != -1:
+                        raw = raw[nl+1:]
+
+                # drop trailing prompt line (exact match)
+                raw = re.sub(rf"\r?\n{re.escape(prompt_line.decode('utf-8','ignore'))}\s*$", "", raw)
+
+                # strip pager & ANSI & term-length noise
+                raw = re.sub(r'--More--|\(q\)uit', '', raw, flags=re.I)
+                raw = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', raw)
+                raw = _strip_term_len_noise(raw)
+
+                out_by_cmd[cmd] = raw.strip()
             return out_by_cmd
-
         finally:
-            try:
-                chan.close()
-            except Exception:
-                pass
+            try: chan.close()
+            except Exception: pass
 
     def _run_cmd_new_session(
         self,
@@ -3988,9 +4482,8 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
 
         return rows
 
-    _IP = r"(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}"
-
     def parse_ip_nhrp(text: str):
+        _IP = r"(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}"
         """
         Parses blocks like:
         172.16.1.200/32 via 172.16.1.200
@@ -4042,6 +4535,7 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
 
 
     def parse_eigrp_neighbors(text: str):
+        _IP = r"(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}"
         """
         Parses 'show ip eigrp neighbors' table (IOS classic style).
         Returns list of dicts with: address, iface, hold, uptime, srtt, rto, qcnt, seq
@@ -4158,18 +4652,28 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         return next((d for d in self.devices if d.get("id") == dev_id), None)
 
     def open_settings_dialog_by_id(self, dev_id: int):
-        device = self._find_device_by_id(dev_id)
-        if not device:
-            QtWidgets.QMessageBox.warning(self, "Not found", "Device could not be found.")
+        dev = self._find_device_by_id(dev_id)
+        if not dev:
+            QtWidgets.QMessageBox.warning(self, "Not found", "Device not found.")
             return
-        dialog = DeviceSettingsDialog(device=device, parent=self)
-        if dialog.exec_() == QtWidgets.QDialog.Accepted:
-            updated_data = dialog.get_data()
-            updated_data["ip"] = device["ip"]
-            updated_data["id"] = device["id"]      # <— add this
-            update_device_in_db(updated_data)
-            self.refresh_devices_from_db()
-            QtWidgets.QMessageBox.information(self, "Success", "Device updated successfully.")
+
+        dlg = DeviceSettingsDialog(device=dev, parent=self)
+        dlg.device_id = dev.get("id")  # ensure present
+
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            return
+
+        updated = dlg.get_data()
+        updated.setdefault("id", dev["id"])
+        try:
+            update_device_in_db(updated)   # writes devices + device_cellular
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Save failed", str(e))
+            return
+
+        # Repaint the affected row so user sees new SIM/IDs immediately
+        self.refresh_devices_from_db()  # simplest
+        # (or do a light repaint of SIM/APN/ICCID columns if you prefer)
 
     # Inside class CiscoSMSMonitorApp
 
@@ -4276,11 +4780,22 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             if (d.get("ip") or "").strip() == ip:
                 return d
         return None
+    
+    def _col_index_e(self, header_text: str, default: int = -1) -> int:
+        """Return the column index for a header (case-insensitive), or default."""
+        try:
+            for c in range(self.deviceTable.columnCount()):
+                item = self.deviceTable.horizontalHeaderItem(c)
+                if item and item.text().strip().lower() == header_text.strip().lower():
+                    return c
+        except Exception:
+            pass
+        return default
 
     def _find_row_by_ip(self, ip: str):
         """Return the QTableWidget row index for the device with this IP."""
         ip = (ip or "").strip()
-        col_ip = self._col_index("IP") if hasattr(self, "_col_index") else -1
+        col_ip = self._col_index_e("IP") if hasattr(self, "_col_index_e") else -1
         if col_ip == -1:
             # fallback: linear scan of every column to look for a matching IP string
             rows = self.deviceTable.rowCount()
@@ -4298,6 +4813,27 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             if it and it.text().strip() == ip:
                 return r
         return None
+
+    def _get_column_index(self, header_text: str):
+        if not hasattr(self, "deviceTable") or self.deviceTable is None:
+            return None
+        wanted = (header_text or "").strip().lower()
+        for i in range(self.deviceTable.columnCount()):
+            hdr = self.deviceTable.horizontalHeaderItem(i)
+            if hdr and hdr.text().strip().lower() == wanted:
+                return i
+        return None
+
+    def _ensure_on_gui(self, fn, *args, **kwargs):
+        """
+        Run `fn` on the GUI thread (useful when called from worker threads).
+        """
+        app_thread = QtWidgets.QApplication.instance().thread()
+        if QtCore.QThread.currentThread() is not app_thread:
+            QtCore.QTimer.singleShot(0, lambda: fn(*args, **kwargs))
+            return False
+        return True
+
 
     def show_send_sms_dialog_by_id(self, dev_id: int):
         device = self._find_device_by_id(dev_id)
@@ -4336,13 +4872,13 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             if sim_val:
                 dialog.to_input.setText(sim_val)
 
-            if dialog.exec_() == QtWidgets.QDialog.Accepted:
-                to_number, message = dialog.get_sms_data()
-                if not to_number.strip():
-                    QtWidgets.QMessageBox.warning(self, "Missing number", "Please enter a recipient number.")
-                    return
-                username, password = get_ssh_credentials()
-                self.send_sms(device["ip"], username, password, to_number.strip(), message)
+            # if dialog.exec_() == QtWidgets.QDialog.Accepted:
+            #     to_number, message = dialog.get_sms_data()
+            #     if not to_number.strip():
+            #         QtWidgets.QMessageBox.warning(self, "Missing number", "Please enter a recipient number.")
+            #         return
+            #     username, password = get_ssh_credentials()
+            #     self.send_sms(device["ip"], username, password, to_number.strip(), message)
 
     # ---------- Inbox table fetch/render ----------
     def _populate_inbox_table(self, smsList):
@@ -4720,7 +5256,7 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
 
     def update_last_sms(self, row, ip):
         def work():
-            sms = fetch_last_sms(ip)
+            sms = _extract_sms_body(fetch_last_sms(ip))
             self.sms_signal.smsFetched.emit(row, sms)
         self._sms_pool.submit(work)
 
@@ -5040,22 +5576,55 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
                 db.close()
 
         def repaint_sim_row(ip: str, sim_text: str):
+            # 1) ensure we run on the GUI thread
+            app_thr = QtWidgets.QApplication.instance().thread()
+            if QtCore.QThread.currentThread() is not app_thr:
+                QtCore.QTimer.singleShot(0, lambda: repaint_sim_row(ip, sim_text))
+                return
+
+            # 2) update in-memory device (and the filtered view list)
             dev = self._find_device_by_ip(ip)
             if not dev:
                 return
 
-            # mark as having cellular once we know a SIM
+            sim_text = sim_text or ""
             dev["sim"] = sim_text
             if sim_text:
                 dev["has_cellular"] = True
 
+            # keep lists in sync (some tables use _view_devices when filtered)
+            for lst in (getattr(self, "devices", []), getattr(self, "_view_devices", [])):
+                for d in lst or []:
+                    if d.get("ip") == ip:
+                        d["sim"] = sim_text
+                        if sim_text:
+                            d["has_cellular"] = True
+
+            # 3) repaint the table row
             row_idx = self._find_row_by_ip(ip)
             if row_idx is None:
                 return
 
             apn_txt = dev.get("apn", "")
-            # use the updated flag so the SIM is shown instead of NO CELL
-            self._set_sim_apn_cells(row_idx, dev.get("has_cellular", False), sim_text, apn_txt)
+
+            # Preferred: your badge/widget renderer
+            if hasattr(self, "_set_sim_apn_cells"):
+                self._set_sim_apn_cells(row_idx, dev.get("has_cellular", False), sim_text, apn_txt)
+            else:
+                # Fallback: plain text into the SIM column
+                col_idx = None
+                if hasattr(self, "_get_column_index"):
+                    col_idx = self._get_column_index("SIM")
+                if col_idx is not None and hasattr(self, "deviceTable"):
+                    item = self.deviceTable.item(row_idx, col_idx)
+                    if item is None:
+                        item = QtWidgets.QTableWidgetItem()
+                        self.deviceTable.setItem(row_idx, col_idx, item)
+                    item.setText(sim_text)
+
+            # force a visual refresh
+            if hasattr(self, "deviceTable"):
+                self.deviceTable.viewport().update()
 
 
         def listen():
@@ -5126,6 +5695,9 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
                                 try:
                                     update_sender_sim_in_db(dev["id"], from_num)
                                     dev["sim"] = from_num 
+                                    # row_idx = self._find_row_by_ip(sender_ip)
+                                    # if row_idx is not None:
+                                    #     self._start_sim_refresh(row_idx, sender_ip)
                                 except Exception as e:
                                     print(f"⚠️ DB SIM update failed for {sender_ip}: {e}")
                                 dev["sim"] = from_num

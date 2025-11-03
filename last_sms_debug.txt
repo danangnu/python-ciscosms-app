@@ -1,0 +1,28 @@
+
+[192.168.200.1] Empty list output at 2025-10-31 10:10:30
+--- cellular 0/0/0 lte sms view all ---
+
+
+[192.168.209.1] Empty list output at 2025-10-31 10:34:24
+--- cellular 0/0/0 lte sms view all ---
+
+
+[192.168.203.1] Empty list output at 2025-10-31 10:42:00
+--- cellular 0/0/0 lte sms view all ---
+
+
+[192.168.200.1] Empty list output at 2025-10-31 10:42:01
+--- cellular 0/0/0 lte sms view all ---
+
+
+[192.168.209.1] Empty list output at 2025-11-03 11:12:10
+--- cellular 0/0/0 lte sms view all ---
+
+
+[192.168.205.1] Empty list output at 2025-11-03 11:12:11
+--- cellular 0/1/0 lte sms view all ---
+
+
+[192.168.205.1] Empty list output at 2025-11-03 13:19:36
+--- cellular 0/1/0 lte sms view all ---
+
