@@ -1,0 +1,19 @@
+host,model_image,version,modem_firmware,raw_first_line,status
+192.168.203.1,C1900-UNIVERSALK9-M,15.7(3)M9,"revision: 1.0) with 487424K/36864K bytes of memory.; Revision: 1.0""; Modem Firmware: Version = SWI9X30C_02.33.03.00","Cisco IOS Software, C1900 Software (C1900-UNIVERSALK9-M), Version 15.7(3)M9, RELEASE SOFTWARE (fc1)",ok
+192.168.204.1,C1900-UNIVERSALK9-M,15.7(3)M9,"revision: 1.0) with 487424K/36864K bytes of memory.; Revision: 1.0""; Modem Firmware: Version = SWI9X30C_02.20.03.00","Cisco IOS Software, C1900 Software (C1900-UNIVERSALK9-M), Version 15.7(3)M9, RELEASE SOFTWARE (fc1)",ok
+192.168.209.1,C1900-UNIVERSALK9-M,15.7(3)M9,"revision: 1.0) with 487424K/36864K bytes of memory.; Revision: 1.0""; Modem Firmware: Version = SWI9X15C_05.05.58.00","Cisco IOS Software, C1900 Software (C1900-UNIVERSALK9-M), Version 15.7(3)M9, RELEASE SOFTWARE (fc1)",ok
+192.168.201.1,C1900-UNIVERSALK9-M,15.7(3)M9,"revision: 1.0) with 487424K/36864K bytes of memory.; Revision: 1.0""; Modem Firmware: Version = SWI9X30C_02.20.03.00","Cisco IOS Software, C1900 Software (C1900-UNIVERSALK9-M), Version 15.7(3)M9, RELEASE SOFTWARE (fc1)",ok
+192.168.205.1,C1900-UNIVERSALK9-M,15.7(3)M9,"revision: 1.0) with 487424K/36864K bytes of memory.; Revision: 1.0""; Modem Firmware: Version = SWI9X30C_02.33.03.00","Cisco IOS Software, C1900 Software (C1900-UNIVERSALK9-M), Version 15.7(3)M9, RELEASE SOFTWARE (fc1)",ok
+192.168.210.1,C1900-UNIVERSALK9-M,15.5(3)M2,"revision: 1.0) with 487424K/36864K bytes of memory.; Revision: 1.0""; Modem Firmware: Version = SWI9X15C_05.05.58.00","Cisco IOS Software, C1900 Software (C1900-UNIVERSALK9-M), Version 15.5(3)M2, RELEASE SOFTWARE (fc1)",ok
+192.168.202.1,C1900-UNIVERSALK9-M,15.7(3)M9,"revision: 1.0) with 487424K/36864K bytes of memory.; Revision: 1.0""; Modem Firmware: Version = SWI9X30C_02.20.03.00","Cisco IOS Software, C1900 Software (C1900-UNIVERSALK9-M), Version 15.7(3)M9, RELEASE SOFTWARE (fc1)",ok
+192.168.200.1,C1900-UNIVERSALK9-M,15.7(3)M9,"revision: 1.0) with 487424K/36864K bytes of memory.; Revision: 1.0""; Modem Firmware: Version = SWI9X30C_02.33.03.00","Cisco IOS Software, C1900 Software (C1900-UNIVERSALK9-M), Version 15.7(3)M9, RELEASE SOFTWARE (fc1)",ok
+192.168.206.1,,,,,error: TimeoutError: timed out
+192.168.208.1,,,,,error: TimeoutError: timed out
+192.168.207.1,,,,,error: TimeoutError: timed out
+192.168.18.43,C1900-UNIVERSALK9-M,15.7(3)M5,"Cisco IOS Software, C1900 Software (C1900-UNIVERSALK9-M), Version 15.7(3)M5, RELEASE SOFTWARE (fc1)",ok
+192.168.230.1,C880DATA-UNIVERSALK9-M,15.2(4)M4,"Cisco IOS Software, C880 Software (C880DATA-UNIVERSALK9-M), Version 15.2(4)M4, RELEASE SOFTWARE (fc2)",ok
+192.168.231.1,C880DATA-UNIVERSALK9-M,15.2(4)M6,"Cisco IOS Software, C880 Software (C880DATA-UNIVERSALK9-M), Version 15.2(4)M6, RELEASE SOFTWARE (fc2)",ok
+192.168.232.1,C880DATA-UNIVERSALK9-M,15.2(4)M4,"Cisco IOS Software, C880 Software (C880DATA-UNIVERSALK9-M), Version 15.2(4)M4, RELEASE SOFTWARE (fc2)",ok
+192.168.206.1,,,,parse_failed
+192.168.18.43,C1900-UNIVERSALK9-M,15.7(3)M5,"Cisco IOS Software, C1900 Software (C1900-UNIVERSALK9-M), Version 15.7(3)M5, RELEASE SOFTWARE (fc1)",ok,yes,0/0/0,Sierra Wireless,MC7304,,"major:2, minor:2, debug:0",Thu Nov 6 5:48:48 2025,,,,,
+192.168.206.1,C1900-UNIVERSALK9-M,15.7(3)M9,"Cisco IOS Software, C1900 Software (C1900-UNIVERSALK9-M), Version 15.7(3)M9, RELEASE SOFTWARE (fc1)",ok,yes,0/0/0,Sierra Wireless,MC7430,,"major:2, minor:2, debug:0",Wed Feb 6 7:24:23 2036,,,,,

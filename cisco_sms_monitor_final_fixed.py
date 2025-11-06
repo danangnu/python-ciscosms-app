@@ -25,6 +25,7 @@ from email.mime.text import MIMEText
 import mysql.connector
 import traceback
 from concurrent.futures import ThreadPoolExecutor
+from paramiko.ssh_exception import SSHException
 
 from collections import deque
 _RECENT_SENDERS = deque(maxlen=200)
@@ -1039,7 +1040,8 @@ class DetectAllRunner(QtCore.QObject):
             self.step_started.emit("Gateway")
             ok, payload = False, None
             try:
-                gw, _ = detect_default_gateway(ip, username, password)
+                gw_ip, gw_if = detect_default_gateway(ip, username, password, vrf=None)
+                gw = f"{gw_ip} ({gw_if})" if gw_ip and gw_if else (gw_ip or "")
                 if gw:
                     ok, payload = True, gw
                     update_device_in_db({**self.dev, "gateway": gw, "cellular_details": []})
@@ -1685,28 +1687,239 @@ def detect_dmvpn_hub_over_ssh(ip: str, timeout: int = 12):
 
     return (False, "No DMVPN hub fingerprints found", facts)
 
-def detect_default_gateway(ip, username, password, *, vrf=None, timeout=6):
-    cmd_route = f"show ip route{' vrf ' + vrf if vrf else ''}"
-    cmd_cfg   = "show running-config | include ^ip route 0.0.0.0 0.0.0.0"
+import re, time, paramiko
+from typing import Tuple, Optional
+
+# --- helpers --------------------------------------------------------------
+
+def _open_shell(ssh: paramiko.SSHClient, *, timeout: int) -> paramiko.Channel:
+    t = ssh.get_transport()
+    if not t or not t.is_active():
+        raise RuntimeError("SSH transport not active")
+    ch = t.open_session(timeout=timeout)
+    ch.get_pty(term="vt100", width=200, height=50)
+    ch.invoke_shell()
+    ch.settimeout(timeout)
+    return ch
+
+def _drain(chan: paramiko.Channel) -> bytes:
+    buf = bytearray()
+    try:
+        while chan.recv_ready():
+            buf.extend(chan.recv(65535))
+    except Exception:
+        pass
+    return bytes(buf)
+
+def _read_until_prompt(chan: paramiko.Channel, *, timeout: int) -> str:
+    """
+    Read from the interactive shell until we see a Cisco-like prompt on a line
+    by itself (…..# or …..> with no spaces). Returns decoded text.
+    """
+    buf = bytearray()
+    last_rx = time.time()
+    while True:
+        if chan.recv_ready():
+            chunk = chan.recv(65535)
+            if not chunk:
+                break
+            buf.extend(chunk)
+            last_rx = time.time()
+
+            tail = bytes(buf[-1024:])
+            # prompt is typically "ALLS102RTR01#" or "...>"
+            lines = tail.splitlines()[-3:]
+            for line in lines:
+                s = line.strip()
+                if s and (s.endswith(b'#') or s.endswith(b'>')) and (b' ' not in s):
+                    return buf.decode("utf-8", errors="ignore")
+        else:
+            if time.time() - last_rx > timeout:
+                return buf.decode("utf-8", errors="ignore")
+            time.sleep(0.05)
+
+def _send(chan: paramiko.Channel, cmd: str):
+    chan.send(cmd.rstrip() + "\n")
+
+_IFACE_SHORT = {
+    "GigabitEthernet": "G",
+    "FastEthernet": "F",
+    "TenGigabitEthernet": "Te",
+    "HundredGigE": "Hu",
+    "Cellular": "Cell",
+    "Serial": "S",
+    "Vlan": "Vl",
+}
+
+_IP_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
+
+def _shorten_iface(name: str) -> str:
+    if not name:
+        return name
+    for long, short in _IFACE_SHORT.items():
+        if name.startswith(long):
+            return name.replace(long, short, 1)
+    return name
+
+def _iface_from_ip_over_shell(chan, ip: str, timeout: int = 8) -> str | None:
+    """Map IP -> interface using a single shell session."""
+    _send(chan, "show ip interface brief")
+    out = _read_until_prompt(chan, timeout=timeout)
+    # Typical line: "GigabitEthernet0/0   192.168.0.1   YES ... up   up"
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == ip:
+            return parts[0]
+    return None
+
+def _resolve_tunnel_underlay_iface_over_shell(chan, tunnel_if: str, timeout: int = 8) -> str | None:
+    """
+    For TunnelX, try to find the 'tunnel source' and map it to a physical interface.
+    Works for:
+      tunnel source <interface>
+      tunnel source <ip-address>
+    Uses the same shell channel.
+    """
+    # Prefer running-config view (most consistent across IOS variants)
+    _send(chan, f"show running-config interface {tunnel_if}")
+    cfg = _read_until_prompt(chan, timeout=timeout)
+    m = re.search(r"(?im)^\s*tunnel\s+source\s+(\S+)", cfg)
+    src = m.group(1) if m else None
+
+    if not src:
+        # Fallback to operational display
+        _send(chan, f"show interface {tunnel_if}")
+        out2 = _read_until_prompt(chan, timeout=timeout)
+        m2 = re.search(r"(?i)tunnel\s+source\s+(\S+)", out2)
+        src = m2.group(1) if m2 else None
+
+    if not src:
+        return None
+
+    if _IP_RE.match(src):
+        # Source is an IP -> find which interface owns it
+        return _iface_from_ip_over_shell(chan, src, timeout=timeout)
+    else:
+        # Source is already an interface name
+        return src
+
+def _parse_default_route(route_text: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Return (gw_ip, outgoing_interface). Handles:
+    - 'Gateway of last resort is A.B.C.D to network 0.0.0.0'
+    - 'S* 0.0.0.0/0 [1/0] via A.B.C.D, Vlan1'
+    - 'S* 0.0.0.0/0 is directly connected, Cellular0/0/0'
+    - '0.0.0.0/0 is directly connected, Cellular0/0/0'
+    """
+    text = route_text
+
+    # 1) Explicit "Gateway of last resort is ..." (records the IP only)
+    m = re.search(r"Gateway of last resort is\s+((?:\d{1,3}\.){3}\d{1,3})\b", text, re.I)
+    gw_ip = m.group(1) if m else None
+
+    # 2) Default route via next-hop, with interface after comma
+    m2 = re.search(
+        r"^\s*S\*\s+0\.0\.0\.0/0.*?\bvia\s+((?:\d{1,3}\.){3}\d{1,3})\s*,\s*([A-Za-z0-9/\.]+)",
+        text, re.M
+    )
+    if m2:
+        return (m2.group(1), m2.group(2))
+
+    # 3) Default route directly connected: interface only
+    m3 = re.search(
+        r"^\s*(?:S\*\s+)?0\.0\.0\.0/0\s+is\s+directly\s+connected,\s*([A-Za-z0-9/\.]+)",
+        text, re.M | re.I
+    )
+    if m3:
+        return (gw_ip, m3.group(1))  # gw_ip may be None, interface is known
+
+    # 4) Fallback: try to pull an interface after "directly connected,"
+    m4 = re.search(r"directly connected,\s*([A-Za-z0-9/\.]+)", text)
+    if m4 and gw_ip:
+        return (gw_ip, m4.group(1))
+
+    # 5) Nothing conclusive
+    return (gw_ip, None)
+
+# --- main API -------------------------------------------------------------
+
+def detect_default_gateway(ip: str, username: str, password: str, *, vrf: str | None = None, timeout: int = 20):
+    """
+    Robust version: run all commands in ONE PTY shell. Returns:
+        (display_text, gw_ip, iface, raw_route_text)
+
+    display_text example: '0.0.0.0 (G0/0)' or '192.0.2.1 (Cell0/0/0)'
+    """
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     ssh.connect(ip, username=username, password=password,
                 look_for_keys=False, allow_agent=False, timeout=timeout)
-    _, stdout, _ = ssh.exec_command(cmd_route)
-    out = stdout.read().decode(errors="ignore")
+    try:
+        # keep transport alive
+        try:
+            ssh.get_transport().set_keepalive(15)
+        except Exception:
+            pass
 
-    m = re.search(r"Gateway of last resort is\s+((?:\d{1,3}\.){3}\d{1,3})\s+to network\s+0\.0\.0\.0",
-                  out, re.IGNORECASE)
-    if m:
-        gw = m.group(1); ssh.close(); return gw, out
-    m2 = re.search(r"(?m)^\S*\*\s+0\.0\.0\.0/0.*?\bvia\s+((?:\d{1,3}\.){3}\d{1,3})\b", out)
-    if m2:
-        gw = m2.group(1); ssh.close(); return gw, out
-    _, stdout2, _ = ssh.exec_command(cmd_cfg)
-    cfg = stdout2.read().decode(errors="ignore")
-    m3 = re.search(r"(?m)^ip route 0\.0\.0\.0 0\.0\.0\.0\s+((?:\d{1,3}\.){3}\d{1,3})\b", cfg)
-    ssh.close()
-    return (m3.group(1) if m3 else None), out
+        chan = _open_shell(ssh, timeout=timeout)
+        time.sleep(0.2)
+        _drain(chan)
+
+        # no paging
+        _send(chan, "terminal length 0")
+        _read_until_prompt(chan, timeout=timeout)
+
+        # route table
+        route_cmd = f"show ip route{' vrf ' + vrf if vrf else ''}"
+        _send(chan, route_cmd)
+        route_text = _read_until_prompt(chan, timeout=timeout)
+
+        gw_ip, iface = _parse_default_route(route_text)  # your existing parser
+
+        # optional config fallback for gw_ip
+        if not gw_ip and not iface:
+            cfg_cmd = (f"show running-config | include ^ip route vrf {vrf} 0.0.0.0 0.0.0.0"
+                       if vrf else "show running-config | include ^ip route 0.0.0.0 0.0.0.0")
+            _send(chan, cfg_cmd)
+            cfg_text = _read_until_prompt(chan, timeout=timeout)
+            m_cfg = re.search(r"ip route (?:vrf \S+\s+)?0\.0\.0\.0 0\.0\.0\.0\s+((?:\d{1,3}\.){3}\d{1,3})", cfg_text)
+            if m_cfg:
+                gw_ip = m_cfg.group(1)
+
+        # If the "interface" we parsed is a Tunnel, resolve to real underlay
+        resolved_iface = iface
+        if iface and iface.lower().startswith("tunnel"):
+            underlay = _resolve_tunnel_underlay_iface_over_shell(chan, iface, timeout=timeout)
+            if underlay:
+                resolved_iface = underlay
+
+        # Shorten for UI
+        if resolved_iface:
+            resolved_iface = _shorten_iface(resolved_iface)
+
+        # Build display text
+        if gw_ip and resolved_iface:
+            display = f"{gw_ip} ({resolved_iface})"
+        elif gw_ip:
+            display = gw_ip
+        elif resolved_iface:
+            display = f"0.0.0.0 ({resolved_iface})"
+        else:
+            display = ""
+
+        try:
+            chan.close()
+        except Exception:
+            pass
+
+        # Return everything the caller might want
+        return gw_ip, resolved_iface
+
+    finally:
+        try:
+            ssh.close()
+        except Exception:
+            pass
 
 def list_cellular_interfaces(ip: str, timeout: int = 8):
     if not is_device_online(ip):
@@ -2770,7 +2983,7 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
         self.detectGatewayButton.clicked.connect(self.handle_detect_gateway)
         self.detectCellButton.clicked.connect(self.handle_detect_cellular)
 
-        self.device = device
+        self.device = device or {}
         self.device_id = self.device.get("id")
         if device and device.get("id"):
             saved = get_device_cellular(device["id"])
@@ -2807,6 +3020,10 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
             self.detectApnButton.setEnabled(has_cell)
             if not has_cell:
                 self.detectApnButton.setToolTip("No cellular interface on this router")
+            self._user_edited_sim = False
+            self.simLineEdit.textEdited.connect(lambda _t: setattr(self, "_user_edited_sim", True))
+            # keep a stable copy of what the dialog started with
+            self._sim_locked = (self.simLineEdit.text() or (device.get("sim") if isinstance(device, dict) else "") or "").strip()
 
         self.saveButton.clicked.connect(self.accept)
         self.cancelButton.clicked.connect(self.reject)
@@ -2900,8 +3117,9 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
 
                 # 1) Gateway
                 try:
-                    g, _ = detect_default_gateway(ip, username, password)
-                    gw = g
+                    gw_ip, gw_if = detect_default_gateway(ip, username, password, vrf=None)
+                    gw =f"{gw_ip} ({gw_if})" if gw_ip and gw_if else (gw_ip or "")
+
                 except Exception:
                     gw = None
 
@@ -3086,10 +3304,17 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
         if hasattr(self, "imsiLineEdit"):  self.imsiLineEdit.setText(d.get("imsi",""))
         if hasattr(self, "imeiLineEdit"):  self.imeiLineEdit.setText(d.get("imei",""))
         if hasattr(self, "iccidLineEdit"): self.iccidLineEdit.setText(d.get("iccid",""))
+
         if hasattr(self, "simLineEdit"):
-            self.simLineEdit.blockSignals(True)
-            self.simLineEdit.setText(d.get("sim",""))
-            self.simLineEdit.blockSignals(False)
+            new_sim = (d.get("sim") or "").strip()
+            cur_sim = self.simLineEdit.text().strip()
+            # only set if we have something meaningful to show and we won’t clobber user typing
+            if new_sim and not getattr(self, "_user_edited_sim", False):
+                if not cur_sim:
+                    self.simLineEdit.blockSignals(True)
+                    self.simLineEdit.setText(new_sim)
+                    self.simLineEdit.blockSignals(False)
+
         self._update_iface_status(d)
         self.selected_interface = d.get("interface","")
 
@@ -3415,7 +3640,8 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
                 if not username or not password:
                     self.detectSignals.detectFailed.emit("SSH credentials not set.")
                     return
-                gw, _ = detect_default_gateway(ip, username, password)
+                gw_ip, gw_if = detect_default_gateway(ip, username, password, vrf=None)
+                gw = f"{gw_ip} ({gw_if})" if gw_ip and gw_if else (gw_ip or "")
                 if gw:
                     self.detectSignals.gatewayDetected.emit(gw)
                 else:
@@ -5436,10 +5662,12 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         if not self._cell_refresh_timer.isActive():
             self._cell_refresh_timer.start(delay_ms)
 
-    def _append_recent_sender(self, ip: str) -> None:
-            ts = _clock()  # seconds
-            with self._senders_lock:
-                self._recent_senders.append((ip, ts))
+    def _append_recent_sender(self, lan_ip: str):
+        t = _now()
+        self._recent_senders.append((lan_ip, t))
+        # bound the list
+        if len(self._recent_senders) > 200:
+            self._recent_senders = self._recent_senders[-200:]
 
     def _pick_recent_sender(self) -> str | None:
         now = _clock()
@@ -5490,45 +5718,64 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         if len(parts) == 4:
             # swap the last two octets: A.B.C.D -> 192.168.D.C
             return f"192.168.{parts[3]}.{parts[2]}"
-        return syslog_ip
+        return 
+    
+    def _note_manual_sim_edit(self, device_id: int):
+        self._last_manual_sim_edit[device_id] = _now()
 
     # ---------- Syslog listener ----------
     def start_syslog_listener(self):
-        # make sure the recent-senders ring exists
-        if not hasattr(self, "_recent_senders"):
-            from collections import deque
-            self._recent_senders = deque(maxlen=32)
+        # --- Ring + lock for recent senders --------------------------------------
+        from collections import deque
+        import threading
 
-        def pick_recent_sender(now: float | None = None) -> str | None:
-            """Return most recent sender within window."""
-            now = now or time.time()
-            with _RECENT_LOCK:
-                for ip, t in reversed(_RECENT_SENDERS):
-                    if now - t <= RECENT_SENDER_WINDOW_SEC:
-                        return ip
-            return None
-    
+        if not hasattr(self, "_recent_senders"):
+            # store tuples (lan_ip, t)
+            self._recent_senders = deque(maxlen=64)
+        if not hasattr(self, "_recent_lock"):
+            self._recent_lock = threading.Lock()
+
+        # manual edit cool-down tracker (device_id -> timestamp)
+        if not hasattr(self, "_last_manual_sim_edit"):
+            self._last_manual_sim_edit = {}
+
+        RECENT_SENDER_WINDOW_SEC = 180          # 3 minutes
+        MANUAL_EDIT_COOLDOWN_SEC = 300          # 5 minutes
+
+        def _now():
+            import time
+            return time.time()
+
         def is_phone_number(s: str) -> bool:
             return bool(re.fullmatch(r"[+]?[\d]{6,20}", (s or "").strip()))
 
         def normalize_msisdn(s: str) -> str:
-            return (s or "").strip()
+            s = (s or "").strip()
+            if s.startswith('+'):
+                digits = '+' + ''.join(ch for ch in s[1:] if ch.isdigit())
+            else:
+                digits = ''.join(ch for ch in s if ch.isdigit())
+            if digits.startswith('00') and len(digits) > 2:
+                digits = '+' + digits[2:]
+            return digits
 
+        def pick_recent_sender() -> str | None:
+            now = _now()
+            with self._recent_lock:
+                for ip, t in reversed(self._recent_senders):
+                    if now - t <= RECENT_SENDER_WINDOW_SEC:
+                        return ip
+            return None
+
+        def _note_recent_sender(lan_ip: str):
+            with self._recent_lock:
+                self._recent_senders.append((lan_ip, _now()))
+
+        # --- DB write + repaint helpers (your versions kept & slightly hardened) --
         def update_sender_sim_in_db(device_id: int, sim_text: str, prefer_iface: str | None = None):
-            """
-            Persist SIM (MSISDN) into device_cellular.sim for the chosen interface row.
-            Strategy:
-            1) If prefer_iface is provided and exists, update that row.
-            2) Else update the 'best' row for this device:
-                - prefer rows with ip_addr != 'unassigned'
-                - then status='up'
-                - newest last
-            If no row exists, insert a minimal one.
-            """
             db = mysql.connector.connect(**get_db_config())
             try:
                 cur = db.cursor()
-
                 row_id = None
                 if prefer_iface:
                     cur.execute(
@@ -5561,7 +5808,6 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
                         (sim_text, row_id),
                     )
                 else:
-                    # no cellular row yet – create a minimal one
                     cur.execute(
                         """
                         INSERT INTO device_cellular
@@ -5570,19 +5816,16 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
                         """,
                         (device_id, prefer_iface or "Cellular0/0/0", "unassigned", "down", "", sim_text),
                     )
-
                 db.commit()
             finally:
                 db.close()
 
         def repaint_sim_row(ip: str, sim_text: str):
-            # 1) ensure we run on the GUI thread
             app_thr = QtWidgets.QApplication.instance().thread()
             if QtCore.QThread.currentThread() is not app_thr:
                 QtCore.QTimer.singleShot(0, lambda: repaint_sim_row(ip, sim_text))
                 return
 
-            # 2) update in-memory device (and the filtered view list)
             dev = self._find_device_by_ip(ip)
             if not dev:
                 return
@@ -5592,29 +5835,23 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             if sim_text:
                 dev["has_cellular"] = True
 
-            # keep lists in sync (some tables use _view_devices when filtered)
+            # keep lists in sync
             for lst in (getattr(self, "devices", []), getattr(self, "_view_devices", [])):
                 for d in lst or []:
-                    if d.get("ip") == ip:
+                    if (d.get("ip") or "").strip() == ip:
                         d["sim"] = sim_text
                         if sim_text:
                             d["has_cellular"] = True
 
-            # 3) repaint the table row
             row_idx = self._find_row_by_ip(ip)
             if row_idx is None:
                 return
 
             apn_txt = dev.get("apn", "")
-
-            # Preferred: your badge/widget renderer
             if hasattr(self, "_set_sim_apn_cells"):
                 self._set_sim_apn_cells(row_idx, dev.get("has_cellular", False), sim_text, apn_txt)
             else:
-                # Fallback: plain text into the SIM column
-                col_idx = None
-                if hasattr(self, "_get_column_index"):
-                    col_idx = self._get_column_index("SIM")
+                col_idx = getattr(self, "_get_column_index", lambda _ : None)("SIM")
                 if col_idx is not None and hasattr(self, "deviceTable"):
                     item = self.deviceTable.item(row_idx, col_idx)
                     if item is None:
@@ -5622,11 +5859,10 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
                         self.deviceTable.setItem(row_idx, col_idx, item)
                     item.setText(sim_text)
 
-            # force a visual refresh
             if hasattr(self, "deviceTable"):
                 self.deviceTable.viewport().update()
 
-
+        # -------------------------- main listener thread ---------------------------
         def listen():
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.bind(("0.0.0.0", 514))
@@ -5637,82 +5873,103 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
                 if self.is_paused:
                     continue
 
-                message = data.decode("utf-8", errors="ignore")
-                router_ip = addr[0]                       # NBMA (e.g., 172.16.1.203)
-                print(f"🔔 Syslog from {router_ip}: {message.strip()}")
+                msg = data.decode("utf-8", errors="ignore")
+                nbma_ip = addr[0]  # e.g., 172.16.1.203
 
-                # 1) OUTGOING SMS (sender) — remember who just sent
-                if "%CELLWAN-5-OUTGOING_SMS_SENT" in message:
-                    sender_ip = map_to_lan(router_ip)     # e.g., 192.168.203.1
-                    lan_ip = self._map_syslog_ip_to_device_ip(router_ip)
-                    self._append_recent_sender(lan_ip)
-                    # self._recent_senders.append((sender_ip, time.time()))
-                    # optionally also do a quick cellular refresh of the sender:
-                    QtCore.QTimer.singleShot(0, lambda ip=sender_ip: self._maybe_mark_refresh_by_ip(ip))
+                # 1) OUTGOING sent: remember sender (LAN ip)
+                if "%CELLWAN-5-OUTGOING_SMS_SENT" in msg:
+                    sender_lan_ip = self._map_syslog_ip_to_device_ip(nbma_ip)
+                    _note_recent_sender(sender_lan_ip)
+                    # optional refresh of that row's last-sms cell
+                    QtCore.QTimer.singleShot(
+                        0, lambda ip=sender_lan_ip: self._maybe_mark_refresh_by_ip(ip)
+                    )
+                    continue
 
-                # 2) INCOMING (receiver) — "SMS Extracted -> ID: N"
-                m = re.search(r"SMS Extracted\s*->\s*ID:\s*(\d+)", message)
+                # 2) Receiver extracted
+                m = re.search(r"SMS Extracted\s*->\s*ID:\s*(\d+)", msg)
                 if not m:
                     continue
 
                 sms_index = m.group(1)
 
-                # Pull full SMS from the receiver (NBMA)
+                # fetch the SMS from the receiver (use NBMA)
                 try:
-                    sms = fetch_sms_details(router_ip, sms_index)
+                    sms = fetch_sms_details(nbma_ip, sms_index)
                 except Exception as e:
-                    print(f"❌ fetch_sms_details failed for {router_ip}, ID {sms_index}: {e}")
+                    print(f"❌ fetch_sms_details failed for {nbma_ip}, ID {sms_index}: {e}")
                     continue
 
-                # Map receiver NBMA → LAN
-                logical_ip = map_to_lan(router_ip)
+                # map receiver to LAN; ensure it's one of our devices
+                receiver_lan_ip = self._map_syslog_ip_to_device_ip(nbma_ip)
+                receiver_dev = self._find_device_by_ip(receiver_lan_ip)
+                if not receiver_dev:
+                    # Not an internal router -> do not autolearn
+                    try:
+                        self.add_sms_log(sms)  # still show in live pane if you like
+                    except Exception:
+                        pass
+                    continue
 
-                # Optional email queueing
+                # tag + email (safe)
                 try:
-                    email_to = get_email_by_router_ip(logical_ip)
+                    sms["Router"] = self.get_router_name(receiver_lan_ip)
+                except Exception:
+                    sms["Router"] = receiver_lan_ip
+                try:
+                    email_to = get_email_by_router_ip(receiver_lan_ip)
                     if email_to:
                         send_email(sms, email_to)
                 except Exception as e:
                     print(f"❌ Email send failed: {e}")
 
-                # Tag for UI and push into Live Capture tab
+                # Extract From and normalize
                 try:
-                    sms["Router"] = self.get_router_name(logical_ip)
-                except Exception:
-                    sms["Router"] = logical_ip
+                    from_norm = normalize_msisdn(sms.get("From", ""))
+                    if not is_phone_number(from_norm):
+                        self.add_sms_log(sms)
+                        continue
 
-                # 2a) Learn the SENDER SIM from the receiver's "From" number
-                try:
-                    from_num = normalize_msisdn(sms.get("From", ""))
-                    if is_phone_number(from_num):
-                        # Find the most recent sender inside the window
-                        sender_ip = pick_recent_sender()
+                    # pick most recent sender
+                    sender_ip = pick_recent_sender()
+                    if not sender_ip:
+                        print("ℹ️ No recent sender to map this inbound 'From' number to.")
+                        self.add_sms_log(sms)
+                        continue
 
-                        if sender_ip:
-                            # update in-memory device, DB, and repaint the sender row
-                            dev = self._find_device_by_ip(lan_ip)
-                            if dev and (dev.get("sim") or "").strip() != from_num:
-                                try:
-                                    update_sender_sim_in_db(dev["id"], from_num)
-                                    dev["sim"] = from_num 
-                                    # row_idx = self._find_row_by_ip(sender_ip)
-                                    # if row_idx is not None:
-                                    #     self._start_sim_refresh(row_idx, sender_ip)
-                                except Exception as e:
-                                    print(f"⚠️ DB SIM update failed for {sender_ip}: {e}")
-                                dev["sim"] = from_num
-                                QtCore.QTimer.singleShot(0, lambda ip=sender_ip, s=from_num: repaint_sim_row(ip, s))
-                                print(f"✅ Learned SIM for {sender_ip}: {from_num}")
-                        else:
-                            print("ℹ️ No recent sender to map this inbound 'From' number to.")
-                except Exception as e:
-                    print(f"⚠️ SIM learn failed (receiver {logical_ip}): {e}")
+                    sender_dev = self._find_device_by_ip(sender_ip)
+                    if not sender_dev or not sender_dev.get("id"):
+                        self.add_sms_log(sms)
+                        continue
 
-                # 2b) Add to in-app live log
-                try:
+                    # honor manual edit cool-down
+                    last_manual = self._last_manual_sim_edit.get(sender_dev["id"], 0)
+                    if last_manual and (_now() - last_manual) < MANUAL_EDIT_COOLDOWN_SEC:
+                        print(f"ℹ️ Skipping autolearn for {sender_ip} (recent manual edit).")
+                        self.add_sms_log(sms)
+                        continue
+
+                    current_norm = normalize_msisdn(sender_dev.get("sim", "")) or ""
+                    if from_norm != current_norm:
+                        try:
+                            update_sender_sim_in_db(sender_dev["id"], from_norm)
+                            sender_dev["sim"] = from_norm
+                            QtCore.QTimer.singleShot(
+                                0, lambda ip=sender_ip, s=from_norm: repaint_sim_row(ip, s)
+                            )
+                            print(f"✅ Learned SIM for {sender_ip}: {from_norm}")
+                        except Exception as e:
+                            print(f"⚠️ DB SIM update failed for {sender_ip}: {e}")
+
+                    # finally log to live pane
                     self.add_sms_log(sms)
+
                 except Exception as e:
-                    print(f"⚠️ add_sms_log failed: {e}")
+                    print(f"⚠️ SIM learn failed (receiver {receiver_lan_ip}): {e}")
+                    try:
+                        self.add_sms_log(sms)
+                    except Exception:
+                        pass
 
         t = threading.Thread(target=listen, daemon=True)
         t.start()
