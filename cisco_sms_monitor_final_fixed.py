@@ -8,6 +8,7 @@ import threading
 import re
 import json
 import smtplib
+import ipaddress
 from cryptography.fernet import Fernet
 from datetime import datetime
 from PyQt5 import QtWidgets, uic, QtCore
@@ -73,6 +74,69 @@ def _capture_prompt(chan, timeout: float = 3.0) -> bytes:
             time.sleep(0.03)
     # fallback: generic
     return b'#'
+
+# --- Unified pill painter (matches APN visual) ---
+def paint_pill(painter: QtGui.QPainter, rect: QtCore.QRect, text: str, base_font: QtGui.QFont):
+    f = QtGui.QFont(base_font)
+    f.setBold(True)                                # APN badge is bold
+    painter.setFont(f)
+    fm = QtGui.QFontMetrics(f)
+
+    pad_h, pad_v, radius = 6, 2, 6                 # APN padding & radius
+    tw = fm.horizontalAdvance(text)
+    ph = fm.height() + 2 * pad_v
+    pw = tw + 2 * pad_h
+
+    pill = QtCore.QRect(
+        rect.left(),
+        rect.top() + (rect.height() - ph) // 2,
+        pw, ph
+    )
+
+    painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+    painter.setPen(QtCore.Qt.NoPen)
+    painter.setBrush(QtGui.QColor("#6b7280"))      # APN gray
+    painter.drawRoundedRect(pill, radius, radius)
+
+    painter.setPen(QtCore.Qt.white)
+    painter.drawText(pill.adjusted(pad_h, 0, -pad_h, 0),
+                    QtCore.Qt.AlignCenter, text)
+    return pill
+    
+# --- UI helper: SIM cell (number + send button) ---
+def make_sim_cell(sim_text: str, dev_id: int, on_send_cb) -> QWidget:
+    w = QWidget()
+    l = QHBoxLayout(w)
+    l.setContentsMargins(6, 0, 6, 0)
+    l.setSpacing(6)
+
+    if not sim_text:  # show pill "NO CELL"
+        lbl = QLabel("NO CELL")
+        lbl.setObjectName("SimPill")
+        f = QtGui.QFont(w.font()); f.setBold(True)
+        lbl.setFont(f)
+        lbl.setAlignment(Qt.AlignVCenter)
+        lbl.setStyleSheet(
+            "#SimPill { background:#6b7280; color:#fff; padding:2px 8px; border-radius:8px; }"
+        )
+        l.addWidget(lbl)
+    else:
+        # number label
+        num = QLabel(sim_text)
+        num.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        l.addWidget(num, 1)
+
+        # send button
+        btn = QToolButton(w)
+        btn.setIcon(QIcon(resource_path("icons/send.png")))
+        btn.setToolTip(f"Send SMS to {sim_text}")
+        btn.setAutoRaise(True)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.clicked.connect(lambda _=False, d=dev_id, to=sim_text: on_send_cb(d, to))
+        l.addWidget(btn, 0)
+
+    l.addStretch(1)
+    return w
 
 def _is_qualified_cell_row(d: dict) -> bool:
     """
@@ -1186,27 +1250,33 @@ class LoadingSpinner(QWidget):
     def stop(self):
         self.setVisible(False); self.movie.stop()
 
-def make_device_cell(name: str, is_hub: bool, has_cellular: bool) -> QWidget:
+def make_device_cell(name: str, is_hub: bool, has_cellular: bool, base_font=None) -> QWidget:
     w = QWidget()
-    layout = QHBoxLayout(w)
-    layout.setContentsMargins(6, 0, 0, 0)
+    lay = QHBoxLayout(w); lay.setContentsMargins(6, 0, 0, 0); lay.setSpacing(6)
+
+    if base_font is None:
+        # safest: match exactly what the table uses to paint items
+        base_font = QtWidgets.QApplication.font("QTableView")
 
     def pill(text, bg, fg="#fff"):
-        lbl = QLabel(text)
-        lbl.setStyleSheet(f"""
-            QLabel {{
-                background:{bg}; color:{fg}; padding:2px 6px;
-                border-radius:6px; font-weight:600; font-size:11px;
-            }}
-        """)
+        lbl = QLabel(text); lbl.setObjectName("HubPill")
+        f = QtGui.QFont(base_font); f.setBold(True)
+        lbl.setFont(f)
+        lbl.setAlignment(Qt.AlignVCenter)
+        lbl.setStyleSheet("#HubPill { background:%s; color:%s; padding:2px 6px; border-radius:6px; }" % (bg, fg))
         return lbl
 
     if is_hub:
-        layout.addWidget(pill("HUB", "#2563eb"))
+        lay.addWidget(pill("HUB", "#2563eb"))
 
-    label = QLabel(("  " + name) if is_hub else name)
-    layout.addWidget(label)
-    layout.addStretch(1)
+    name_lbl = QLabel(("  " + name) if is_hub else name)
+    name_lbl.setObjectName("DeviceNameLabel")
+    name_lbl.setFont(base_font)                               # ← exact same font as items
+    name_lbl.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+    name_lbl.setWordWrap(False)
+    name_lbl.setStyleSheet("#DeviceNameLabel { background:transparent; color:palette(text); padding:0; margin:0; }")
+
+    lay.addWidget(name_lbl); lay.addStretch(1)
     return w
 
 def create_status_label(status):
@@ -1841,42 +1911,86 @@ def _parse_default_route(route_text: str) -> Tuple[Optional[str], Optional[str]]
     # 5) Nothing conclusive
     return (gw_ip, None)
 
-# --- main API -------------------------------------------------------------
+def _infer_iface_for_nexthop_from_route(route_text: str, gw_ip: str) -> str | None:
+    """
+    From a 'show ip route' dump, figure out which *directly connected* interface
+    would be used to reach gw_ip. Prefer the most-specific connected prefix.
+    """
+    if not gw_ip:
+        return None
+    try:
+        gw = ipaddress.ip_address(gw_ip)
+    except Exception:
+        return None
 
+    best: tuple[int, str] | None = None  # (prefixlen, iface)
+
+    for raw in route_text.splitlines():
+        line = raw.strip()
+        # Match connected/local lines, e.g.:
+        #   C 192.168.1.0/24 is directly connected, GigabitEthernet0/0
+        #   L 192.168.1.151/32 is directly connected, GigabitEthernet0/0
+        m = re.match(r'^[CL]\s+(\d{1,3}(?:\.\d{1,3}){3})/(\d+).*?directly connected,\s+(\S+)', line)
+        if not m:
+            continue
+        net, plen_s, iface = m.group(1), m.group(2), m.group(3)
+        # ignore loopbacks as candidates
+        if iface.lower().startswith("loopback"):
+            continue
+        try:
+            n = ipaddress.ip_network(f"{net}/{int(plen_s)}", strict=False)
+        except Exception:
+            continue
+        if gw in n:
+            cand = (int(plen_s), iface)
+            if (best is None) or (cand[0] > best[0]):
+                best = cand
+
+    if best:
+        return best[1]
+
+    # Secondary pattern: some IOS show the iface on the default line:
+    # S* 0.0.0.0/0 [1/0] via 192.168.1.1, 00:01:23, GigabitEthernet0/0
+    m2 = re.search(
+        rf'S\*\s+0\.0\.0\.0/0.*?via\s+{re.escape(gw_ip)}(?:,\s*\S+)*,\s*(\S+)',
+        route_text
+    )
+    if m2:
+        iface = m2.group(1)
+        if not iface.lower().startswith("loopback"):
+            return iface
+
+    return None
+
+# --- main API -------------------------------------------------------------
 def detect_default_gateway(ip: str, username: str, password: str, *, vrf: str | None = None, timeout: int = 20):
     """
-    Robust version: run all commands in ONE PTY shell. Returns:
-        (display_text, gw_ip, iface, raw_route_text)
-
-    display_text example: '0.0.0.0 (G0/0)' or '192.0.2.1 (Cell0/0/0)'
+    ONE-PTY shell; returns (gw_ip, resolved_iface).
+    Display text can be built by the caller as: f"{gw_ip} ({resolved_iface})".
     """
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     ssh.connect(ip, username=username, password=password,
                 look_for_keys=False, allow_agent=False, timeout=timeout)
     try:
-        # keep transport alive
         try:
             ssh.get_transport().set_keepalive(15)
         except Exception:
             pass
 
         chan = _open_shell(ssh, timeout=timeout)
-        time.sleep(0.2)
-        _drain(chan)
+        time.sleep(0.2); _drain(chan)
 
-        # no paging
         _send(chan, "terminal length 0")
         _read_until_prompt(chan, timeout=timeout)
 
-        # route table
         route_cmd = f"show ip route{' vrf ' + vrf if vrf else ''}"
         _send(chan, route_cmd)
         route_text = _read_until_prompt(chan, timeout=timeout)
 
-        gw_ip, iface = _parse_default_route(route_text)  # your existing parser
+        gw_ip, iface = _parse_default_route(route_text)
 
-        # optional config fallback for gw_ip
+        # Fallback: default route only in config
         if not gw_ip and not iface:
             cfg_cmd = (f"show running-config | include ^ip route vrf {vrf} 0.0.0.0 0.0.0.0"
                        if vrf else "show running-config | include ^ip route 0.0.0.0 0.0.0.0")
@@ -1886,33 +2000,32 @@ def detect_default_gateway(ip: str, username: str, password: str, *, vrf: str | 
             if m_cfg:
                 gw_ip = m_cfg.group(1)
 
-        # If the "interface" we parsed is a Tunnel, resolve to real underlay
+        # >>> NEW: infer real egress iface for the next-hop if we have gw_ip
         resolved_iface = iface
-        if iface and iface.lower().startswith("tunnel"):
-            underlay = _resolve_tunnel_underlay_iface_over_shell(chan, iface, timeout=timeout)
-            if underlay:
+        if gw_ip:
+            egress = _infer_iface_for_nexthop_from_route(route_text, gw_ip)
+            if egress:
+                resolved_iface = egress
+
+        # Only if we *still* have a Tunnel (or no iface at all), try underlay resolution.
+        if resolved_iface and resolved_iface.lower().startswith("tunnel"):
+            underlay = _resolve_tunnel_underlay_iface_over_shell(chan, resolved_iface, timeout=timeout)
+            if underlay and not underlay.lower().startswith("loopback"):
                 resolved_iface = underlay
 
         # Shorten for UI
         if resolved_iface:
-            resolved_iface = _shorten_iface(resolved_iface)
-
-        # Build display text
-        if gw_ip and resolved_iface:
-            display = f"{gw_ip} ({resolved_iface})"
-        elif gw_ip:
-            display = gw_ip
-        elif resolved_iface:
-            display = f"0.0.0.0 ({resolved_iface})"
-        else:
-            display = ""
+            name = resolved_iface.strip()
+            if not name.lower().startswith("fastethernet"):
+                resolved_iface = _shorten_iface(name)
+            else:
+                resolved_iface = name
 
         try:
             chan.close()
         except Exception:
             pass
 
-        # Return everything the caller might want
         return gw_ip, resolved_iface
 
     finally:
@@ -5284,6 +5397,17 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             self.deviceTable.setItem(row, SIM_COL, QtWidgets.QTableWidgetItem(sim_text or ""))
             self.deviceTable.setItem(row, APN_COL, QtWidgets.QTableWidgetItem(apn_text or ""))
 
+    def _send_sms_to(self, dev_id: int, to_number: str):
+        # If your dialog supports prefill, add this overload:
+        try:
+            # Preferred: extend your method signature to accept default_to
+            self.show_send_sms_dialog_by_id(dev_id, default_to=to_number)
+            return
+        except TypeError:
+            pass
+        # Fallback: open the normal dialog (user types number there)
+        self.show_send_sms_dialog_by_id(dev_id)
+
     # ---------- Table build ----------
     def load_devices(self, device_list):
         # stop and clear any previous per-row timers
@@ -5305,6 +5429,19 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             "Email", "Last SMS", "Signal", "Status", "Actions"
         ])
         self.deviceTable.setRowCount(len(device_list))
+        self.deviceTable.setItemDelegateForColumn(0, DeviceDelegate(self.deviceTable))
+        
+        self.simDelegate = SimDelegate(self.deviceTable)
+        self.deviceTable.setItemDelegateForColumn(3, self.simDelegate)  # SIM column
+        self.simDelegate.sendSmsRequested.connect(self._send_sms_to)
+        
+        self.apnDelegate = ApnDelegate(self.deviceTable)
+        self.deviceTable.setItemDelegateForColumn(4, self.apnDelegate)
+
+        self.deviceTable.setWordWrap(False)
+        fm = self.deviceTable.fontMetrics()
+        self.deviceTable.verticalHeader().setDefaultSectionSize(fm.height() + 12)
+        self.deviceTable.horizontalHeader().setSectionsClickable(True)
 
         # resolve Last SMS column index once (fallback moved from 6 → 7 because of ICCID)
         self._last_sms_col = _col_index(self, "Last SMS", default=7)
@@ -5316,14 +5453,27 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
                 self._auto_detect_and_flag_hub(i, d)
 
             # columns 0..2
-            self.deviceTable.setCellWidget(i, 0, make_device_cell(
-                d["name"], d.get("is_hub", False), d.get("has_cellular", False)
-            ))
+            item0 = QtWidgets.QTableWidgetItem(d["name"])
+            item0.setFlags(item0.flags() & ~QtCore.Qt.ItemIsEditable)
+            item0.setData(DEVICE_HUB_ROLE, 1 if d.get("is_hub", False) else 0)
+            self.deviceTable.setItem(i, 0, item0)
             self.deviceTable.setItem(i, 1, IPItem(d["ip"]))
             self.deviceTable.setItem(i, 2, QtWidgets.QTableWidgetItem(d["gateway"]))
 
-            # SIM (col 3) + APN (col 4)
-            self._set_sim_apn_cells(i, d.get("has_cellular", False), d.get("sim", ""), d.get("apn", ""))
+            # SIM (col 3)
+            sim_txt = (d.get("sim") or "").strip()
+            it_sim = QtWidgets.QTableWidgetItem(sim_txt)
+            it_sim.setFlags(it_sim.flags() & ~QtCore.Qt.ItemIsEditable)
+            it_sim.setData(SIM_TEXT_ROLE, sim_txt)
+            it_sim.setData(DEVICE_ID_ROLE, int(d["id"]))
+            self.deviceTable.setItem(i, 3, it_sim)
+
+            # APN (col 4)
+            apn_txt = (d.get("apn") or "").strip()
+            it_apn = QtWidgets.QTableWidgetItem(apn_txt)
+            it_apn.setFlags(it_apn.flags() & ~QtCore.Qt.ItemIsEditable)
+            it_apn.setData(APN_TEXT_ROLE, apn_txt)
+            self.deviceTable.setItem(i, 4, it_apn)
 
             # ICCID (col 5) — show parsed ICCID from best cellular iface (or em dash)
             col_iccid = _col_index(self, "ICCID")     # <-- use function, not self._col_index
@@ -5989,6 +6139,165 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
                 content = log.get('Content','').replace('"', '""')
                 f.write(f'{log.get("ID","")},{log.get("Time","")},{log.get("From","")},{log.get("Size","")},"{content}"\n')
         QtWidgets.QMessageBox.information(self, "Export", "SMS logs exported successfully.")
+
+DEVICE_HUB_ROLE = QtCore.Qt.UserRole + 101  # custom role to store is_hub flag
+
+class DeviceDelegate(QtWidgets.QStyledItemDelegate):
+    def paint(self, painter: QtGui.QPainter, option: QtWidgets.QStyleOptionViewItem, index: QtCore.QModelIndex):
+        opt = QtWidgets.QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+
+        # draw selection/row background as usual
+        style = opt.widget.style() if opt.widget else QtWidgets.QApplication.style()
+        style.drawPrimitive(QtWidgets.QStyle.PE_PanelItemViewItem, opt, painter, opt.widget)
+
+        # we will draw text ourselves
+        text = index.data(QtCore.Qt.DisplayRole) or ""
+        is_hub = bool(index.data(DEVICE_HUB_ROLE))
+
+        r = opt.rect.adjusted(8, 0, -8, 0)  # left/right padding
+        painter.save()
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.setFont(opt.font)  # EXACT same font the view uses
+
+        x = r.left()
+        y = r.top()
+        h = r.height()
+
+        # optional: HUB pill
+        if is_hub:
+            pill_margin_h = 6
+            pill_margin_v = 4
+            pill_text = "HUB"
+            # size using the SAME font metrics the table uses
+            fm = QtGui.QFontMetrics(opt.font)
+            tw = fm.horizontalAdvance(pill_text)
+            ph = fm.height() + pill_margin_v   # pill height ~ text height
+            pw = tw + 16                       # padding inside the pill
+            pill_rect = QtCore.QRect(x, y + (h - ph)//2, pw, ph)
+
+            # pill background
+            painter.setBrush(QtGui.QColor("#2563eb"))
+            painter.drawRoundedRect(pill_rect, 6, 6)
+
+            # pill text
+            painter.setPen(QtCore.Qt.white)
+            painter.drawText(pill_rect.adjusted(8, 0, -8, 0),
+                             QtCore.Qt.AlignVCenter | QtCore.Qt.AlignHCenter,
+                             pill_text)
+
+            x = pill_rect.right() + 8  # space between pill and device name
+
+        # device name (same font/color/path as other items)
+        name_rect = QtCore.QRect(x, r.top(), r.right() - x, r.height())
+        # use view palette for text color so selection states match
+        painter.setPen(opt.palette.color(
+            QtGui.QPalette.HighlightedText if (opt.state & QtWidgets.QStyle.State_Selected)
+            else QtGui.QPalette.Text
+        ))
+        painter.drawText(name_rect, QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft,
+                         text)
+
+        painter.restore()
+
+    def sizeHint(self, option, index):
+        # keep default row height logic
+        return super().sizeHint(option, index)
+    
+APN_TEXT_ROLE = QtCore.Qt.UserRole + 202
+
+class ApnDelegate(QtWidgets.QStyledItemDelegate):
+    def paint(self, painter, option, index):
+        opt = QtWidgets.QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        style = opt.widget.style() if opt.widget else QtWidgets.QApplication.style()
+        style.drawPrimitive(QtWidgets.QStyle.PE_PanelItemViewItem, opt, painter, opt.widget)
+
+        painter.save()
+        painter.setFont(opt.font)
+
+        text = (index.data(APN_TEXT_ROLE) or "").strip()
+        r = opt.rect.adjusted(8, 0, -8, 0)
+
+        if not text:          # show the same pill as SIM's empty
+            paint_pill(painter, r, "NO CELL", opt.font)
+        else:                  # normal APN text
+            color = opt.palette.color(
+                QtGui.QPalette.HighlightedText if (opt.state & QtWidgets.QStyle.State_Selected)
+                else QtGui.QPalette.Text
+            )
+            painter.setPen(color)
+            painter.drawText(r, QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft, text)
+
+        painter.restore()
+
+    def sizeHint(self, option, index):
+        return super().sizeHint(option, index)
+
+DEVICE_ID_ROLE = QtCore.Qt.UserRole + 200
+SIM_TEXT_ROLE  = QtCore.Qt.UserRole + 201
+
+class SimDelegate(QtWidgets.QStyledItemDelegate):
+    sendSmsRequested = QtCore.pyqtSignal(int, str)  # (device_id, to_number)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # cache icon pixmap
+        self.icon = QtGui.QIcon(resource_path("icons/send.png"))
+        self._last_icon_rect = {}
+
+    def paint(self, painter, option, index):
+        opt = QtWidgets.QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        style = opt.widget.style() if opt.widget else QtWidgets.QApplication.style()
+        style.drawPrimitive(QtWidgets.QStyle.PE_PanelItemViewItem, opt, painter, opt.widget)
+
+        painter.save()
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        painter.setFont(opt.font)
+
+        text = (index.data(SIM_TEXT_ROLE) or "").strip()
+        r = opt.rect.adjusted(8, 0, -8, 0)  # padding
+
+        if not text:
+            paint_pill(painter, r, "NO CELL", opt.font)
+            self._last_icon_rect[index] = QtCore.QRect()
+            painter.restore()
+            return
+        else:
+            # draw SIM text and a send icon at the right
+            fm = QtGui.QFontMetrics(opt.font)
+            icon_sz = min(max(fm.height(), 16), 20)
+            icon_rect = QtCore.QRect(r.right()-icon_sz, r.top() + (r.height()-icon_sz)//2,
+                                     icon_sz, icon_sz)
+            text_rect = QtCore.QRect(r.left(), r.top(), icon_rect.left()-8 - r.left(), r.height())
+
+            painter.setPen(opt.palette.color(
+                QtGui.QPalette.HighlightedText if (opt.state & QtWidgets.QStyle.State_Selected)
+                else QtGui.QPalette.Text
+            ))
+            painter.drawText(text_rect, QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft, text)
+
+            pm = self.icon.pixmap(icon_sz, icon_sz)
+            style.drawItemPixmap(painter, icon_rect, QtCore.Qt.AlignCenter, pm)
+
+            # remember clickable area for editorEvent
+            self._last_icon_rect[index] = icon_rect
+
+        painter.restore()
+
+    def editorEvent(self, event, model, option, index):
+        # click on icon → emit signal
+        if event.type() == QtCore.QEvent.MouseButtonRelease and event.button() == QtCore.Qt.LeftButton:
+            icon_rect = self._last_icon_rect.get(index, QtCore.QRect())
+            if icon_rect.contains(event.pos()):
+                dev_id = int(index.data(DEVICE_ID_ROLE) or 0)
+                sim_to = (index.data(SIM_TEXT_ROLE) or "").strip()
+                if dev_id and sim_to:
+                    self.sendSmsRequested.emit(dev_id, sim_to)
+                return True
+        return super().editorEvent(event, model, option, index)
 
 # Simple dialog for sending SMS
 class SendSMSDialog(QtWidgets.QDialog):

@@ -58,3 +58,19 @@
 [192.168.210.1] Empty list output at 2025-11-06 15:35:11
 --- cellular 0/0/0 lte sms view all ---
 
+
+[192.168.209.1] Empty view output for ID 7 at 2025-11-07 10:27:39
+--- cellular 0/0/0 lte sms view 7 ---
+
+
+[192.168.205.1] Empty view output for ID 23 at 2025-11-07 10:27:56
+--- cellular 0/0/0 lte sms view 23 ---
+
+
+[192.168.209.1] Empty view output for ID 7 at 2025-11-07 13:48:16
+--- cellular 0/0/0 lte sms view 7 ---
+
+
+[192.168.209.1] Empty list output at 2025-11-07 14:41:20
+--- cellular 0/0/0 lte sms view all ---
+
