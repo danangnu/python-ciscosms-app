@@ -102,6 +102,40 @@ def paint_pill(painter: QtGui.QPainter, rect: QtCore.QRect, text: str, base_font
     painter.drawText(pill.adjusted(pad_h, 0, -pad_h, 0),
                     QtCore.Qt.AlignCenter, text)
     return pill
+
+def ensure_sms_inbox_schema():
+    cfg = get_db_config()
+    print(f"[inbox] using DB: {cfg.get('database')}")
+    conn = mysql.connector.connect(**cfg)
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS sms_inbox (
+      id           BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+      device_id    INT NOT NULL,
+      sms_id       VARCHAR(64) NOT NULL,
+      sender       VARCHAR(64) NOT NULL,
+      body         LONGTEXT NOT NULL,
+      size_bytes   INT NULL,
+      router_time  DATETIME NULL,
+      received_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      body_sha1    CHAR(40) NOT NULL,
+      UNIQUE KEY uq_router_sms (device_id, sms_id),
+      KEY ix_device_time (device_id, router_time),
+      KEY ix_received_at (received_at),
+      KEY ix_body_sha1 (body_sha1)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """)
+    # triggers for body_sha1 (Option B)
+    cur.execute("""
+    CREATE TRIGGER IF NOT EXISTS sms_inbox_bi BEFORE INSERT ON sms_inbox
+    FOR EACH ROW SET NEW.body_sha1 = SHA1(NEW.body)
+    """)
+    cur.execute("""
+    CREATE TRIGGER IF NOT EXISTS sms_inbox_bu BEFORE UPDATE ON sms_inbox
+    FOR EACH ROW SET NEW.body_sha1 = SHA1(NEW.body)
+    """)
+    conn.commit()
+    cur.close(); conn.close()
     
 # --- UI helper: SIM cell (number + send button) ---
 def make_sim_cell(sim_text: str, dev_id: int, on_send_cb) -> QWidget:
@@ -212,6 +246,45 @@ def _col_index(self, header_text: str, default: int = -1) -> int:
         pass
     return default
 
+def upsert_sms_batch(device_id: int, entries: list[dict]) -> int:
+    if not entries:
+        return 0
+    conn = mysql.connector.connect(**get_db_config())
+    cur = conn.cursor()
+    sql = """
+    INSERT INTO sms_inbox (device_id, sms_id, sender, body, size_bytes, router_time)
+    VALUES (%s, %s, %s, %s, %s, %s)
+    ON DUPLICATE KEY UPDATE
+      sender=VALUES(sender),
+      body=VALUES(body),
+      size_bytes=VALUES(size_bytes),
+      router_time=VALUES(router_time)
+    """
+    affected = 0
+    for e in entries:
+        sms_id = str(e.get("ID") or e.get("id") or "").strip()
+        frm    = str(e.get("From") or e.get("from") or "").strip()
+        body   = str(e.get("Content") or e.get("body") or "")
+        size   = int(e.get("Size") or e.get("size") or 0) or None
+
+        tm_raw = (e.get("Time") or e.get("time") or "").strip()
+        rt = None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%y-%m-%d %H:%M:%S", "%d-%m-%y %H:%M:%S"):
+            try:
+                rt = datetime.strptime(tm_raw, fmt); break
+            except Exception:
+                pass
+
+        if not sms_id:
+            # synthesize stable id if router omits ID
+            sms_id = f"auto:{(rt or datetime.utcnow()).strftime('%Y%m%d%H%M%S')}:{hash(body) & 0xffffffff:x}"
+
+        cur.execute(sql, (device_id, sms_id, frm, body, size, rt))
+        affected += cur.rowcount
+    conn.commit()
+    cur.close(); conn.close()
+    return affected
+
 # top-level helper (NOT a method)
 def _make_cell_spinner(parent) -> QLabel:
     lbl = QLabel(parent)
@@ -249,6 +322,33 @@ def choose_sms_iface(ip: str) -> str:
         return f"cellular {slot}"
     except Exception:
         return "cellular 0/0/0"
+    
+# --- Router polling ---
+def fetch_and_store_sms_for_device(dev: dict, *, timeout: int = 12) -> int:
+    """
+    Polls one router for all inbox messages and upserts them into sms_inbox.
+    Returns rows affected.
+    """
+    if not dev.get("has_cellular"):
+        return 0
+
+    ip = dev["ip"]
+    dev_id = int(dev["id"])
+    user, pw = get_ssh_credentials()    # you already have this pattern
+    if not user or not pw:
+        return 0
+
+    try:
+        slot = choose_sms_iface(ip)  # e.g., 'cellular 0/0/0'
+        cmd  = f"show {slot} lte sms view all"
+        raw  = run_cmd_fresh(ip, user, pw, cmd, timeout=timeout)
+
+        # Prefer your newest parser; fall back if needed
+        msgs = parse_sms_view_all_for_dialog(raw) or parse_sms_view_all(raw) or []
+        return upsert_sms_batch(dev_id, msgs)
+    except Exception as e:
+        print(f"[sms-sync] {dev['name']} ({ip}) failed: {e}")
+        return 0
 
 def update_sim_for_device(device_id: int, sim_number: str):
     """Set SIM for all cellular rows of a device (idempotent)."""
@@ -1480,6 +1580,24 @@ def load_devices_from_db():
             "has_cellular": has_cell,
         })
     return devices
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+def sync_all_sms_from_routers(max_workers: int = 4) -> int:
+    devices = load_devices_from_db()  # your existing source of devices
+    total = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = [
+            ex.submit(fetch_and_store_sms_for_device, d)
+            for d in devices if d.get("has_cellular")
+        ]
+        for f in as_completed(futs):
+            try:
+                total += int(f.result() or 0)
+            except Exception:
+                pass
+    print(f"[sms-sync] affected rows: {total}")
+    return total
 
 def update_device_in_db(device: dict):
     """
@@ -3807,8 +3925,47 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         # Devices tab widgets
         self.deviceSearchLineEdit = self.tabDevices.findChild(QtWidgets.QLineEdit, "searchLineEdit")
         # SMS Inbox tab
+        self._sms_pool = ThreadPoolExecutor(max_workers=4)
         self.inboxSearchLineEdit = self.tabSms.findChild(QtWidgets.QLineEdit, "searchLineEdit")
-        self.smsInboxTable = self.tabSms.findChild(QtWidgets.QTableWidget, "smsTable")
+        self.tabSms = (
+            self.findChild(QtWidgets.QWidget, "tabSms")
+            or self.findChild(QtWidgets.QWidget, "tabSMS")
+            or self.findChild(QtWidgets.QWidget, "smsTab")
+        )
+        if not isinstance(self.tabSms, QtWidgets.QWidget):
+            print("[UI] WARNING: 'tabSms' not found in .ui; using centralWidget as fallback.")
+
+        # 2) Find the inbox table; try common names
+        self.smsInboxTable = (
+            self.tabSms.findChild(QtWidgets.QTableWidget, "smsTable")
+            or self.tabSms.findChild(QtWidgets.QTableWidget, "smsInboxTable")
+            or self.tabSms.findChild(QtWidgets.QTableWidget, "inboxTable")
+        )
+
+        # 3) If still None, create one and add to the tab layout
+        if not isinstance(self.smsInboxTable, QtWidgets.QTableWidget):
+            print("[UI] 'smsTable' not found; creating a new QTableWidget for SMS Inbox.")
+            self.smsInboxTable = QtWidgets.QTableWidget(self.tabSms)
+            self.smsInboxTable.setObjectName("smsTable")
+            lay = self.tabSms.layout()
+            if lay is None:
+                lay = QtWidgets.QVBoxLayout(self.tabSms)
+                self.tabSms.setLayout(lay)
+            lay.addWidget(self.smsInboxTable)
+
+        # 4) Bind the search box on the SMS tab (if present)
+        self.inboxSearchLineEdit = (
+            self.tabSms.findChild(QtWidgets.QLineEdit, "searchLineEdit")
+            or self.tabSms.findChild(QtWidgets.QLineEdit, "inboxSearchLineEdit")
+        )
+        if self.inboxSearchLineEdit:
+            self.inboxSearchLineEdit.textChanged.connect(self.filter_inbox_table)
+
+        ensure_sms_inbox_schema()
+        _debug_inbox_count = self._debug_inbox_count()
+        print(f"[DB] SMS Inbox entries in DB: {_debug_inbox_count}")
+        self._setup_sms_inbox_table()
+        self.refresh_sms_inbox()
 
         # ✅ Assert and log
         print("[LIVE-UI] tabCapture:", type(self.tabCapture).__name__)
@@ -3903,8 +4060,6 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         self._rowDetectWatchdog.setSingleShot(True)
         self._rowDetectWatchdog.timeout.connect(self._detect_all_row_timed_out)
 
-        self._sms_pool = ThreadPoolExecutor(max_workers=4)
-
         self._sms_pending = {}             # row_idx -> QTimer
         self._last_sms_col = None          # resolved at table-build time
 
@@ -3938,12 +4093,200 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
 
         # Syslog listener + timer
         self.start_syslog_listener()
+        # One-time backfill: poll all routers then refresh
+        try:
+            print("[inbox] initial backfill starting…")
+            sync_all_sms_from_routers()
+            self.refresh_sms_inbox()
+            self._debug_inbox_count()
+        except Exception as e:
+            print(f"[inbox] initial backfill failed: {e}")
+
+
+        # --- Timer (e.g., in your main window init) ---
+        self.smsSyncTimer = QtCore.QTimer(self)
+        self.smsSyncTimer.setInterval(180_000)   # 3 minutes
+        self.smsSyncTimer.timeout.connect(lambda: (sync_all_sms_from_routers(), self.refresh_sms_inbox()))
+        self.smsSyncTimer.start()
 
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.fetch_all_devices)
         self.timer.start(5 * 60 * 1000)
 
     _autohub_checked = set()
+
+    # --- SMS INBOX: table setup, fetch, paint, filter ---
+
+    def _debug_inbox_count(self):
+        conn = mysql.connector.connect(**get_db_config())
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*), MAX(received_at) FROM sms_inbox")
+        c, mx = cur.fetchone()
+        print(f"[inbox] rows={c}, max(received_at)={mx}")
+        cur.close(); conn.close()
+
+    def _setup_sms_inbox_table(self):
+        tbl = self.smsInboxTable
+        tbl.setColumnCount(6)
+        tbl.setHorizontalHeaderLabels(["Device", "From", "Body", "Router Time", "Received At", "Size"])
+        tbl.verticalHeader().setVisible(False)
+        tbl.setShowGrid(True)
+        tbl.setWordWrap(False)
+        tbl.setSortingEnabled(True)
+
+        hh = tbl.horizontalHeader()
+        hh.setStretchLastSection(False)
+        hh.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)  # Device
+        hh.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)  # From
+        hh.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)           # Body
+        hh.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)  # Router Time
+        hh.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeToContents)  # Received
+        hh.setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeToContents)  # Size
+
+    def _query_inbox_rows(self, limit=500, search=""):
+        """
+        Returns list of dict rows from sms_inbox joined with devices (name).
+        Newest first by (router_time or received_at).
+        """
+        conn = mysql.connector.connect(**get_db_config())
+        cur = conn.cursor(dictionary=True)
+        try:
+            base = """
+            SELECT d.name   AS device_name,
+                s.sender AS sender,
+                s.body   AS body,
+                s.router_time,
+                s.received_at,
+                s.size_bytes
+            FROM sms_inbox s
+            LEFT JOIN devices d ON d.id = s.device_id
+            """
+            where = ""
+            args = []
+            if search:
+                # simple case-insensitive search on device, from, body
+                where = "WHERE (LOWER(COALESCE(d.name,'')) LIKE %s OR LOWER(s.sender) LIKE %s OR LOWER(s.body) LIKE %s)"
+                like = f"%{search.lower()}%"
+                args = [like, like, like]
+            order = "ORDER BY COALESCE(s.router_time, s.received_at) DESC, s.id DESC"
+            lim   = "LIMIT %s"
+            args.append(int(limit))
+            cur.execute(" ".join([base, where, order, lim]), args)
+            return cur.fetchall() or []
+        finally:
+            cur.close(); conn.close()
+
+    def refresh_sms_inbox(self, *, limit: int = 500):
+        """
+        Fetch SMS inbox rows from the DB on a worker thread, then paint them
+        into self.smsInboxTable on the GUI thread. Safe to call anytime.
+        """
+        # ---------- background work (DB) ----------
+        def _work():
+            try:
+                term = (self.inboxSearchLineEdit.text() if self.inboxSearchLineEdit else "").strip()
+            except Exception:
+                term = ""
+            # relies on _query_inbox_rows(limit, search) you added earlier
+            return self._query_inbox_rows(limit=limit, search=term)
+
+        # ---------- GUI apply ----------
+        def _apply(rows):
+            tbl = getattr(self, "smsInboxTable", None)
+            if not isinstance(tbl, QtWidgets.QTableWidget):
+                print("[inbox] smsInboxTable not bound; skipping paint.")
+                return
+
+            # disable sorting during fill for speed / stability
+            was_sorting = tbl.isSortingEnabled()
+            tbl.setSortingEnabled(False)
+
+            try:
+                tbl.setRowCount(len(rows))
+
+                # helpers
+                def mk_item(text: str, *, align=None):
+                    it = QtWidgets.QTableWidgetItem(text)
+                    it.setFlags(it.flags() & ~QtCore.Qt.ItemIsEditable)
+                    if align is not None:
+                        it.setTextAlignment(align)
+                    return it
+
+                for r, row in enumerate(rows):
+                    dev_name  = (row.get("device_name") or "").strip()
+                    sender    = (row.get("sender") or "").strip()
+                    body      = (row.get("body") or "")
+                    rt        = row.get("router_time")
+                    ra        = row.get("received_at")
+                    size      = row.get("size_bytes")
+
+                    # Normalize date strings to sortable ISO (YYYY-MM-DD HH:MM:SS)
+                    rt_txt = ""
+                    try:
+                        if rt:
+                            rt_txt = rt.strftime("%Y-%m-%d %H:%M:%S")
+                    except Exception:
+                        rt_txt = str(rt or "")
+
+                    ra_txt = ""
+                    try:
+                        if hasattr(ra, "strftime"):
+                            ra_txt = ra.strftime("%Y-%m-%d %H:%M:%S")
+                        else:
+                            ra_txt = str(ra or "")
+                    except Exception:
+                        ra_txt = str(ra or "")
+
+                    # Device
+                    tbl.setItem(r, 0, mk_item(dev_name, align=QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft))
+                    # From
+                    tbl.setItem(r, 1, mk_item(sender,   align=QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft))
+                    # Body
+                    tbl.setItem(r, 2, mk_item(body,     align=QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft))
+                    # Router Time
+                    tbl.setItem(r, 3, mk_item(rt_txt,   align=QtCore.Qt.AlignVCenter | QtCore.Qt.AlignHCenter))
+                    # Received At
+                    tbl.setItem(r, 4, mk_item(ra_txt,   align=QtCore.Qt.AlignVCenter | QtCore.Qt.AlignHCenter))
+                    # Size
+                    sz_txt = "" if (size is None or size == "") else str(size)
+                    tbl.setItem(r, 5, mk_item(sz_txt,   align=QtCore.Qt.AlignVCenter | QtCore.Qt.AlignRight))
+
+            finally:
+                # re-enable sorting and default to newest first by Router Time, then Received
+                tbl.setSortingEnabled(True)
+                # Column 3 is "Router Time" in ISO format, so string sort is chronologically correct
+                tbl.sortItems(3, QtCore.Qt.DescendingOrder)
+                # ensure no wrapping for performance/consistency
+                tbl.setWordWrap(False)
+                # set a sensible row height based on viewport font
+                fm = tbl.viewport().fontMetrics()
+                tbl.verticalHeader().setDefaultSectionSize(max(tbl.verticalHeader().defaultSectionSize(), fm.height() + 8))
+
+        # ---------- ensure a thread pool exists ----------
+        pool = getattr(self, "_sms_pool", None)
+        if pool is None:
+            from concurrent.futures import ThreadPoolExecutor
+            self._sms_pool = ThreadPoolExecutor(max_workers=4)
+            pool = self._sms_pool
+
+        # ---------- kick the background job ----------
+        future = pool.submit(_work)
+
+        def _done(_f=future):
+            try:
+                rows = _f.result()
+            except Exception as e:
+                print(f"[inbox] fetch failed: {e}")
+                rows = []
+            # marshal to GUI thread
+            QtCore.QTimer.singleShot(0, lambda: _apply(rows))
+
+        future.add_done_callback(lambda *_: _done())
+
+    def filter_inbox_table(self, _text: str):
+        """Live filter is handled in refresh_sms_inbox() to keep things simple."""
+        # Just re-run the query with current search
+        self.refresh_sms_inbox()
 
     def _get_column_index(self, header_text: str):
         """
@@ -3958,7 +4301,6 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             if hdr and hdr.text().strip().lower() == wanted:
                 return i
         return None
-
 
     def _ensure_on_gui(self, fn, *args, **kwargs):
         """
@@ -6072,6 +6414,14 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
                         send_email(sms, email_to)
                 except Exception as e:
                     print(f"❌ Email send failed: {e}")
+
+                try:
+                    affected = upsert_sms_batch(int(receiver_dev["id"]), [sms])
+                    if affected:
+                        print(f"[inbox] upserted {affected} row(s) for {receiver_dev['name']}")
+                    QtCore.QTimer.singleShot(0, self.refresh_sms_inbox)  # repaint UI
+                except Exception as e:
+                    print(f"⚠️ DB upsert failed for {receiver_lan_ip}: {e}")
 
                 # Extract From and normalize
                 try:
