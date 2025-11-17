@@ -1065,22 +1065,75 @@ def _score_iface(d: dict) -> tuple:
     link_up = ("up" in proto) or (status == "up")
     return (1 if has_ip else 0, 1 if link_up else 0, d.get("interface",""))
 
-def _is_eligible_cellular(d: dict) -> bool:
+def ensure_iccid_phone_schema():
+    """Create ICCID → phone mapping table if not exists."""
+    db = mysql.connector.connect(**get_db_config())
+    try:
+        cur = db.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS iccid_phone_map (
+                id           INT(11) NOT NULL AUTO_INCREMENT,
+                iccid        VARCHAR(32) NOT NULL,
+                phone_number VARCHAR(32) NOT NULL,
+                description  VARCHAR(255) NULL DEFAULT NULL,
+                created_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                             ON UPDATE CURRENT_TIMESTAMP,
+                PRIMARY KEY (id),
+                UNIQUE KEY ux_iccid        (iccid),
+                UNIQUE KEY ux_phone_number (phone_number)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+        db.commit()
+    finally:
+        db.close()
+
+
+def lookup_phone_by_iccid(iccid: str) -> str | None:
+    """Return phone_number for a given ICCID, or None if not found."""
+    iccid = (iccid or "").strip()
+    if not iccid:
+        return None
+
+    db = mysql.connector.connect(**get_db_config())
+    try:
+        cur = db.cursor()
+        cur.execute(
+            "SELECT phone_number FROM iccid_phone_map WHERE iccid = %s LIMIT 1",
+            (iccid,)
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+    finally:
+        db.close()
+
+
+def upsert_iccid_phone(iccid: str, phone_number: str, description: str | None = None):
     """
-    Only keep real/usable cellular rows:
-      1) interface name starts with 'Cellular'
-      2) has an IP (not 'unassigned' / empty)
-      3) link is up (Status == 'up' OR Protocol contains 'up')
+    Insert/update ICCID ↔ phone mapping.
+    If ICCID exists -> update phone_number/description.
+    If phone exists with different ICCID -> will raise because phone_number is unique,
+    so handle that in UI if you need.
     """
-    if not (d.get("interface","").lower().startswith("cellular")):
-        return False
-    ip = (d.get("ip") or "").strip().lower()
-    if not ip or ip == "unassigned":
-        return False
-    status = (d.get("status") or "").strip().lower()
-    proto  = (d.get("protocol") or "").strip().lower()
-    link_up = (status == "up") or ("up" in proto)
-    return link_up
+    iccid = (iccid or "").strip()
+    phone_number = (phone_number or "").strip()
+    if not iccid or not phone_number:
+        return
+
+    db = mysql.connector.connect(**get_db_config())
+    try:
+        cur = db.cursor()
+        cur.execute("""
+            INSERT INTO iccid_phone_map (iccid, phone_number, description)
+            VALUES (%s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                phone_number = VALUES(phone_number),
+                description  = VALUES(description),
+                updated_at   = CURRENT_TIMESTAMP
+        """, (iccid, phone_number, description))
+        db.commit()
+    finally:
+        db.close()
 
 def update_device_primary_cellular(device_id: int, best: dict, apn: str = ""):
     db = get_db_config()
@@ -4154,6 +4207,7 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
 
         # --- schema + inbox table setup (light)
         ensure_sms_inbox_schema()
+        ensure_iccid_phone_schema()
         try:
             self._debug_inbox_count()
         except Exception as e:
@@ -4339,6 +4393,15 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
 
         fut.add_done_callback(lambda *_: _done())
 
+    def _pick_iccid_and_phone(self) -> tuple[str | None, str | None]:
+        """
+        Opens ICCIDPickerDialog and returns (iccid, phone) or (None, None) if cancelled.
+        """
+        dlg = ICCIDPickerDialog(self)
+        if dlg.exec_() == QtWidgets.QDialog.Accepted:
+            return dlg.selected_iccid, dlg.selected_phone
+        return None, None
+    
     # --- SMS INBOX: table setup, fetch, paint, filter ---
     def _wire_sms_inbox_refresh(self):
         btn = (self.tabSms.findChild(QtWidgets.QPushButton, "inboxRefreshButton")
@@ -6934,18 +6997,275 @@ class SendSMSDialog(QtWidgets.QDialog):
     def __init__(self, device_name, router_ip, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Send SMS via {device_name}")
-        self.setFixedSize(300, 200)
+        self.setFixedSize(360, 220)
+
         layout = QVBoxLayout()
-        self.to_input = QtWidgets.QLineEdit(); self.to_input.setPlaceholderText("Recipient Number")
-        layout.addWidget(QtWidgets.QLabel("To:")); layout.addWidget(self.to_input)
-        self.message_input = QtWidgets.QPlainTextEdit(); self.message_input.setPlaceholderText("Enter your message")
-        layout.addWidget(QtWidgets.QLabel("Message:")); layout.addWidget(self.message_input)
-        send_btn = QPushButton("Send"); send_btn.clicked.connect(self.accept)
+
+        # --- "To" row: line edit + ICCID search button -----------------
+        layout.addWidget(QtWidgets.QLabel("To:"))
+
+        to_row = QtWidgets.QHBoxLayout()
+        self.to_input = QtWidgets.QLineEdit()
+        self.to_input.setPlaceholderText("Recipient Number")
+
+        self.iccid_btn = QPushButton("Search By ICCID")
+
+        to_row.addWidget(self.to_input)
+        to_row.addWidget(self.iccid_btn)
+        layout.addLayout(to_row)
+
+        # --- Message ---------------------------------------------------
+        layout.addWidget(QtWidgets.QLabel("Message:"))
+        self.message_input = QtWidgets.QPlainTextEdit()
+        self.message_input.setPlaceholderText("Enter your message")
+        layout.addWidget(self.message_input)
+
+        send_btn = QPushButton("Send")
+        send_btn.clicked.connect(self.accept)
         layout.addWidget(send_btn)
+
         self.setLayout(layout)
         self.router_ip = router_ip
+
+        # Wire ICCID button
+        self.iccid_btn.clicked.connect(self._on_search_iccid)
+
+    def _on_search_iccid(self):
+        dlg = ICCIDPickerDialog(self)
+        if dlg.exec_() == QtWidgets.QDialog.Accepted and dlg.selected_phone:
+            # Put selected phone number into "To" field
+            self.to_input.setText(dlg.selected_phone)
+
     def get_sms_data(self):
         return self.to_input.text(), self.message_input.toPlainText()
+    
+class ICCIDEditDialog(QtWidgets.QDialog):
+    """
+    Simple dialog to add a new ICCID mapping.
+    Returns (iccid, phone, description) via get_data().
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Add ICCID Mapping")
+        self.resize(400, 180)
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        form = QtWidgets.QFormLayout()
+        self.iccid_edit = QtWidgets.QLineEdit(self)
+        self.phone_edit = QtWidgets.QLineEdit(self)
+        self.desc_edit = QtWidgets.QLineEdit(self)
+
+        self.iccid_edit.setPlaceholderText("e.g. 8961024623...")
+        self.phone_edit.setPlaceholderText("e.g. 0412345678")
+        self.desc_edit.setPlaceholderText("Optional description (site, router, etc.)")
+
+        form.addRow("ICCID:", self.iccid_edit)
+        form.addRow("Phone:", self.phone_edit)
+        form.addRow("Description:", self.desc_edit)
+        layout.addLayout(form)
+
+        btn_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
+            parent=self
+        )
+        layout.addWidget(btn_box)
+
+        btn_box.accepted.connect(self._on_ok)
+        btn_box.rejected.connect(self.reject)
+
+    def _on_ok(self):
+        iccid = self.iccid_edit.text().strip()
+        phone = self.phone_edit.text().strip()
+
+        if not iccid or not phone:
+            QtWidgets.QMessageBox.warning(
+                self, "Missing data", "ICCID and phone number are required."
+            )
+            return
+
+        self.accept()
+
+    def get_data(self):
+        return (
+            self.iccid_edit.text().strip(),
+            self.phone_edit.text().strip(),
+            self.desc_edit.text().strip(),
+        )
+    
+class ICCIDPickerDialog(QtWidgets.QDialog):
+    """
+    Dialog to search ICCID → phone_number from iccid_phone_map
+    and pick one. After exec_():
+        self.selected_iccid
+        self.selected_phone
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select SIM by ICCID")
+        self.resize(600, 420)
+
+        self.selected_iccid = None
+        self.selected_phone = None
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        # --- Search box -------------------------------------------------
+        search_layout = QtWidgets.QHBoxLayout()
+        self.search_edit = QtWidgets.QLineEdit(self)
+        self.search_edit.setPlaceholderText("Search by ICCID / phone / description...")
+        search_layout.addWidget(QtWidgets.QLabel("Search:", self))
+        search_layout.addWidget(self.search_edit)
+        layout.addLayout(search_layout)
+
+        # --- Table ------------------------------------------------------
+        self.table = QtWidgets.QTableWidget(self)
+        self.table.setColumnCount(3)
+        self.table.setHorizontalHeaderLabels(["ICCID", "Phone", "Description"])
+        self.table.horizontalHeader().setSectionResizeMode(
+            0, QtWidgets.QHeaderView.ResizeToContents
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            1, QtWidgets.QHeaderView.ResizeToContents
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            2, QtWidgets.QHeaderView.Stretch
+        )
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        layout.addWidget(self.table)
+
+        # --- Bottom buttons row: Add + OK / Cancel ----------------------
+        bottom_layout = QtWidgets.QHBoxLayout()
+
+        self.add_btn = QtWidgets.QPushButton("Add…", self)
+        bottom_layout.addWidget(self.add_btn)
+        bottom_layout.addStretch(1)
+
+        btn_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
+            parent=self
+        )
+        bottom_layout.addWidget(btn_box)
+
+        layout.addLayout(bottom_layout)
+
+        # Signals
+        self.search_edit.textChanged.connect(self._reload_rows)
+        self.table.itemDoubleClicked.connect(self._accept_current_row)
+        btn_box.accepted.connect(self._on_ok)
+        btn_box.rejected.connect(self.reject)
+        self.add_btn.clicked.connect(self._on_add_clicked)
+
+        # initial data
+        self._reload_rows()
+
+    # ------------ DB helpers -----------------
+    def _fetch_iccid_rows(self, term: str | None):
+        """
+        Returns list of (iccid, phone_number, description)
+        from iccid_phone_map.
+        """
+        term = (term or "").strip()
+        db = mysql.connector.connect(**get_db_config())
+        try:
+            cur = db.cursor()
+            if term:
+                like = f"%{term}%"
+                cur.execute(
+                    """
+                    SELECT iccid, phone_number, COALESCE(description, '')
+                    FROM iccid_phone_map
+                    WHERE iccid        LIKE %s
+                       OR phone_number LIKE %s
+                       OR description  LIKE %s
+                    ORDER BY iccid
+                    """,
+                    (like, like, like),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT iccid, phone_number, COALESCE(description, '')
+                    FROM iccid_phone_map
+                    ORDER BY iccid
+                    """
+                )
+            return list(cur.fetchall())
+        finally:
+            db.close()
+
+    def _reload_rows(self):
+        rows = self._fetch_iccid_rows(self.search_edit.text())
+        self.table.setRowCount(len(rows))
+        for r, (iccid, phone, desc) in enumerate(rows):
+            self.table.setItem(r, 0, QtWidgets.QTableWidgetItem(iccid or ""))
+            self.table.setItem(r, 1, QtWidgets.QTableWidgetItem(phone or ""))
+            self.table.setItem(r, 2, QtWidgets.QTableWidgetItem(desc or ""))
+
+    # ------------ selection helpers ---------------
+    def _set_from_row(self, row: int):
+        if row < 0:
+            return
+        iccid_item = self.table.item(row, 0)
+        phone_item = self.table.item(row, 1)
+        if not iccid_item or not phone_item:
+            return
+        self.selected_iccid = iccid_item.text().strip()
+        self.selected_phone = phone_item.text().strip()
+
+    def _accept_current_row(self, *_):
+        row = self.table.currentRow()
+        self._set_from_row(row)
+        if self.selected_phone:
+            self.accept()
+
+    def _on_ok(self):
+        row = self.table.currentRow()
+        self._set_from_row(row)
+        if not self.selected_phone:
+            QtWidgets.QMessageBox.warning(
+                self, "No selection", "Please select a SIM row to use."
+            )
+            return
+        self.accept()
+
+    # ------------ Add new ICCID -------------------
+    def _on_add_clicked(self):
+        dlg = ICCIDEditDialog(self)
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            return
+
+        iccid, phone, desc = dlg.get_data()
+
+        # Insert into DB
+        db = mysql.connector.connect(**get_db_config())
+        try:
+            cur = db.cursor()
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO iccid_phone_map (iccid, phone_number, description)
+                    VALUES (%s, %s, %s)
+                    """,
+                    (iccid, phone, desc or None),
+                )
+                db.commit()
+            except mysql.connector.Error as e:
+                db.rollback()
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "Insert failed",
+                    f"Could not save ICCID mapping:\n{e}",
+                )
+                return
+        finally:
+            db.close()
+
+        # refresh table and move search to new ICCID
+        self.search_edit.setText(iccid)
+        self._reload_rows()
 
 # ---------- get email by router ip ----------
 def get_email_by_router_ip(router_ip):

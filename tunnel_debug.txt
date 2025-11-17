@@ -1,51 +1,47 @@
-[2025-11-14T15:03:39] Refresh for ABB01 (192.168.18.43)
+[2025-11-17T17:16:32] Refresh for ABB01 (192.168.18.43)
 Used NHRP cmd:  show ip nhrp
 Used DMVPN cmd: show dmvpn
 Used EIGRP cmd: show ip eigrp neighbors
 
 === SHOW IP NHRP ===
 172.16.1.200/32 via 172.16.1.200
-   Tunnel1 created 15:01:21, expire 00:05:50
+   Tunnel1 created 3d17h, expire 00:05:32
    Type: dynamic, Flags: registered nhop 
    NBMA address: 192.168.255.200 
 172.16.1.201/32 via 172.16.1.201
-   Tunnel1 created 12:49:50, expire 00:07:18
+   Tunnel1 created 3d15h, expire 00:07:00
    Type: dynamic, Flags: registered nhop 
    NBMA address: 192.168.255.201 
-172.16.1.202/32 via 172.16.1.202
-   Tunnel1 created 2d05h, expire 00:06:56
-   Type: dynamic, Flags: registered nhop 
-   NBMA address: 10.46.182.214 
 172.16.1.203/32 via 172.16.1.203
-   Tunnel1 created 2d05h, expire 00:06:58
+   Tunnel1 created 23:32:07, expire 00:06:38
    Type: dynamic, Flags: registered nhop 
    NBMA address: 192.168.255.203 
 172.16.1.204/32 via 172.16.1.204
-   Tunnel1 created 12:48:29, expire 00:06:19
+   Tunnel1 created 2d16h, expire 00:06:01
    Type: dynamic, Flags: registered nhop 
    NBMA address: 192.168.255.204 
 172.16.1.205/32 via 172.16.1.205
-   Tunnel1 created 14:43:22, expire 00:05:14
+   Tunnel1 created 15:01:30, expire 00:07:21
    Type: dynamic, Flags: registered nhop 
    NBMA address: 10.199.75.198 
 172.16.1.206/32 via 172.16.1.206
-   Tunnel1 created 19:32:40, expire 00:06:46
+   Tunnel1 created 3d21h, expire 00:06:30
    Type: dynamic, Flags: registered nhop 
    NBMA address: 192.168.255.206 
 172.16.1.208/32 via 172.16.1.208
-   Tunnel1 created 18:52:40, expire 00:07:02
+   Tunnel1 created 2d00h, expire 00:06:42
    Type: dynamic, Flags: unique registered nhop 
    NBMA address: 192.168.1.191 
 172.16.1.209/32 via 172.16.1.209
-   Tunnel1 created 03:55:25, expire 00:05:17
+   Tunnel1 created 3d06h, expire 00:07:25
    Type: dynamic, Flags: registered nhop 
    NBMA address: 192.168.255.209 
 172.16.1.210/32 via 172.16.1.210
-   Tunnel1 created 2d05h, expire 00:07:24
+   Tunnel1 created 5d07h, expire 00:07:03
    Type: dynamic, Flags: unique registered nhop 
    NBMA address: 10.106.99.77 
 172.16.1.230/32 via 172.16.1.230
-   Tunnel1 created 2d05h, expire 00:06:19
+   Tunnel1 created 5d07h, expire 00:06:07
    Type: dynamic, Flags: unique registered used nhop 
    NBMA address: 192.168.1.252
 
@@ -59,34 +55,32 @@ Legend: Attrb --> S - Static, D - Dynamic, I - Incomplete
 	UpDn Time --> Up or Down Time for a Tunnel
 ==========================================================================
 Interface: Tunnel1, IPv4 NHRP Details 
-Type:Hub, NHRP Peers:11, 
+Type:Hub, NHRP Peers:10, 
  # Ent  Peer NBMA Addr Peer Tunnel Add State  UpDn Tm Attrb
  ----- --------------- --------------- ----- -------- -----
-     1 192.168.255.200    172.16.1.200    UP 15:01:21     D
-     1 192.168.255.201    172.16.1.201    UP 12:49:40     D
-     1 10.46.182.214      172.16.1.202    UP    2d05h     D
-     1 192.168.255.203    172.16.1.203    UP    2d05h     D
-     1 192.168.255.204    172.16.1.204    UP 12:48:29     D
-     1 10.199.75.198      172.16.1.205    UP 14:42:15     D
-     1 192.168.255.206    172.16.1.206    UP 19:31:59     D
-     1 192.168.1.191      172.16.1.208    UP 18:52:40     D
-     1 192.168.255.209    172.16.1.209    UP 03:55:25     D
-     1 10.106.99.77       172.16.1.210    UP    2d05h     D
-     1 192.168.1.252      172.16.1.230    UP    2d05h     D
+     1 192.168.255.200    172.16.1.200    UP    3d17h     D
+     1 192.168.255.201    172.16.1.201    UP    3d15h     D
+     1 192.168.255.203    172.16.1.203    UP 23:31:30     D
+     1 192.168.255.204    172.16.1.204    UP    2d16h     D
+     1 10.199.75.198      172.16.1.205    UP 15:01:30     D
+     1 192.168.255.206    172.16.1.206    UP    3d21h     D
+     1 192.168.1.191      172.16.1.208    UP    2d00h     D
+     1 192.168.255.209    172.16.1.209    UP    3d06h     D
+     1 10.106.99.77       172.16.1.210    UP    5d07h     D
+     1 192.168.1.252      172.16.1.230    UP    5d07h     D
 
 === SHOW IP EIGRP NEIGHBORS ===
 EIGRP-IPv4 Neighbors for AS(10)
 H   Address                 Interface              Hold Uptime   SRTT   RTO  Q  Seq
                                                    (sec)         (ms)       Cnt Num
-10  172.16.1.209            Tu1                      11 03:55:25   33  1590  0  9
-4   172.16.1.201            Tu1                      11 12:49:37   34  1590  0  430
-5   172.16.1.205            Tu1                      12 14:43:10   40  1590  0  205
-8   172.16.1.200            Tu1                      14 15:01:20   31  1590  0  415
-2   172.16.1.208            Tu1                      12 18:52:37   46  1590  0  75
-0   172.16.1.206            Tu1                      12 19:31:58   80  1590  0  376
-9   172.16.1.230            Tu1                      12 2d05h      83  1590  0  1162
-7   172.16.1.210            Tu1                      28 2d05h      42  1590  0  415
-6   172.16.1.202            Tu1                      14 2d05h      29  1590  0  431
-3   172.16.1.204            Tu1                      13 2d05h      48  1590  0  501
-1   172.16.1.203            Tu1                      13 2d05h      67  1590  0  307
+2   172.16.1.208            Tu1                      10 23:21:23   66  1362  0  147
+1   172.16.1.203            Tu1                      13 23:31:28   46  1362  0  353
+3   172.16.1.204            Tu1                      12 2d16h      31  1362  0  567
+10  172.16.1.209            Tu1                      11 3d06h      52  1362  0  75
+4   172.16.1.201            Tu1                      13 3d15h      34  1362  0  496
+5   172.16.1.205            Tu1                      12 3d16h      30  1362  0  271
+8   172.16.1.200            Tu1                      14 3d17h      29  1362  0  481
+0   172.16.1.206            Tu1                      14 3d21h     119  1362  0  442
+9   172.16.1.230            Tu1                      12 5d07h      85  1362  0  1228
+7   172.16.1.210            Tu1                      28 5d07h      91  1362  0  481
 
