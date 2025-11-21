@@ -27,6 +27,12 @@ import mysql.connector
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from paramiko.ssh_exception import SSHException
+from iccid_dialogs import ICCIDPickerDialog
+from send_sms_dialog import SendSMSDialog
+from sim_delegate import SimDelegate, DEVICE_ID_ROLE, SIM_TEXT_ROLE
+from apn_delegate import ApnDelegate, APN_TEXT_ROLE
+from device_delegate import DeviceDelegate, DEVICE_HUB_ROLE
+from pill_utils import paint_pill
 
 from collections import deque
 _RECENT_SENDERS = deque(maxlen=200)
@@ -44,6 +50,10 @@ def resource_path(relative_path):
     if hasattr(sys, '_MEIPASS'):
         return os.path.join(sys._MEIPASS, relative_path)
     return os.path.join(os.path.abspath("."), relative_path)
+
+def _now() -> float:
+    """Return current time in seconds since epoch."""
+    return time.time()
 
 def _strip_term_len_noise(s: str) -> str:
     if not s: return s
@@ -74,6 +84,36 @@ def _capture_prompt(chan, timeout: float = 3.0) -> bytes:
             time.sleep(0.03)
     # fallback: generic
     return b'#'
+
+def format_g00_cell(ifaces: list[dict]) -> str:
+    """
+    Given a parsed 'show ip int brief' list of dicts with keys:
+      name, ip, status, protocol, method (if you have it)
+    return a single line string for GigabitEthernet0/0.
+    """
+    g = None
+    for row in ifaces:
+        if row.get("name") in ("GigabitEthernet0/0", "Gi0/0", "Gig0/0"):
+            g = row
+            break
+
+    if not g:
+        return "—"  # no such interface found
+
+    ip = (g.get("ip") or "unassigned").strip()
+    status = (g.get("status") or "").strip().lower()
+    proto = (g.get("protocol") or "").strip().lower()
+    method = (g.get("method") or "").strip().upper()  # DHCP / manual etc, if available
+
+    # basic state
+    state = "up" if status == "up" and proto == "up" else "down"
+
+    parts = [ip, f"({state}"]
+    if method:
+        parts.append(f", {method}")
+    parts[-1] += ")"  # close the last part's bracket
+
+    return " ".join(parts)
 
 # --- Unified pill painter (matches APN visual) ---
 def paint_pill(painter: QtGui.QPainter, rect: QtCore.QRect, text: str, base_font: QtGui.QFont):
@@ -1056,6 +1096,66 @@ def get_ssh_credentials():
     except Exception as e:
         print(f"⚠️ Failed to load SSH credentials: {e}")
         return None, None
+    
+# --- ICCID phone map DB helpers (for ICCIDPickerDialog) -----------------
+
+def iccid_fetch_rows(term: str | None):
+    """
+    Returns list of (iccid, phone_number, description) from iccid_phone_map.
+    """
+    term = (term or "").strip()
+    db = mysql.connector.connect(**get_db_config())
+    try:
+        cur = db.cursor()
+        if term:
+            like = f"%{term}%"
+            cur.execute(
+                """
+                SELECT iccid, phone_number, COALESCE(description, '')
+                FROM iccid_phone_map
+                WHERE iccid        LIKE %s
+                   OR phone_number LIKE %s
+                   OR description  LIKE %s
+                ORDER BY iccid
+                """,
+                (like, like, like),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT iccid, phone_number, COALESCE(description, '')
+                FROM iccid_phone_map
+                ORDER BY iccid
+                """
+            )
+        return list(cur.fetchall())
+    finally:
+        db.close()
+
+
+def iccid_insert_row(iccid: str, phone: str, desc: str | None):
+    """
+    Inserts a new row into iccid_phone_map.
+    Returns (ok: bool, err_msg: str | None)
+    """
+    db = mysql.connector.connect(**get_db_config())
+    try:
+        cur = db.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO iccid_phone_map (iccid, phone_number, description)
+                VALUES (%s, %s, %s)
+                """,
+                (iccid, phone, desc),
+            )
+            db.commit()
+            return True, None
+        except mysql.connector.Error as e:
+            db.rollback()
+            return False, str(e)
+    finally:
+        db.close()
 
 def _score_iface(d: dict) -> tuple:
     ip = (d.get("ip") or "").strip().lower()
@@ -1396,6 +1496,66 @@ Message:
     except Exception as e:
         print(f"❌ Failed to send email: {e}")
 
+def _detect_g0_0_summary(ip: str, username: str, password: str, timeout: int = 8) -> str:
+    """
+    Returns a human-readable status for GigabitEthernet0/0 on the router, e.g.:
+        '10.106.99.77 (up/up, dhcp)'
+        'unassigned (administratively down/down, manual)'
+    Returns '' on error or if G0/0 is not found.
+    """
+    cli = paramiko.SSHClient()
+    cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        cli.connect(
+            ip,
+            username=username,
+            password=password,
+            look_for_keys=False,
+            allow_agent=False,
+            timeout=timeout,
+            banner_timeout=timeout,
+            auth_timeout=timeout,
+        )
+        cmd = "show ip interface brief | include GigabitEthernet0/0"
+        _, stdout, _ = cli.exec_command(cmd)
+        out = stdout.read().decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+    finally:
+        try:
+            cli.close()
+        except Exception:
+            pass
+
+    for line in out.splitlines():
+        cols = re.split(r"\s+", line.strip())
+        if not cols:
+            continue
+
+        name = cols[0]
+        if not name.lower().startswith("gigabitethernet0/0"):
+            continue
+
+        ipaddr   = cols[1] if len(cols) > 1 else ""
+        method   = cols[3] if len(cols) > 3 else ""
+        status   = cols[4] if len(cols) > 4 else ""
+        protocol = cols[5] if len(cols) > 5 else ""
+
+        if not ipaddr:
+            ipaddr = "unassigned"
+
+        method_str = method.lower()
+        if "dhcp" in method_str:
+            method_label = "dhcp"
+        elif method_str:
+            method_label = method_str
+        else:
+            method_label = "manual"
+
+        return f"{ipaddr} ({status}/{protocol}, {method_label})"
+
+    return ""
+
 # put near other Qt classes
 class DetectAllRunner(QtCore.QObject):
     step_started = pyqtSignal(str)
@@ -1425,13 +1585,35 @@ class DetectAllRunner(QtCore.QObject):
             self.step_started.emit("Gateway")
             ok, payload = False, None
             try:
+                 # 1a) Default gateway
                 gw_ip, gw_if = detect_default_gateway(ip, username, password, vrf=None)
                 gw = f"{gw_ip} ({gw_if})" if gw_ip and gw_if else (gw_ip or "")
-                if gw:
-                    ok, payload = True, gw
-                    update_device_in_db({**self.dev, "gateway": gw, "cellular_details": []})
+                
+                # 1b) G0/0 summary
+                g0_summary = _detect_g0_0_summary(ip, username, password, timeout=8)
+
+                # 1c) Persist into devices table
+                if gw or g0_summary:
+                    new_dev = dict(self.dev)  # shallow copy
+                    if gw:
+                        new_dev["gateway"] = gw
+                    if g0_summary:
+                        # NOTE: adjust key name if your column is called something else
+                        new_dev["g0_0"] = g0_summary
+                    # we don't want to overwrite cellular_details from here
+                    new_dev["cellular_details"] = []
+                    update_device_in_db(new_dev)
+                    ok = True
+
+                # 1d) Payload for progress dialog
+                if gw and g0_summary:
+                    payload = f"GW: {gw} | G0/0: {g0_summary}"
+                elif gw:
+                    payload = f"GW: {gw}"
+                elif g0_summary:
+                    payload = f"G0/0: {g0_summary}"
                 else:
-                    payload = "Gateway of last resort not set"
+                    payload = "Gateway of last resort not set; G0/0 not found"
             except Exception as e:
                 payload = f"{type(e).__name__}: {e}"
             self.step_done.emit("Gateway", ok, payload)
@@ -1732,7 +1914,7 @@ def load_devices_from_db():
     conn = mysql.connector.connect(**db_config)
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT d.name, d.ip, d.gateway, d.apn, d.email, d.id, IFNULL(d.is_hub,0),
+        SELECT d.name, d.ip, d.gateway, d.g0_0, d.apn, d.email, d.id, IFNULL(d.is_hub,0),
                IFNULL(d.hostname,''), IFNULL(d.ios_version,''), IFNULL(d.modem_firmware,'')
         FROM devices d
     """)
@@ -1741,7 +1923,7 @@ def load_devices_from_db():
 
     devices = []
     for row in rows:
-        name, ip, gateway, apn, email, dev_id, is_hub, hostname, ios, fw = row
+        name, ip, gateway, g0_0, apn, email, dev_id, is_hub, hostname, ios, fw = row
 
         online = is_device_online(ip)
 
@@ -1786,6 +1968,7 @@ def load_devices_from_db():
             "name": name,
             "ip": ip,
             "gateway": gateway,
+            "g0_0": g0_0,
             "sim": sim_for_ui,
             "apn": apn,
             "iccid": iccid_for_ui,  # ← NEW (use this to display after APN)
@@ -1849,6 +2032,7 @@ def update_device_in_db(device: dict):
                    email=%s,
                    name=%s,
                    gateway=%s,
+                   g0_0=%s,
                    hostname=%s,
                    ios_version=%s,
                    modem_firmware=%s
@@ -1859,6 +2043,7 @@ def update_device_in_db(device: dict):
                 device.get("email") or None,
                 device.get("name") or None,
                 device.get("gateway") or None,
+                device.get("g0_0") or None,
                 device.get("hostname") or None,
                 device.get("ios_version") or None,
                 device.get("modem_firmware") or None,
@@ -2024,9 +2209,9 @@ def insert_device_to_db(device):
         pass
 
     cur.execute("""
-        INSERT INTO devices (name, ip, gateway, apn, email, is_hub, hostname, ios_version, modem_firmware)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-    """, (device["name"], device["ip"], device["gateway"], device["apn"],
+        INSERT INTO devices (name, ip, gateway, g0_0, apn, email, is_hub, hostname, ios_version, modem_firmware)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    """, (device["name"], device["ip"], device["gateway"], device.get("g0_0"), device["apn"],
           device["email"], is_hub,
           device.get("hostname") or None, device.get("ios_version") or None, device.get("modem_firmware") or None))
     conn.commit()
@@ -2382,6 +2567,61 @@ def detect_default_gateway(ip: str, username: str, password: str, *, vrf: str | 
             ssh.close()
         except Exception:
             pass
+
+def list_ip_interfaces(ip: str, timeout: int = 8):
+    """
+    Generic 'show ip interface brief' parser.
+    Returns list of dicts:
+      { 'name', 'ip', 'ok', 'method', 'status', 'protocol' }
+    for all interfaces.
+    """
+    if not is_device_online(ip):
+        return []
+
+    username, password = get_ssh_credentials()
+    if not username or not password:
+        return []
+
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        ssh.connect(ip, username=username, password=password,
+                    look_for_keys=False, allow_agent=False,
+                    timeout=timeout, banner_timeout=timeout,
+                    auth_timeout=timeout)
+        _, stdout, _ = ssh.exec_command("show ip interface brief")
+        out = stdout.read().decode(errors="ignore")
+    except Exception:
+        return []
+    finally:
+        try:
+            ssh.close()
+        except:
+            pass
+
+    results = []
+    for raw in out.splitlines():
+        raw = raw.rstrip()
+        if not raw or raw.lower().startswith("interface "):
+            # Skip header / blank lines
+            continue
+
+        cols = re.split(r"\s+", raw.strip())
+        if len(cols) < 6:
+            continue
+
+        name, ipaddr, ok, method, status, protocol = cols[:6]
+        results.append({
+            "name": name,
+            "ip": ipaddr,
+            "ok": ok,
+            "method": method,
+            "status": status,
+            "protocol": protocol,
+        })
+
+    print("[DBG] show ip int brief parsed (all):", results)
+    return results
 
 def list_cellular_interfaces(ip: str, timeout: int = 8):
     if not is_device_online(ip):
@@ -3354,6 +3594,7 @@ class DetectSignals(QObject):
     cellularDetected = pyqtSignal(list)
     prefillDetected = pyqtSignal(list)
     allDetected = pyqtSignal(object, list, object, object)  # gw, details, apn, err
+    g0Detected       = QtCore.pyqtSignal(str)
 
 class DeviceSettingsDialog(QtWidgets.QDialog):
     def __init__(self, device=None, parent=None):
@@ -3373,6 +3614,7 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
         self.detectSignals.cellularDetected.connect(self.on_cellular_detected)
         self.detectSignals.prefillDetected.connect(self._apply_cellular_ids_silent)
         self.detectSignals.allDetected.connect(self._on_all_detected)
+        self.detectSignals.g0Detected.connect(self.on_g0_detected)
 
         self._prefill_started = False
 
@@ -3390,113 +3632,174 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
 
         self.gatewaySpinner = LoadingSpinner(self)
 
+        # --- main vertical layout from .ui ------------------------------
         layout: QtWidgets.QVBoxLayout = self.layout()
-        
-        # --- Interface row (dropdown + status dot)
-        self.ifaceCombo = QtWidgets.QComboBox()
-        self.ifaceStatus = QtWidgets.QLabel("●")
+
+        # helper: detach a widget from the current VBox layout
+        def _detach_widget(layout: QtWidgets.QVBoxLayout, w: QtWidgets.QWidget):
+            for i in range(layout.count()):
+                item = layout.itemAt(i)
+                if item and item.widget() is w:
+                    layout.takeAt(i)
+                    return
+
+        # We remove the plain gateway/apn widgets; we'll re-insert them in HBox rows
+        _detach_widget(layout, self.gatewayLineEdit)
+        _detach_widget(layout, self.apnLineEdit)
+
+        # find where the IP line edit is, so we can insert rows after it
+        ip_index = 0
+        for i in range(layout.count()):
+            item = layout.itemAt(i)
+            if item and item.widget() is self.ipLineEdit:
+                ip_index = i
+                break
+
+        # --- Gateway row: [gatewayLineEdit][Detect][spinner] ------------
+        self.detectGatewayButton = QPushButton("Detect", self)
+        self.gatewaySpinner = LoadingSpinner(self)
+        self.gatewaySpinner.hide()
+
+        gw_row = QHBoxLayout()
+        gw_row.addWidget(self.gatewayLineEdit, 1)
+        gw_row.addWidget(self.detectGatewayButton)
+        gw_row.addWidget(self.gatewaySpinner)
+
+        # --- NEW G0/0 row (read-only) -----------------------------------
+        self.g00LineEdit = QtWidgets.QLineEdit(self)
+        self.g00LineEdit.setObjectName("g00LineEdit")
+        self.g00LineEdit.setPlaceholderText("G0/0 (WAN IP / status)")
+        self.g00LineEdit.setReadOnly(True)
+
+        # --- APN row: [apnLineEdit][Detect] -----------------------------
+        self.detectApnButton = QPushButton("Detect", self)
+        apn_row = QHBoxLayout()
+        apn_row.addWidget(self.apnLineEdit, 1)
+        apn_row.addWidget(self.detectApnButton)
+
+        # --- Interface row (combo + status dot) -------------------------
+        self.ifaceCombo = QtWidgets.QComboBox(self)
+        self.ifaceCombo.setObjectName("ifaceCombo")
+
+        self.ifaceStatus = QtWidgets.QLabel("●", self)
+        self.ifaceStatus.setObjectName("ifaceStatus")
         self.ifaceStatus.setStyleSheet("QLabel { color:#9ca3af; font-size:14px; }")
+
         iface_row_layout = QHBoxLayout()
-        iface_row_layout.addWidget(QtWidgets.QLabel("Interface"))
+        iface_row_layout.addWidget(QtWidgets.QLabel("Interface", self))
         iface_row_layout.addWidget(self.ifaceCombo, 1)
         iface_row_layout.addWidget(self.ifaceStatus)
 
-        # Gateway row
-        self.detectGatewayButton = QPushButton("Detect")
-        getway_row_layout = QHBoxLayout()
-        getway_row_layout.addWidget(self.gatewayLineEdit)
-        getway_row_layout.addWidget(self.detectGatewayButton)
-        getway_row_layout.addWidget(self.gatewaySpinner)
-
-        # APN row
-        self.detectApnButton = QPushButton("Detect")
-        apn_row_layout = QHBoxLayout()
-        apn_row_layout.addWidget(self.apnLineEdit)
-        apn_row_layout.addWidget(self.detectApnButton)
-
-        # Detect Cellular row
-        self.detectCellButton = QPushButton("Detect Cellular…")
+        # --- Detect Cellular row ----------------------------------------
+        self.detectCellButton = QPushButton("Detect Cellular…", self)
         cell_row_layout = QHBoxLayout()
         cell_row_layout.addStretch(1)
         cell_row_layout.addWidget(self.detectCellButton)
 
-        # --- Interface row (dropdown + status dot)
-        self.ifaceCombo = QtWidgets.QComboBox()
-        self.ifaceCombo.setObjectName("ifaceCombo")
-        self.ifaceStatus = QtWidgets.QLabel("●")
-        self.ifaceStatus.setObjectName("ifaceStatus")
-        self.ifaceStatus.setStyleSheet("QLabel { color:#9ca3af; font-size:14px; }")  # gray by default
-        iface_row_layout = QHBoxLayout()
-        iface_row_layout.addWidget(QtWidgets.QLabel("Interface"))
-        iface_row_layout.addWidget(self.ifaceCombo, 1)
-        iface_row_layout.addWidget(self.ifaceStatus)
+        # insert all these rows directly *after* the IP line
+        insert_at = ip_index + 1
+        layout.insertLayout(insert_at + 0, gw_row)           # Gateway row
+        layout.insertWidget(insert_at + 1, self.g00LineEdit)  # G0/0 row
+        layout.insertLayout(insert_at + 2, apn_row)           # APN row
+        layout.insertLayout(insert_at + 3, iface_row_layout)  # Interface row
+        layout.insertLayout(insert_at + 4, cell_row_layout)   # Detect Cellular row
 
-        # attach to main layout
-        layout: QtWidgets.QVBoxLayout = self.layout()
-        layout.insertLayout(2, getway_row_layout)
-        layout.insertLayout(3, apn_row_layout)
-        layout.insertLayout(4, cell_row_layout)
-        layout.insertLayout(5, iface_row_layout)   # now safe
-
+        # --- Ensure IMSI/IMEI/ICCID/Hostname/IOS/Firmware fields exist --
         self._ensure_id_fields(layout)
 
-        # clicks
+        # --- Move Save/Cancel to the very bottom ------------------------
+        # Detach from any previous layout and add a fresh row at the end
+        self.saveButton.setParent(self)
+        self.cancelButton.setParent(self)
+
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(self.saveButton)
+        btn_row.addWidget(self.cancelButton)
+        layout.addLayout(btn_row)
+
+        # signals for the detect buttons
         self.detectApnButton.clicked.connect(self.handle_detect_apn)
         self.detectGatewayButton.clicked.connect(self.handle_detect_gateway)
         self.detectCellButton.clicked.connect(self.handle_detect_cellular)
-
-        self.device = device or {}
-        self.device_id = self.device.get("id")
-        if device and device.get("id"):
-            saved = get_device_cellular(device["id"])
-            # map to the structure used by the combo
-            details = []
-            for r in saved:
-                details.append({
-                    "interface": r["interface"],
-                    "ip_addr": (r.get("ip_addr") or "").strip(),
-                    "ip": (r.get("ip_addr") or "").strip(),     # backward-compatible
-                    "status": (r.get("status") or "").strip(),
-                    "protocol": (r.get("protocol") or "").strip(),
-                    "imsi": (r.get("imsi") or "").strip(),
-                    "imei": (r.get("imei") or "").strip(),
-                    "iccid": (r.get("iccid") or "").strip(),
-                    "apn": (r.get("apn") or "").strip(),
-                    "sim": (r.get("sim") or "").strip(),
-                })
-            if details:
-                self._set_interface_list(details, select_best=True)
-
-        if device:
-            self.nameLineEdit.setText(device["name"])
-            self.ipLineEdit.setText(device["ip"])
-            self.gatewayLineEdit.setText(device["gateway"])
-            self.hostnameLineEdit.setText(device.get("hostname",""))
-            self.iosLineEdit.setText(device.get("ios_version",""))
-            self.fwLineEdit.setText(device.get("modem_firmware",""))
-            self.simLineEdit.setText(device["sim"])
-            self.apnLineEdit.setText(device["apn"])
-            self.emailLineEdit.setText(device["email"])
-            # button enablement correct
-            has_cell = bool(device.get("has_cellular", True))
-            self.detectApnButton.setEnabled(has_cell)
-            if not has_cell:
-                self.detectApnButton.setToolTip("No cellular interface on this router")
-            self._user_edited_sim = False
-            self.simLineEdit.textEdited.connect(lambda _t: setattr(self, "_user_edited_sim", True))
-            # keep a stable copy of what the dialog started with
-            self._sim_locked = (self.simLineEdit.text() or (device.get("sim") if isinstance(device, dict) else "") or "").strip()
 
         self.saveButton.clicked.connect(self.accept)
         self.cancelButton.clicked.connect(self.reject)
 
         self.ifaceCombo.currentIndexChanged.connect(self._on_iface_changed)
-        self._cell_details = []   # holds the list we put in the combo
+        self._cell_details = []
         self.selected_interface = ""
 
         self._busy_widgets = []
         self._collect_busy_widgets()
         self.resizeEvent = self._resize_event_forward
+
+        # --------------------------------------------------------------
+        #  Populate fields when editing an existing device
+        # --------------------------------------------------------------
+        self.device = device or {}
+        self.device_id = self.device.get("id")
+
+        if device:
+            # basic fields
+            self.nameLineEdit.setText(device.get("name", ""))
+            self.ipLineEdit.setText(device.get("ip", ""))
+            self.gatewayLineEdit.setText(device.get("gateway", ""))
+            self.apnLineEdit.setText(device.get("apn", ""))
+            self.simLineEdit.setText(device.get("sim", ""))
+            self.emailLineEdit.setText(device.get("email", ""))
+
+            # optional extra fields
+            self.hostnameLineEdit.setText(device.get("hostname", ""))
+            self.iosLineEdit.setText(device.get("ios_version", ""))
+            self.fwLineEdit.setText(device.get("modem_firmware", ""))
+
+            # G0/0 read-only summary (if you have these keys)
+            g00_ip    = (device.get("g00_ip") or device.get("g00") or "").strip()
+            g00_stat  = (device.get("g00_status") or "").strip()
+            g00_proto = (device.get("g00_protocol") or "").strip()
+            g00_mode  = (device.get("g00_mode") or "").strip()
+
+            parts = []
+            if g00_ip:
+                parts.append(g00_ip)
+            if g00_stat or g00_proto:
+                parts.append(f"{g00_stat}/{g00_proto}".strip("/"))
+            if g00_mode:
+                parts.append(g00_mode)
+            self.g00LineEdit.setText("  ".join(parts) if parts else "")
+
+            # load any saved cellular interfaces into the Interface combo
+            if device.get("id"):
+                saved = get_device_cellular(device["id"])
+                details = []
+                for r in saved:
+                    details.append({
+                        "interface": r["interface"],
+                        "ip_addr": (r.get("ip_addr") or "").strip(),
+                        "ip": (r.get("ip_addr") or "").strip(),
+                        "status": (r.get("status") or "").strip(),
+                        "protocol": (r.get("protocol") or "").strip(),
+                        "imsi": (r.get("imsi") or "").strip(),
+                        "imei": (r.get("imei") or "").strip(),
+                        "iccid": (r.get("iccid") or "").strip(),
+                        "apn": (r.get("apn") or "").strip(),
+                        "sim": (r.get("sim") or "").strip(),
+                    })
+                if details:
+                    self._set_interface_list(details, select_best=True)
+
+            # enable / disable APN detect based on has_cellular flag
+            has_cell = bool(device.get("has_cellular", True))
+            self.detectApnButton.setEnabled(has_cell)
+            if not has_cell:
+                self.detectApnButton.setToolTip("No cellular interface on this router")
+
+            # track manual SIM edits
+            self._user_edited_sim = False
+            self.simLineEdit.textEdited.connect(
+                lambda _t: setattr(self, "_user_edited_sim", True)
+            )
+            self._sim_locked = (self.simLineEdit.text() or device.get("sim", "")).strip()
 
     def _collect_busy_widgets(self):
         """Widgets to freeze during background detect work."""
@@ -3517,6 +3820,16 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
         ]
         # filter Nones
         self._busy_widgets = [x for x in w if x is not None]
+
+    def on_g0_detected(self, text: str):
+        """
+        Slot for DetectSignals.g0Detected.
+        Fills the G0/0 line edit when detection succeeds.
+        """
+        # adjust the attribute name to match your .ui (g0LineEdit / g0_0LineEdit)
+        target = getattr(self, "g0LineEdit", None) or getattr(self, "g0_0LineEdit", None)
+        if target is not None:
+            target.setText(text or "")
 
     # inside DeviceSettingsDialog
     def _cell_text(self, row, col):
@@ -3820,55 +4133,35 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
         self._apply_detail_to_fields(self._cell_details[idx])
 
     # ---------- create IMSI/IMEI/ICCID rows ----------
-    def _ensure_id_fields(self, main_vbox: QtWidgets.QVBoxLayout):
-        # Reuse or create the fields
-        self.imsiLineEdit  = getattr(self, "imsiLineEdit",  None) or QtWidgets.QLineEdit()
-        self.imeiLineEdit  = getattr(self, "imeiLineEdit",  None) or QtWidgets.QLineEdit()
-        self.iccidLineEdit = getattr(self, "iccidLineEdit", None) or QtWidgets.QLineEdit()
-        self.simLineEdit   = getattr(self, "simLineEdit",   None) or QtWidgets.QLineEdit()
+    def _ensure_id_fields(self, layout: QtWidgets.QVBoxLayout):
+        """
+        Make sure the IMSI/IMEI/ICCID/SIM/Hostname/IOS/Firmware rows exist,
+        appended after the main connection rows. Does NOT touch G0/0 or
+        the Interface combo.
+        """
+        if hasattr(self, "imsiLineEdit"):
+            # already created once
+            return
 
-        # IDs are detected and locked; SIM should be editable
-        for w in (self.imsiLineEdit, self.imeiLineEdit, self.iccidLineEdit):
-            w.setReadOnly(True)
-            w.setPlaceholderText("— detected after clicking ‘Detect Cellular’ —")
+        def add_labeled_row(label_text: str, attr_name: str, placeholder: str):
+            lbl = QtWidgets.QLabel(label_text, self)
+            edit = QtWidgets.QLineEdit(self)
+            edit.setPlaceholderText(placeholder)
+            setattr(self, attr_name, edit)
 
-        self.simLineEdit.setReadOnly(False)
-        self.simLineEdit.setPlaceholderText("SIM Number")
+            row = QHBoxLayout()
+            row.addWidget(lbl)
+            row.addWidget(edit)
+            layout.addLayout(row)
 
-        # object names (handy if you style/test)
-        self.imsiLineEdit.setObjectName("imsiLineEdit")
-        self.imeiLineEdit.setObjectName("imeiLineEdit")
-        self.iccidLineEdit.setObjectName("iccidLineEdit")
-        self.simLineEdit.setObjectName("simLineEdit")
-
-        # layout
-        grid = QtWidgets.QGridLayout()
-        grid.setVerticalSpacing(6)
-        grid.setHorizontalSpacing(8)
-        grid.addWidget(QtWidgets.QLabel("IMSI"),  0, 0); grid.addWidget(self.imsiLineEdit,  0, 1)
-        grid.addWidget(QtWidgets.QLabel("IMEI"),  1, 0); grid.addWidget(self.imeiLineEdit,  1, 1)
-        grid.addWidget(QtWidgets.QLabel("ICCID"), 2, 0); grid.addWidget(self.iccidLineEdit, 2, 1)
-        grid.addWidget(QtWidgets.QLabel("SIM"),   3, 0); grid.addWidget(self.simLineEdit,   3, 1)
-
-                # NEW: Hostname / IOS / Firmware (IOS+Firmware read-only; fetched via SSH)
-        self.hostnameLineEdit = getattr(self, "hostnameLineEdit", None) or QtWidgets.QLineEdit()
-        self.iosLineEdit      = getattr(self, "iosLineEdit",      None) or QtWidgets.QLineEdit()
-        self.fwLineEdit       = getattr(self, "fwLineEdit",       None) or QtWidgets.QLineEdit()
-        self.iosLineEdit.setReadOnly(True); self.fwLineEdit.setReadOnly(True)
-        self.iosLineEdit.setPlaceholderText("— detected via SSH —")
-        self.fwLineEdit.setPlaceholderText("— detected via SSH —")
-
-        grid2 = QtWidgets.QGridLayout()
-        grid2.setVerticalSpacing(6); grid2.setHorizontalSpacing(8)
-        grid2.addWidget(QtWidgets.QLabel("Hostname"), 0, 0); grid2.addWidget(self.hostnameLineEdit, 0, 1)
-        grid2.addWidget(QtWidgets.QLabel("IOS"),      1, 0); grid2.addWidget(self.iosLineEdit,      1, 1)
-        grid2.addWidget(QtWidgets.QLabel("Firmware"), 2, 0); grid2.addWidget(self.fwLineEdit,       2, 1)
-        
-        main_vbox.insertLayout(6, grid)
-        main_vbox.insertLayout(7, grid2)
-
-        # when SIM text changes, keep our in-memory detail list in sync
-        self.simLineEdit.textChanged.connect(self._on_sim_changed)
+        add_labeled_row("IMSI", "imsiLineEdit", "— detected after clicking 'Detect Cellular' —")
+        add_labeled_row("IMEI", "imeiLineEdit", "— detected after clicking 'Detect Cellular' —")
+        add_labeled_row("ICCID", "iccidLineEdit", "— detected after clicking 'Detect Cellular' —")
+        # SIM already exists in the UI, don’t recreate it; just leave it where it is.
+        # Hostname / IOS / Firmware
+        add_labeled_row("Hostname", "hostnameLineEdit", "")
+        add_labeled_row("IOS", "iosLineEdit", "— detected via SSH —")
+        add_labeled_row("Firmware", "fwLineEdit", "— detected via SSH —")
 
     # inside DeviceSettingsDialog
     def get_data(self) -> dict:
@@ -3891,6 +4184,7 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
             "name":          _txt("nameLineEdit"),
             "ip":            _txt("ipLineEdit"),
             "gateway":       _txt("gatewayLineEdit"),
+            "g0_0":          _txt("g0_0LineEdit"),
             "apn":           _txt("apnLineEdit"),
             "email":         _txt("emailLineEdit"),
             "hostname":      getattr(self, "hostnameLineEdit", None) and _txt("hostnameLineEdit") or "",
@@ -4084,6 +4378,12 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
         self.overlaySpinner.stop(); self.overlay.hide()
         QtWidgets.QMessageBox.information(self, "Gateway Detected", f"Detected Gateway: {gateway}")
 
+    def on_g0_detected(self, g0_0):
+        self.g0_0LineEdit.setText(g0_0)
+        self._set_busy(False)   
+        self.overlaySpinner.stop(); self.overlay.hide()
+        QtWidgets.QMessageBox.information(self, "G0/0 Detected", f"Detected G0/0: {g0_0}")
+
     def on_apn_failed(self, message):
         self.overlaySpinner.stop(); self.overlay.hide()
         self._set_busy(False)
@@ -4108,6 +4408,64 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
                     self.detectSignals.gatewayDetected.emit(gw)
                 else:
                     self.detectSignals.detectFailed.emit("Gateway of last resort is not set.")
+
+                
+                # --- 2) Detect G0/0 using 'show ip interface brief' ----------
+                g0_summary = None
+
+                ssh = paramiko.SSHClient()
+                ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                try:
+                    ssh.connect(
+                        ip,
+                        username=username,
+                        password=password,
+                        look_for_keys=False,
+                        allow_agent=False,
+                        timeout=8,
+                        banner_timeout=8,
+                        auth_timeout=8,
+                    )
+                    cmd = "show ip interface brief | include GigabitEthernet0/0"
+                    _, stdout, _ = ssh.exec_command(cmd)
+                    out = stdout.read().decode("utf-8", errors="ignore")
+                finally:
+                    try:
+                        ssh.close()
+                    except Exception:
+                        pass
+
+                for line in out.splitlines():
+                    cols = re.split(r"\s+", line.strip())
+                    if not cols:
+                        continue
+                    name = cols[0]
+                    if not name.lower().startswith("gigabitethernet0/0"):
+                        continue
+
+                    ipaddr   = cols[1] if len(cols) > 1 else ""
+                    # typical columns: IF  IP-ADDR  OK?  METHOD  STATUS  PROTOCOL
+                    method   = cols[3] if len(cols) > 3 else ""
+                    status   = cols[4] if len(cols) > 4 else ""
+                    protocol = cols[5] if len(cols) > 5 else ""
+
+                    if not ipaddr:
+                        ipaddr = "unassigned"
+
+                    # METHOD is usually "DHCP" or "manual"
+                    method_str = method.lower()
+                    if "dhcp" in method_str:
+                        method_label = "dhcp"
+                    elif method_str:
+                        method_label = method_str
+                    else:
+                        method_label = "manual"
+
+                    g0_summary = f"{ipaddr}  ({status}/{protocol}, {method_label})"
+                    break
+
+                if g0_summary:
+                    self.detectSignals.g0Detected.emit(g0_summary)
             except Exception as e:
                 self.detectSignals.detectFailed.emit(f"Gateway detect error: {e}")
 
@@ -4347,6 +4705,25 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(100, lambda: print("[diag] UI tick ok"))
 
     _autohub_checked = set()
+
+    def _set_g00_cell_by_ip(self, device_ip: str, text: str):
+        """Find row by LAN IP and update the G0/0 column."""
+        row_idx = self._find_row_by_ip(device_ip)
+        if row_idx is None:
+            return
+
+        col_g00 = _col_index(self, "G0/0", default=3)
+        if col_g00 < 0:
+            return
+
+        item = self.deviceTable.item(row_idx, col_g00)
+        if item is None:
+            item = QtWidgets.QTableWidgetItem()
+            item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
+            item.setTextAlignment(QtCore.Qt.AlignCenter)
+            self.deviceTable.setItem(row_idx, col_g00, item)
+
+        item.setText(text or "—")
 
     def _schedule_inbox_row_resize(self, *args):
         """Called often; just (re)start the timer, very cheap."""
@@ -6107,29 +6484,33 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         self.deviceTable.setSortingEnabled(False)
 
         # ⬅️ We now have 11 columns (added ICCID after APN)
-        self.deviceTable.setColumnCount(11)
+        self.deviceTable.setColumnCount(12)
         self.deviceTable.setHorizontalHeaderLabels([
-            "Device", "IP", "Gateway", "SIM", "APN",
-            "ICCID",                      # new column
+            "Device", "IP", "Gateway", "G0/0", 
+            "SIM", "APN", "ICCID",
             "Email", "Last SMS", "Signal", "Status", "Actions"
         ])
+        self.deviceDelegate = DeviceDelegate(self.deviceTable)
         self.deviceTable.setRowCount(len(device_list))
-        self.deviceTable.setItemDelegateForColumn(0, DeviceDelegate(self.deviceTable))
+        self.deviceTable.setItemDelegateForColumn(0, self.deviceDelegate)  # Device column
         
-        self.simDelegate = SimDelegate(self.deviceTable)
-        self.deviceTable.setItemDelegateForColumn(3, self.simDelegate)  # SIM column
+        self.simDelegate = SimDelegate(
+            parent=self.deviceTable,
+            icon=QtGui.QIcon(resource_path("icons/send.png"))
+        )
+        self.deviceTable.setItemDelegateForColumn(4, self.simDelegate)  # SIM column
         self.simDelegate.sendSmsRequested.connect(self._send_sms_to)
         
         self.apnDelegate = ApnDelegate(self.deviceTable)
-        self.deviceTable.setItemDelegateForColumn(4, self.apnDelegate)
+        self.deviceTable.setItemDelegateForColumn(5, self.apnDelegate)
 
         self.deviceTable.setWordWrap(False)
         fm = self.deviceTable.fontMetrics()
         self.deviceTable.verticalHeader().setDefaultSectionSize(fm.height() + 12)
         self.deviceTable.horizontalHeader().setSectionsClickable(True)
 
-        # resolve Last SMS column index once (fallback moved from 6 → 7 because of ICCID)
-        self._last_sms_col = _col_index(self, "Last SMS", default=7)
+        # resolve Last SMS column index once (fallback moved from 7 → 8 because of G0/0)
+        self._last_sms_col = _col_index(self, "Last SMS", default=8)
 
         for i, d in enumerate(device_list):
             dev_id = d["id"]
@@ -6145,22 +6526,41 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             self.deviceTable.setItem(i, 1, IPItem(d["ip"]))
             self.deviceTable.setItem(i, 2, QtWidgets.QTableWidgetItem(d["gateway"]))
 
-            # SIM (col 3)
+            # --- G0/0 column (new) ---------------------------------------
+            # Expect these keys to be filled by the probe code (see part 2)
+            g00_ip     = (d.get("g00_ip") or "unassigned").strip()
+            g00_stat   = (d.get("g00_status") or "").strip()   # e.g. "up"
+            g00_proto  = (d.get("g00_protocol") or "").strip() # e.g. "up"
+            g00_mode   = (d.get("g00_mode") or "").strip()     # "DHCP" / "Static" / ""
+
+            # nice compact summary, adjust to taste
+            if g00_ip == "unassigned":
+                g00_text = "unassigned"
+            else:
+                # e.g. "159.196.90.25  up/up  DHCP"
+                mode_part = f"  {g00_mode}" if g00_mode else ""
+                g00_text = f"{g00_ip}  {g00_stat}/{g00_proto}{mode_part}"
+
+            g00_item = QtWidgets.QTableWidgetItem(g00_text)
+            g00_item.setFlags(g00_item.flags() & ~QtCore.Qt.ItemIsEditable)
+            self.deviceTable.setItem(i, 3, g00_item)
+
+            # SIM (col 4)
             sim_txt = (d.get("sim") or "").strip()
             it_sim = QtWidgets.QTableWidgetItem(sim_txt)
             it_sim.setFlags(it_sim.flags() & ~QtCore.Qt.ItemIsEditable)
             it_sim.setData(SIM_TEXT_ROLE, sim_txt)
             it_sim.setData(DEVICE_ID_ROLE, int(d["id"]))
-            self.deviceTable.setItem(i, 3, it_sim)
+            self.deviceTable.setItem(i, 4, it_sim)
 
-            # APN (col 4)
+            # APN (col 5)
             apn_txt = (d.get("apn") or "").strip()
             it_apn = QtWidgets.QTableWidgetItem(apn_txt)
             it_apn.setFlags(it_apn.flags() & ~QtCore.Qt.ItemIsEditable)
             it_apn.setData(APN_TEXT_ROLE, apn_txt)
-            self.deviceTable.setItem(i, 4, it_apn)
+            self.deviceTable.setItem(i, 5, it_apn)
 
-            # ICCID (col 5) — show parsed ICCID from best cellular iface (or em dash)
+            # ICCID (col 6) — show parsed ICCID from best cellular iface (or em dash)
             col_iccid = _col_index(self, "ICCID")     # <-- use function, not self._col_index
             if col_iccid != -1:
                 iccid_txt = d.get("iccid") or "—"
@@ -6168,8 +6568,8 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
                 item.setTextAlignment(Qt.AlignCenter)
                 self.deviceTable.setItem(i, col_iccid, item)
 
-            # Email (shifted to col 6)
-            self.deviceTable.setItem(i, 6, QtWidgets.QTableWidgetItem(d["email"]))
+            # Email (shifted to col 7)
+            self.deviceTable.setItem(i, 7, QtWidgets.QTableWidgetItem(d["email"]))
 
             # Last SMS: spinner + watchdog if cellular, else static text
             if d.get("has_cellular", False):
@@ -6184,14 +6584,14 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
                     w.deleteLater()
                 self.deviceTable.setItem(i, last_col, QtWidgets.QTableWidgetItem("No Cellular"))
 
-            # Signal (shifted to col 8)
-            self.deviceTable.setItem(i, 8, QtWidgets.QTableWidgetItem("▓" * d.get("signal", 0)))
+            # Signal (shifted to col 9)
+            self.deviceTable.setItem(i, 9, QtWidgets.QTableWidgetItem("▓" * d.get("signal", 0)))
 
-            # Status (shifted to col 9)
+            # Status (shifted to col 10)
             status_widget = create_status_label(d["status"])
-            self.deviceTable.setCellWidget(i, 9, status_widget)
+            self.deviceTable.setCellWidget(i, 10, status_widget)
 
-            # Actions menu (shifted to col 10)
+            # Actions menu (shifted to col 11)
             action_button = QToolButton()
             action_button.setText("Edit")
             action_button.setIcon(QIcon(resource_path("icons/edit.png")))
@@ -6236,7 +6636,7 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             menu.addAction(delete_action)
 
             action_button.setMenu(menu)
-            self.deviceTable.setCellWidget(i, 10, action_button)
+            self.deviceTable.setCellWidget(i, 11, action_button)
 
             # Connect actions
             action_button.clicked.connect(lambda _, id=dev_id: self.open_settings_dialog_by_id(id))
@@ -6577,10 +6977,6 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
         RECENT_SENDER_WINDOW_SEC = 180          # 3 minutes
         MANUAL_EDIT_COOLDOWN_SEC = 300          # 5 minutes
 
-        def _now():
-            import time
-            return time.time()
-
         def is_phone_number(s: str) -> bool:
             return bool(re.fullmatch(r"[+]?[\d]{6,20}", (s or "").strip()))
 
@@ -6832,440 +7228,6 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
                 content = log.get('Content','').replace('"', '""')
                 f.write(f'{log.get("ID","")},{log.get("Time","")},{log.get("From","")},{log.get("Size","")},"{content}"\n')
         QtWidgets.QMessageBox.information(self, "Export", "SMS logs exported successfully.")
-
-DEVICE_HUB_ROLE = QtCore.Qt.UserRole + 101  # custom role to store is_hub flag
-
-class DeviceDelegate(QtWidgets.QStyledItemDelegate):
-    def paint(self, painter: QtGui.QPainter, option: QtWidgets.QStyleOptionViewItem, index: QtCore.QModelIndex):
-        opt = QtWidgets.QStyleOptionViewItem(option)
-        self.initStyleOption(opt, index)
-
-        # draw selection/row background as usual
-        style = opt.widget.style() if opt.widget else QtWidgets.QApplication.style()
-        style.drawPrimitive(QtWidgets.QStyle.PE_PanelItemViewItem, opt, painter, opt.widget)
-
-        # we will draw text ourselves
-        text = index.data(QtCore.Qt.DisplayRole) or ""
-        is_hub = bool(index.data(DEVICE_HUB_ROLE))
-
-        r = opt.rect.adjusted(8, 0, -8, 0)  # left/right padding
-        painter.save()
-        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
-        painter.setPen(QtCore.Qt.NoPen)
-        painter.setFont(opt.font)  # EXACT same font the view uses
-
-        x = r.left()
-        y = r.top()
-        h = r.height()
-
-        # optional: HUB pill
-        if is_hub:
-            pill_margin_h = 6
-            pill_margin_v = 4
-            pill_text = "HUB"
-            # size using the SAME font metrics the table uses
-            fm = QtGui.QFontMetrics(opt.font)
-            tw = fm.horizontalAdvance(pill_text)
-            ph = fm.height() + pill_margin_v   # pill height ~ text height
-            pw = tw + 16                       # padding inside the pill
-            pill_rect = QtCore.QRect(x, y + (h - ph)//2, pw, ph)
-
-            # pill background
-            painter.setBrush(QtGui.QColor("#2563eb"))
-            painter.drawRoundedRect(pill_rect, 6, 6)
-
-            # pill text
-            painter.setPen(QtCore.Qt.white)
-            painter.drawText(pill_rect.adjusted(8, 0, -8, 0),
-                             QtCore.Qt.AlignVCenter | QtCore.Qt.AlignHCenter,
-                             pill_text)
-
-            x = pill_rect.right() + 8  # space between pill and device name
-
-        # device name (same font/color/path as other items)
-        name_rect = QtCore.QRect(x, r.top(), r.right() - x, r.height())
-        # use view palette for text color so selection states match
-        painter.setPen(opt.palette.color(
-            QtGui.QPalette.HighlightedText if (opt.state & QtWidgets.QStyle.State_Selected)
-            else QtGui.QPalette.Text
-        ))
-        painter.drawText(name_rect, QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft,
-                         text)
-
-        painter.restore()
-
-    def sizeHint(self, option, index):
-        # keep default row height logic
-        return super().sizeHint(option, index)
-    
-APN_TEXT_ROLE = QtCore.Qt.UserRole + 202
-
-class ApnDelegate(QtWidgets.QStyledItemDelegate):
-    def paint(self, painter, option, index):
-        opt = QtWidgets.QStyleOptionViewItem(option)
-        self.initStyleOption(opt, index)
-        style = opt.widget.style() if opt.widget else QtWidgets.QApplication.style()
-        style.drawPrimitive(QtWidgets.QStyle.PE_PanelItemViewItem, opt, painter, opt.widget)
-
-        painter.save()
-        painter.setFont(opt.font)
-
-        text = (index.data(APN_TEXT_ROLE) or "").strip()
-        r = opt.rect.adjusted(8, 0, -8, 0)
-
-        if not text:          # show the same pill as SIM's empty
-            paint_pill(painter, r, "NO CELL", opt.font)
-        else:                  # normal APN text
-            color = opt.palette.color(
-                QtGui.QPalette.HighlightedText if (opt.state & QtWidgets.QStyle.State_Selected)
-                else QtGui.QPalette.Text
-            )
-            painter.setPen(color)
-            painter.drawText(r, QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft, text)
-
-        painter.restore()
-
-    def sizeHint(self, option, index):
-        return super().sizeHint(option, index)
-
-DEVICE_ID_ROLE = QtCore.Qt.UserRole + 200
-SIM_TEXT_ROLE  = QtCore.Qt.UserRole + 201
-
-class SimDelegate(QtWidgets.QStyledItemDelegate):
-    sendSmsRequested = QtCore.pyqtSignal(int, str)  # (device_id, to_number)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        # cache icon pixmap
-        self.icon = QtGui.QIcon(resource_path("icons/send.png"))
-        self._last_icon_rect = {}
-
-    def paint(self, painter, option, index):
-        opt = QtWidgets.QStyleOptionViewItem(option)
-        self.initStyleOption(opt, index)
-        style = opt.widget.style() if opt.widget else QtWidgets.QApplication.style()
-        style.drawPrimitive(QtWidgets.QStyle.PE_PanelItemViewItem, opt, painter, opt.widget)
-
-        painter.save()
-        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
-        painter.setFont(opt.font)
-
-        text = (index.data(SIM_TEXT_ROLE) or "").strip()
-        r = opt.rect.adjusted(8, 0, -8, 0)  # padding
-
-        if not text:
-            paint_pill(painter, r, "NO CELL", opt.font)
-            self._last_icon_rect[index] = QtCore.QRect()
-            painter.restore()
-            return
-        else:
-            # draw SIM text and a send icon at the right
-            fm = QtGui.QFontMetrics(opt.font)
-            icon_sz = min(max(fm.height(), 16), 20)
-            icon_rect = QtCore.QRect(r.right()-icon_sz, r.top() + (r.height()-icon_sz)//2,
-                                     icon_sz, icon_sz)
-            text_rect = QtCore.QRect(r.left(), r.top(), icon_rect.left()-8 - r.left(), r.height())
-
-            painter.setPen(opt.palette.color(
-                QtGui.QPalette.HighlightedText if (opt.state & QtWidgets.QStyle.State_Selected)
-                else QtGui.QPalette.Text
-            ))
-            painter.drawText(text_rect, QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft, text)
-
-            pm = self.icon.pixmap(icon_sz, icon_sz)
-            style.drawItemPixmap(painter, icon_rect, QtCore.Qt.AlignCenter, pm)
-
-            # remember clickable area for editorEvent
-            self._last_icon_rect[index] = icon_rect
-
-        painter.restore()
-
-    def editorEvent(self, event, model, option, index):
-        # click on icon → emit signal
-        if event.type() == QtCore.QEvent.MouseButtonRelease and event.button() == QtCore.Qt.LeftButton:
-            icon_rect = self._last_icon_rect.get(index, QtCore.QRect())
-            if icon_rect.contains(event.pos()):
-                dev_id = int(index.data(DEVICE_ID_ROLE) or 0)
-                sim_to = (index.data(SIM_TEXT_ROLE) or "").strip()
-                if dev_id and sim_to:
-                    self.sendSmsRequested.emit(dev_id, sim_to)
-                return True
-        return super().editorEvent(event, model, option, index)
-
-# Simple dialog for sending SMS
-class SendSMSDialog(QtWidgets.QDialog):
-    def __init__(self, device_name, router_ip, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle(f"Send SMS via {device_name}")
-        self.setFixedSize(360, 220)
-
-        layout = QVBoxLayout()
-
-        # --- "To" row: line edit + ICCID search button -----------------
-        layout.addWidget(QtWidgets.QLabel("To:"))
-
-        to_row = QtWidgets.QHBoxLayout()
-        self.to_input = QtWidgets.QLineEdit()
-        self.to_input.setPlaceholderText("Recipient Number")
-
-        self.iccid_btn = QPushButton("Search By ICCID")
-
-        to_row.addWidget(self.to_input)
-        to_row.addWidget(self.iccid_btn)
-        layout.addLayout(to_row)
-
-        # --- Message ---------------------------------------------------
-        layout.addWidget(QtWidgets.QLabel("Message:"))
-        self.message_input = QtWidgets.QPlainTextEdit()
-        self.message_input.setPlaceholderText("Enter your message")
-        layout.addWidget(self.message_input)
-
-        send_btn = QPushButton("Send")
-        send_btn.clicked.connect(self.accept)
-        layout.addWidget(send_btn)
-
-        self.setLayout(layout)
-        self.router_ip = router_ip
-
-        # Wire ICCID button
-        self.iccid_btn.clicked.connect(self._on_search_iccid)
-
-    def _on_search_iccid(self):
-        dlg = ICCIDPickerDialog(self)
-        if dlg.exec_() == QtWidgets.QDialog.Accepted and dlg.selected_phone:
-            # Put selected phone number into "To" field
-            self.to_input.setText(dlg.selected_phone)
-
-    def get_sms_data(self):
-        return self.to_input.text(), self.message_input.toPlainText()
-    
-class ICCIDEditDialog(QtWidgets.QDialog):
-    """
-    Simple dialog to add a new ICCID mapping.
-    Returns (iccid, phone, description) via get_data().
-    """
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Add ICCID Mapping")
-        self.resize(400, 180)
-
-        layout = QtWidgets.QVBoxLayout(self)
-
-        form = QtWidgets.QFormLayout()
-        self.iccid_edit = QtWidgets.QLineEdit(self)
-        self.phone_edit = QtWidgets.QLineEdit(self)
-        self.desc_edit = QtWidgets.QLineEdit(self)
-
-        self.iccid_edit.setPlaceholderText("e.g. 8961024623...")
-        self.phone_edit.setPlaceholderText("e.g. 0412345678")
-        self.desc_edit.setPlaceholderText("Optional description (site, router, etc.)")
-
-        form.addRow("ICCID:", self.iccid_edit)
-        form.addRow("Phone:", self.phone_edit)
-        form.addRow("Description:", self.desc_edit)
-        layout.addLayout(form)
-
-        btn_box = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
-            parent=self
-        )
-        layout.addWidget(btn_box)
-
-        btn_box.accepted.connect(self._on_ok)
-        btn_box.rejected.connect(self.reject)
-
-    def _on_ok(self):
-        iccid = self.iccid_edit.text().strip()
-        phone = self.phone_edit.text().strip()
-
-        if not iccid or not phone:
-            QtWidgets.QMessageBox.warning(
-                self, "Missing data", "ICCID and phone number are required."
-            )
-            return
-
-        self.accept()
-
-    def get_data(self):
-        return (
-            self.iccid_edit.text().strip(),
-            self.phone_edit.text().strip(),
-            self.desc_edit.text().strip(),
-        )
-    
-class ICCIDPickerDialog(QtWidgets.QDialog):
-    """
-    Dialog to search ICCID → phone_number from iccid_phone_map
-    and pick one. After exec_():
-        self.selected_iccid
-        self.selected_phone
-    """
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Select SIM by ICCID")
-        self.resize(600, 420)
-
-        self.selected_iccid = None
-        self.selected_phone = None
-
-        layout = QtWidgets.QVBoxLayout(self)
-
-        # --- Search box -------------------------------------------------
-        search_layout = QtWidgets.QHBoxLayout()
-        self.search_edit = QtWidgets.QLineEdit(self)
-        self.search_edit.setPlaceholderText("Search by ICCID / phone / description...")
-        search_layout.addWidget(QtWidgets.QLabel("Search:", self))
-        search_layout.addWidget(self.search_edit)
-        layout.addLayout(search_layout)
-
-        # --- Table ------------------------------------------------------
-        self.table = QtWidgets.QTableWidget(self)
-        self.table.setColumnCount(3)
-        self.table.setHorizontalHeaderLabels(["ICCID", "Phone", "Description"])
-        self.table.horizontalHeader().setSectionResizeMode(
-            0, QtWidgets.QHeaderView.ResizeToContents
-        )
-        self.table.horizontalHeader().setSectionResizeMode(
-            1, QtWidgets.QHeaderView.ResizeToContents
-        )
-        self.table.horizontalHeader().setSectionResizeMode(
-            2, QtWidgets.QHeaderView.Stretch
-        )
-        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
-        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        layout.addWidget(self.table)
-
-        # --- Bottom buttons row: Add + OK / Cancel ----------------------
-        bottom_layout = QtWidgets.QHBoxLayout()
-
-        self.add_btn = QtWidgets.QPushButton("Add…", self)
-        bottom_layout.addWidget(self.add_btn)
-        bottom_layout.addStretch(1)
-
-        btn_box = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
-            parent=self
-        )
-        bottom_layout.addWidget(btn_box)
-
-        layout.addLayout(bottom_layout)
-
-        # Signals
-        self.search_edit.textChanged.connect(self._reload_rows)
-        self.table.itemDoubleClicked.connect(self._accept_current_row)
-        btn_box.accepted.connect(self._on_ok)
-        btn_box.rejected.connect(self.reject)
-        self.add_btn.clicked.connect(self._on_add_clicked)
-
-        # initial data
-        self._reload_rows()
-
-    # ------------ DB helpers -----------------
-    def _fetch_iccid_rows(self, term: str | None):
-        """
-        Returns list of (iccid, phone_number, description)
-        from iccid_phone_map.
-        """
-        term = (term or "").strip()
-        db = mysql.connector.connect(**get_db_config())
-        try:
-            cur = db.cursor()
-            if term:
-                like = f"%{term}%"
-                cur.execute(
-                    """
-                    SELECT iccid, phone_number, COALESCE(description, '')
-                    FROM iccid_phone_map
-                    WHERE iccid        LIKE %s
-                       OR phone_number LIKE %s
-                       OR description  LIKE %s
-                    ORDER BY iccid
-                    """,
-                    (like, like, like),
-                )
-            else:
-                cur.execute(
-                    """
-                    SELECT iccid, phone_number, COALESCE(description, '')
-                    FROM iccid_phone_map
-                    ORDER BY iccid
-                    """
-                )
-            return list(cur.fetchall())
-        finally:
-            db.close()
-
-    def _reload_rows(self):
-        rows = self._fetch_iccid_rows(self.search_edit.text())
-        self.table.setRowCount(len(rows))
-        for r, (iccid, phone, desc) in enumerate(rows):
-            self.table.setItem(r, 0, QtWidgets.QTableWidgetItem(iccid or ""))
-            self.table.setItem(r, 1, QtWidgets.QTableWidgetItem(phone or ""))
-            self.table.setItem(r, 2, QtWidgets.QTableWidgetItem(desc or ""))
-
-    # ------------ selection helpers ---------------
-    def _set_from_row(self, row: int):
-        if row < 0:
-            return
-        iccid_item = self.table.item(row, 0)
-        phone_item = self.table.item(row, 1)
-        if not iccid_item or not phone_item:
-            return
-        self.selected_iccid = iccid_item.text().strip()
-        self.selected_phone = phone_item.text().strip()
-
-    def _accept_current_row(self, *_):
-        row = self.table.currentRow()
-        self._set_from_row(row)
-        if self.selected_phone:
-            self.accept()
-
-    def _on_ok(self):
-        row = self.table.currentRow()
-        self._set_from_row(row)
-        if not self.selected_phone:
-            QtWidgets.QMessageBox.warning(
-                self, "No selection", "Please select a SIM row to use."
-            )
-            return
-        self.accept()
-
-    # ------------ Add new ICCID -------------------
-    def _on_add_clicked(self):
-        dlg = ICCIDEditDialog(self)
-        if dlg.exec_() != QtWidgets.QDialog.Accepted:
-            return
-
-        iccid, phone, desc = dlg.get_data()
-
-        # Insert into DB
-        db = mysql.connector.connect(**get_db_config())
-        try:
-            cur = db.cursor()
-            try:
-                cur.execute(
-                    """
-                    INSERT INTO iccid_phone_map (iccid, phone_number, description)
-                    VALUES (%s, %s, %s)
-                    """,
-                    (iccid, phone, desc or None),
-                )
-                db.commit()
-            except mysql.connector.Error as e:
-                db.rollback()
-                QtWidgets.QMessageBox.critical(
-                    self,
-                    "Insert failed",
-                    f"Could not save ICCID mapping:\n{e}",
-                )
-                return
-        finally:
-            db.close()
-
-        # refresh table and move search to new ICCID
-        self.search_edit.setText(iccid)
-        self._reload_rows()
 
 # ---------- get email by router ip ----------
 def get_email_by_router_ip(router_ip):

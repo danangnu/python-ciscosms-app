@@ -1,55 +1,52 @@
-[2025-11-18T14:37:22] Refresh for ABB01 (192.168.18.43)
+[2025-11-21T17:18:07] Refresh for ABB01 (192.168.18.43)
 Used NHRP cmd:  show ip nhrp
 Used DMVPN cmd: show dmvpn
 Used EIGRP cmd: show ip eigrp neighbors
 
 === SHOW IP NHRP ===
+al length 0
+
+=== SHOW DMVPN ===
+show ip nhrp
 172.16.1.200/32 via 172.16.1.200
-   Tunnel1 created 4d14h, expire 00:07:13
+   Tunnel1 created 1d08h, expire 00:05:18
    Type: dynamic, Flags: registered nhop 
    NBMA address: 192.168.255.200 
 172.16.1.201/32 via 172.16.1.201
-   Tunnel1 created 13:23:26, expire 00:06:10
+   Tunnel1 created 1d08h, expire 00:05:33
    Type: dynamic, Flags: registered nhop 
    NBMA address: 192.168.255.201 
 172.16.1.202/32 via 172.16.1.202
-   Tunnel1 created 04:57:11, expire 00:05:43
+   Tunnel1 created 1d07h, expire 00:05:02
    Type: dynamic, Flags: registered nhop 
    NBMA address: 192.168.255.202 
 172.16.1.203/32 via 172.16.1.203
-   Tunnel1 created 13:24:11, expire 00:05:48
+   Tunnel1 created 1d17h, expire 00:05:18
    Type: dynamic, Flags: registered nhop 
    NBMA address: 192.168.255.203 
 172.16.1.204/32 via 172.16.1.204
-   Tunnel1 created 3d14h, expire 00:05:12
+   Tunnel1 created 1d10h, expire 00:07:01
    Type: dynamic, Flags: registered nhop 
    NBMA address: 192.168.255.204 
 172.16.1.205/32 via 172.16.1.205
-   Tunnel1 created 1d12h, expire 00:06:30
+   Tunnel1 created 2d01h, expire 00:06:21
    Type: dynamic, Flags: registered nhop 
-   NBMA address: 10.199.75.198 
-172.16.1.206/32 via 172.16.1.206
-   Tunnel1 created 4d19h, expire 00:05:43
-   Type: dynamic, Flags: registered nhop 
-   NBMA address: 192.168.255.206 
-172.16.1.208/32 via 172.16.1.208
-   Tunnel1 created 00:07:58, expire 00:06:51
-   Type: dynamic, Flags: unique registered nhop 
-   NBMA address: 192.168.1.191 
+   NBMA address: 192.168.255.205 
 172.16.1.209/32 via 172.16.1.209
-   Tunnel1 created 00:21:05, expire 00:07:11
+   Tunnel1 created 1d23h, expire 00:05:22
    Type: dynamic, Flags: registered nhop 
    NBMA address: 192.168.255.209 
 172.16.1.210/32 via 172.16.1.210
-   Tunnel1 created 6d04h, expire 00:06:13
+   Tunnel1 created 2d00h, expire 00:05:41
    Type: dynamic, Flags: unique registered nhop 
-   NBMA address: 10.106.99.77 
+   NBMA address: 192.168.255.210 
 172.16.1.230/32 via 172.16.1.230
-   Tunnel1 created 6d04h, expire 00:05:20
+   Tunnel1 created 1d07h, expire 00:05:21
    Type: dynamic, Flags: unique registered used nhop 
    NBMA address: 192.168.1.252
 
-=== SHOW DMVPN ===
+=== SHOW IP EIGRP NEIGHBORS ===
+show dmvpn
 Legend: Attrb --> S - Static, D - Dynamic, I - Incomplete
 	N - NATed, L - Local, X - No Socket
 	T1 - Route Installed, T2 - Nexthop-override
@@ -59,34 +56,16 @@ Legend: Attrb --> S - Static, D - Dynamic, I - Incomplete
 	UpDn Time --> Up or Down Time for a Tunnel
 ==========================================================================
 Interface: Tunnel1, IPv4 NHRP Details 
-Type:Hub, NHRP Peers:11, 
+Type:Hub, NHRP Peers:9, 
  # Ent  Peer NBMA Addr Peer Tunnel Add State  UpDn Tm Attrb
  ----- --------------- --------------- ----- -------- -----
-     1 192.168.255.200    172.16.1.200    UP    4d14h     D
-     1 192.168.255.201    172.16.1.201    UP 13:23:26     D
-     1 192.168.255.202    172.16.1.202    UP 04:57:12     D
-     1 192.168.255.203    172.16.1.203    UP 13:23:32     D
-     1 192.168.255.204    172.16.1.204    UP    3d14h     D
-     1 10.199.75.198      172.16.1.205    UP    1d12h     D
-     1 192.168.255.206    172.16.1.206    UP    4d19h     D
-     1 192.168.1.191      172.16.1.208    UP 00:07:58     D
-     1 192.168.255.209    172.16.1.209    UP 00:21:05     D
-     1 10.106.99.77       172.16.1.210    UP    6d04h     D
-     1 192.168.1.252      172.16.1.230    UP    6d04h     D
-
-=== SHOW IP EIGRP NEIGHBORS ===
-EIGRP-IPv4 Neighbors for AS(10)
-H   Address                 Interface              Hold Uptime   SRTT   RTO  Q  Seq
-                                                   (sec)         (ms)       Cnt Num
-2   172.16.1.208            Tu1                      11 00:07:57   62  2043  0  11
-10  172.16.1.209            Tu1                      12 00:21:06   36  1362  0  4
-6   172.16.1.202            Tu1                      12 04:57:11   28  1362  0  500
-4   172.16.1.201            Tu1                      12 13:23:22   31  1362  0  547
-1   172.16.1.203            Tu1                      11 13:23:29   55  1362  0  392
-3   172.16.1.204            Tu1                      14 3d14h      38  1362  0  621
-5   172.16.1.205            Tu1                      14 4d14h      53  1362  0  326
-8   172.16.1.200            Tu1                      11 4d14h      35  1362  0  535
-0   172.16.1.206            Tu1                      13 4d19h      38  2097  0  496
-9   172.16.1.230            Tu1                      12 6d04h     207  2097  0  1282
-7   172.16.1.210            Tu1                      28 6d04h      75  2097  0  535
+     1 192.168.255.200    172.16.1.200    UP    1d08h     D
+     1 192.168.255.201    172.16.1.201    UP    1d08h     D
+     1 192.168.255.202    172.16.1.202    UP    1d07h     D
+     1 192.168.255.203    172.16.1.203    UP    1d17h     D
+     1 192.168.255.204    172.16.1.204    UP    1d10h     D
+     1 192.168.255.205    172.16.1.205    UP    2d01h     D
+     1 192.168.255.209    172.16.1.209    UP    1d23h     D
+     1 192.168.255.210    172.16.1.210    UP    2d00h     D
+     1 192.168.1.252      172.16.1.230    UP    1d07h     D
 
