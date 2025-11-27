@@ -284,22 +284,24 @@ def _parse_sms_list(text: str) -> list[dict]:
             out.append(d)
     return out
 
-def _is_qualified_cell_row(d: dict) -> bool:
+def _is_qualified_cell_row(row: dict) -> bool:
     """
-    Keep only real cellular rows:
-      - interface starts with 'Cellular'
-      - IP is assigned (not 'unassigned' / empty)
-      - link is up (status == 'up' AND protocol contains 'up')
+    A cellular interface row is only considered 'real cellular' if:
+      - status/protocol are up-ish
+      - ICCID exists (new rule)
     """
-    name = (d.get("interface") or d.get("name") or "").lower()
-    if not name.startswith("cellular"):
+    status   = (row.get("status") or "").lower()
+    proto    = (row.get("protocol") or "").lower()
+    iccid    = (row.get("iccid") or "").strip()
+
+    if not iccid:
+        return False  # 👈 No ICCID → treat as NO CELL
+
+    if "up" not in status or "up" not in proto:
+        # still allow, if you want, but your text says "status is up"
         return False
-    ip = (d.get("ip") or d.get("ip_addr") or "").strip().lower()
-    if not ip or ip == "unassigned":
-        return False
-    status   = (d.get("status") or "").strip().lower()
-    protocol = (d.get("protocol") or "").strip().lower()
-    return status == "up" and "up" in protocol
+
+    return True
 
 # ---------- Crypto for SSH password ----------
 # --- Feature flags ---
@@ -3601,12 +3603,11 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
         super(DeviceSettingsDialog, self).__init__(parent)
         uic.loadUi(resource_path("device_settings_dialog.ui"), self)
 
-        # at top of DeviceSettingsDialog.__init__
+        # --- timers / signals -------------------------------------------------
         self._detectAllWatchdog = QtCore.QTimer(self)
         self._detectAllWatchdog.setSingleShot(True)
         self._detectAllWatchdog.timeout.connect(self._detect_all_timed_out)
 
-        # signals
         self.detectSignals = DetectSignals()
         self.detectSignals.apnDetected.connect(self.on_apn_detected)
         self.detectSignals.gatewayDetected.connect(self.on_gateway_detected)
@@ -3618,7 +3619,7 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
 
         self._prefill_started = False
 
-        # overlay
+        # overlay spinner
         self.overlay = QWidget(self)
         self.overlay.setStyleSheet("background: rgba(255, 255, 255, 0.7);")
         self.overlay.hide()
@@ -3626,16 +3627,19 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
         self.overlay.setAttribute(Qt.WA_TransparentForMouseEvents, False)
         self.overlaySpinner = LoadingSpinner(self.overlay)
         self.overlaySpinner.setFixedSize(80, 80)
-        self.overlaySpinner.setGeometry(self.overlay.width()//2-40, self.overlay.height()//2-40, 80, 80)
-
-        self.overlay.raise_() 
+        self.overlaySpinner.setGeometry(
+            self.overlay.width() // 2 - 40,
+            self.overlay.height() // 2 - 40,
+            80, 80,
+        )
+        self.overlay.raise_()
 
         self.gatewaySpinner = LoadingSpinner(self)
 
-        # --- main vertical layout from .ui ------------------------------
+        # ========== LAYOUT REBUILD ============================================
         layout: QtWidgets.QVBoxLayout = self.layout()
 
-        # helper: detach a widget from the current VBox layout
+        # helper to detach a widget from the VBox without deleting it
         def _detach_widget(layout: QtWidgets.QVBoxLayout, w: QtWidgets.QWidget):
             for i in range(layout.count()):
                 item = layout.itemAt(i)
@@ -3643,11 +3647,12 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
                     layout.takeAt(i)
                     return
 
-        # We remove the plain gateway/apn widgets; we'll re-insert them in HBox rows
+        # remove raw gateway / APN / email widgets so we can re-insert them
         _detach_widget(layout, self.gatewayLineEdit)
         _detach_widget(layout, self.apnLineEdit)
+        _detach_widget(layout, self.emailLineEdit)
 
-        # find where the IP line edit is, so we can insert rows after it
+        # find index of IP line edit so we can insert rows after it
         ip_index = 0
         for i in range(layout.count()):
             item = layout.itemAt(i)
@@ -3655,7 +3660,7 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
                 ip_index = i
                 break
 
-        # --- Gateway row: [gatewayLineEdit][Detect][spinner] ------------
+        # --- Gateway row: [gatewayLineEdit][Detect][spinner] ------------------
         self.detectGatewayButton = QPushButton("Detect", self)
         self.gatewaySpinner = LoadingSpinner(self)
         self.gatewaySpinner.hide()
@@ -3665,19 +3670,19 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
         gw_row.addWidget(self.detectGatewayButton)
         gw_row.addWidget(self.gatewaySpinner)
 
-        # --- NEW G0/0 row (read-only) -----------------------------------
+        # --- G0/0 read-only row ----------------------------------------------
         self.g00LineEdit = QtWidgets.QLineEdit(self)
         self.g00LineEdit.setObjectName("g00LineEdit")
         self.g00LineEdit.setPlaceholderText("G0/0 (WAN IP / status)")
         self.g00LineEdit.setReadOnly(True)
 
-        # --- APN row: [apnLineEdit][Detect] -----------------------------
+        # --- APN row: [apnLineEdit][Detect] -----------------------------------
         self.detectApnButton = QPushButton("Detect", self)
         apn_row = QHBoxLayout()
         apn_row.addWidget(self.apnLineEdit, 1)
         apn_row.addWidget(self.detectApnButton)
 
-        # --- Interface row (combo + status dot) -------------------------
+        # --- Interface row (combo + dot) -------------------------------------
         self.ifaceCombo = QtWidgets.QComboBox(self)
         self.ifaceCombo.setObjectName("ifaceCombo")
 
@@ -3690,25 +3695,31 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
         iface_row_layout.addWidget(self.ifaceCombo, 1)
         iface_row_layout.addWidget(self.ifaceStatus)
 
-        # --- Detect Cellular row ----------------------------------------
+        # --- Detect Cellular row ---------------------------------------------
         self.detectCellButton = QPushButton("Detect Cellular…", self)
         cell_row_layout = QHBoxLayout()
         cell_row_layout.addStretch(1)
         cell_row_layout.addWidget(self.detectCellButton)
 
-        # insert all these rows directly *after* the IP line
+        # Insert in desired order after IP:
+        #   Gateway row
+        #   G0/0 row
+        #   APN row
+        #   Email
+        #   Interface row
+        #   Detect Cellular row
         insert_at = ip_index + 1
-        layout.insertLayout(insert_at + 0, gw_row)           # Gateway row
-        layout.insertWidget(insert_at + 1, self.g00LineEdit)  # G0/0 row
-        layout.insertLayout(insert_at + 2, apn_row)           # APN row
-        layout.insertLayout(insert_at + 3, iface_row_layout)  # Interface row
-        layout.insertLayout(insert_at + 4, cell_row_layout)   # Detect Cellular row
+        layout.insertLayout(insert_at + 0, gw_row)
+        layout.insertWidget(insert_at + 1, self.g00LineEdit)
+        layout.insertLayout(insert_at + 2, apn_row)
+        layout.insertWidget(insert_at + 3, self.emailLineEdit)     # ⬅️ email just after APN
+        layout.insertLayout(insert_at + 4, iface_row_layout)
+        layout.insertLayout(insert_at + 5, cell_row_layout)
 
-        # --- Ensure IMSI/IMEI/ICCID/Hostname/IOS/Firmware fields exist --
+        # Ensure IMSI/IMEI/ICCID/SIM/etc exist (created if missing)
         self._ensure_id_fields(layout)
 
-        # --- Move Save/Cancel to the very bottom ------------------------
-        # Detach from any previous layout and add a fresh row at the end
+        # ---- Save / Cancel row at the very bottom ---------------------------
         self.saveButton.setParent(self)
         self.cancelButton.setParent(self)
 
@@ -3717,7 +3728,7 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
         btn_row.addWidget(self.cancelButton)
         layout.addLayout(btn_row)
 
-        # signals for the detect buttons
+        # ========== WIRING ====================================================
         self.detectApnButton.clicked.connect(self.handle_detect_apn)
         self.detectGatewayButton.clicked.connect(self.handle_detect_gateway)
         self.detectCellButton.clicked.connect(self.handle_detect_cellular)
@@ -3733,60 +3744,53 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
         self._collect_busy_widgets()
         self.resizeEvent = self._resize_event_forward
 
-        # --------------------------------------------------------------
-        #  Populate fields when editing an existing device
-        # --------------------------------------------------------------
+        # ---------- load existing device values -------------------------------
         self.device = device or {}
         self.device_id = self.device.get("id")
 
         if device:
-            # basic fields
-            self.nameLineEdit.setText(device.get("name", ""))
-            self.ipLineEdit.setText(device.get("ip", ""))
-            self.gatewayLineEdit.setText(device.get("gateway", ""))
-            self.apnLineEdit.setText(device.get("apn", ""))
-            self.simLineEdit.setText(device.get("sim", ""))
+            self.nameLineEdit.setText(device["name"])
+            self.ipLineEdit.setText(device["ip"])
+            self.gatewayLineEdit.setText(device["gateway"])
+            self.g00LineEdit.setText(device.get("g0_0", "") or "")
             self.emailLineEdit.setText(device.get("email", ""))
+            self.simLineEdit.setText(device.get("sim", ""))
+            self.apnLineEdit.setText(device.get("apn", ""))
 
-            # optional extra fields
             self.hostnameLineEdit.setText(device.get("hostname", ""))
             self.iosLineEdit.setText(device.get("ios_version", ""))
             self.fwLineEdit.setText(device.get("modem_firmware", ""))
 
-            # G0/0 read-only summary (if you have these keys)
-            g00_ip    = (device.get("g00_ip") or device.get("g00") or "").strip()
-            g00_stat  = (device.get("g00_status") or "").strip()
-            g00_proto = (device.get("g00_protocol") or "").strip()
-            g00_mode  = (device.get("g00_mode") or "").strip()
+            # enable/disable APN detect based on has_cellular
+            has_cell = bool(device.get("has_cellular", True))
+            self.detectApnButton.setEnabled(has_cell)
+            if not has_cell:
+                self.detectApnButton.setToolTip("No cellular interface on this router")
 
-            parts = []
-            if g00_ip:
-                parts.append(g00_ip)
-            if g00_stat or g00_proto:
-                parts.append(f"{g00_stat}/{g00_proto}".strip("/"))
-            if g00_mode:
-                parts.append(g00_mode)
-            self.g00LineEdit.setText("  ".join(parts) if parts else "")
+            self._user_edited_sim = False
+            self.simLineEdit.textEdited.connect(
+                lambda _t: setattr(self, "_user_edited_sim", True)
+            )
+            self._sim_locked = (self.simLineEdit.text() or device.get("sim", "") or "").strip()
 
-            # load any saved cellular interfaces into the Interface combo
-            if device.get("id"):
-                saved = get_device_cellular(device["id"])
-                details = []
-                for r in saved:
-                    details.append({
-                        "interface": r["interface"],
-                        "ip_addr": (r.get("ip_addr") or "").strip(),
-                        "ip": (r.get("ip_addr") or "").strip(),
-                        "status": (r.get("status") or "").strip(),
-                        "protocol": (r.get("protocol") or "").strip(),
-                        "imsi": (r.get("imsi") or "").strip(),
-                        "imei": (r.get("imei") or "").strip(),
-                        "iccid": (r.get("iccid") or "").strip(),
-                        "apn": (r.get("apn") or "").strip(),
-                        "sim": (r.get("sim") or "").strip(),
-                    })
-                if details:
-                    self._set_interface_list(details, select_best=True)
+            # pre-fill interface combo from saved cellular details
+            saved = get_device_cellular(device["id"])
+            details = []
+            for r in saved:
+                details.append({
+                    "interface": r["interface"],
+                    "ip_addr": (r.get("ip_addr") or "").strip(),
+                    "ip": (r.get("ip_addr") or "").strip(),
+                    "status": (r.get("status") or "").strip(),
+                    "protocol": (r.get("protocol") or "").strip(),
+                    "imsi": (r.get("imsi") or "").strip(),
+                    "imei": (r.get("imei") or "").strip(),
+                    "iccid": (r.get("iccid") or "").strip(),
+                    "apn": (r.get("apn") or "").strip(),
+                    "sim": (r.get("sim") or "").strip(),
+                })
+            if details:
+                self._set_interface_list(details, select_best=True)
 
             # enable / disable APN detect based on has_cellular flag
             has_cell = bool(device.get("has_cellular", True))
@@ -3826,8 +3830,8 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
         Slot for DetectSignals.g0Detected.
         Fills the G0/0 line edit when detection succeeds.
         """
-        # adjust the attribute name to match your .ui (g0LineEdit / g0_0LineEdit)
-        target = getattr(self, "g0LineEdit", None) or getattr(self, "g0_0LineEdit", None)
+        # adjust the attribute name to match your .ui (g0LineEdit / g00LineEdit)
+        target = getattr(self, "g0LineEdit", None) or getattr(self, "g00LineEdit", None)
         if target is not None:
             target.setText(text or "")
 
@@ -4135,33 +4139,41 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
     # ---------- create IMSI/IMEI/ICCID rows ----------
     def _ensure_id_fields(self, layout: QtWidgets.QVBoxLayout):
         """
-        Make sure the IMSI/IMEI/ICCID/SIM/Hostname/IOS/Firmware rows exist,
-        appended after the main connection rows. Does NOT touch G0/0 or
-        the Interface combo.
+        Make sure the ID / modem fields exist and are added to the layout
+        in the correct order:
+
+            IMSI → IMEI → ICCID → SIM → Hostname → IOS → Firmware
         """
-        if hasattr(self, "imsiLineEdit"):
-            # already created once
-            return
 
-        def add_labeled_row(label_text: str, attr_name: str, placeholder: str):
-            lbl = QtWidgets.QLabel(label_text, self)
-            edit = QtWidgets.QLineEdit(self)
-            edit.setPlaceholderText(placeholder)
-            setattr(self, attr_name, edit)
+        def ensure_pair(edit_attr: str, label_text: str, placeholder: str):
+            # edit line
+            edit = getattr(self, edit_attr, None)
+            if edit is None:
+                edit = QtWidgets.QLineEdit(self)
+                edit.setObjectName(edit_attr)
+                edit.setPlaceholderText(placeholder)
+                setattr(self, edit_attr, edit)
 
-            row = QHBoxLayout()
-            row.addWidget(lbl)
-            row.addWidget(edit)
-            layout.addLayout(row)
+            # label (we name it <edit_attr>_label)
+            label_attr = edit_attr + "_label"
+            label = getattr(self, label_attr, None)
+            if label is None:
+                label = QtWidgets.QLabel(label_text, self)
+                setattr(self, label_attr, label)
 
-        add_labeled_row("IMSI", "imsiLineEdit", "— detected after clicking 'Detect Cellular' —")
-        add_labeled_row("IMEI", "imeiLineEdit", "— detected after clicking 'Detect Cellular' —")
-        add_labeled_row("ICCID", "iccidLineEdit", "— detected after clicking 'Detect Cellular' —")
-        # SIM already exists in the UI, don’t recreate it; just leave it where it is.
-        # Hostname / IOS / Firmware
-        add_labeled_row("Hostname", "hostnameLineEdit", "")
-        add_labeled_row("IOS", "iosLineEdit", "— detected via SSH —")
-        add_labeled_row("Firmware", "fwLineEdit", "— detected via SSH —")
+            # only add to layout if not already inside
+            if layout.indexOf(label) == -1:
+                layout.addWidget(label)
+                layout.addWidget(edit)
+
+        # ---- desired order ----
+        ensure_pair("imsiLineEdit",  "IMSI",     "— detected after clicking 'Detect Cellular' —")
+        ensure_pair("imeiLineEdit",  "IMEI",     "— detected after clicking 'Detect Cellular' —")
+        ensure_pair("iccidLineEdit", "ICCID",    "— detected after clicking 'Detect Cellular' —")
+        ensure_pair("simLineEdit",   "SIM Number", "SIM Number")
+        ensure_pair("hostnameLineEdit", "Hostname", "")
+        ensure_pair("iosLineEdit",      "IOS",      "— detected via SSH —")
+        ensure_pair("fwLineEdit",       "Firmware", "— detected via SSH —")
 
     # inside DeviceSettingsDialog
     def get_data(self) -> dict:
@@ -4184,7 +4196,7 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
             "name":          _txt("nameLineEdit"),
             "ip":            _txt("ipLineEdit"),
             "gateway":       _txt("gatewayLineEdit"),
-            "g0_0":          _txt("g0_0LineEdit"),
+            "g0_0":          _txt("g00LineEdit"),
             "apn":           _txt("apnLineEdit"),
             "email":         _txt("emailLineEdit"),
             "hostname":      getattr(self, "hostnameLineEdit", None) and _txt("hostnameLineEdit") or "",
@@ -4379,7 +4391,7 @@ class DeviceSettingsDialog(QtWidgets.QDialog):
         QtWidgets.QMessageBox.information(self, "Gateway Detected", f"Detected Gateway: {gateway}")
 
     def on_g0_detected(self, g0_0):
-        self.g0_0LineEdit.setText(g0_0)
+        self.g00LineEdit.setText(g0_0)
         self._set_busy(False)   
         self.overlaySpinner.stop(); self.overlay.hide()
         QtWidgets.QMessageBox.information(self, "G0/0 Detected", f"Detected G0/0: {g0_0}")
@@ -6527,19 +6539,11 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             self.deviceTable.setItem(i, 2, QtWidgets.QTableWidgetItem(d["gateway"]))
 
             # --- G0/0 column (new) ---------------------------------------
-            # Expect these keys to be filled by the probe code (see part 2)
-            g00_ip     = (d.get("g00_ip") or "unassigned").strip()
-            g00_stat   = (d.get("g00_status") or "").strip()   # e.g. "up"
-            g00_proto  = (d.get("g00_protocol") or "").strip() # e.g. "up"
-            g00_mode   = (d.get("g00_mode") or "").strip()     # "DHCP" / "Static" / ""
+            # Single DB column: devices.g0_0 holds whatever summary text we want to show
+            g00_text = (d.get("g0_0") or "").strip()
 
-            # nice compact summary, adjust to taste
-            if g00_ip == "unassigned":
+            if not g00_text:
                 g00_text = "unassigned"
-            else:
-                # e.g. "159.196.90.25  up/up  DHCP"
-                mode_part = f"  {g00_mode}" if g00_mode else ""
-                g00_text = f"{g00_ip}  {g00_stat}/{g00_proto}{mode_part}"
 
             g00_item = QtWidgets.QTableWidgetItem(g00_text)
             g00_item.setFlags(g00_item.flags() & ~QtCore.Qt.ItemIsEditable)
@@ -6547,10 +6551,22 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
 
             # SIM (col 4)
             sim_txt = (d.get("sim") or "").strip()
+            iccid_val = (d.get("iccid") or "").strip()
+
             it_sim = QtWidgets.QTableWidgetItem(sim_txt)
             it_sim.setFlags(it_sim.flags() & ~QtCore.Qt.ItemIsEditable)
-            it_sim.setData(SIM_TEXT_ROLE, sim_txt)
             it_sim.setData(DEVICE_ID_ROLE, int(d["id"]))
+
+            # New behaviour:
+            # - If ICCID missing  -> keep SIM_TEXT_ROLE empty     -> NO CELL pill
+            # - If ICCID present but SIM empty -> show "SIM not set" text, no pill
+            if iccid_val:
+                sim_role_text = sim_txt if sim_txt else "SIM not set"
+            else:
+                sim_role_text = ""   # triggers "NO CELL" pill in delegate
+
+            it_sim.setData(SIM_TEXT_ROLE, sim_role_text)
+
             self.deviceTable.setItem(i, 4, it_sim)
 
             # APN (col 5)
@@ -6571,8 +6587,12 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             # Email (shifted to col 7)
             self.deviceTable.setItem(i, 7, QtWidgets.QTableWidgetItem(d["email"]))
 
+            # derive has_cell from ICCID (new rule)
+            iccid_val = (d.get("iccid") or "").strip()
+            has_cell = bool(iccid_val)
+
             # Last SMS: spinner + watchdog if cellular, else static text
-            if d.get("has_cellular", False):
+            if has_cell:
                 self._start_row_fetch(i, d["ip"])
             else:
                 last_col = self._last_sms_col
@@ -6619,7 +6639,6 @@ class CiscoSMSMonitorApp(QtWidgets.QMainWindow):
             send_sms_action = QAction(QIcon(resource_path("icons/send.png")), "Send SMS", self)
             delete_action   = QAction(QIcon(resource_path("icons/delete.png")), "Delete", self)
 
-            has_cell = bool(d.get("has_cellular"))
             if not has_cell:
                 sms_logs_action.setEnabled(False)
                 sms_logs_action.setStatusTip("No cellular interface on this device")
